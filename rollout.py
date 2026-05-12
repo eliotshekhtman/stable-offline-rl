@@ -16,6 +16,7 @@ DATASET_KEYS = (
     "terminals",
     "timeouts",
 )
+MAX_SEED = np.iinfo(np.int32).max
 
 
 def load_expert_policy(env_name: str, policy_path: str):
@@ -131,7 +132,7 @@ def collect_suboptimal(
     rng = np.random.default_rng() if rng is None else rng
 
     def make_action_fn(env: gym.Env) -> Callable[[np.ndarray], np.ndarray]:
-        env.action_space.seed(_next_seed(rng))
+        env.action_space.seed(int(rng.integers(0, MAX_SEED)))
 
         def action_fn(_: np.ndarray) -> np.ndarray:
             return np.asarray(env.action_space.sample(), dtype=np.float32)
@@ -198,7 +199,9 @@ def collect_dataset(
             )
         )
 
-    dataset = _shuffle_dataset(_concat_datasets(datasets), rng)
+    dataset = _concat_datasets(datasets)
+    indices = rng.permutation(len(dataset["rewards"]))
+    dataset = {key: dataset[key][indices] for key in DATASET_KEYS}
     metadata = make_metadata(
         env_name=env_name,
         policy_path=policy_path,
@@ -271,58 +274,33 @@ def _collect_source(
     env = gym.make(env_name)
     try:
         action_fn = make_action_fn(env)
-        return _collect_and_sample(
-            env=env,
-            action_fn=action_fn,
-            num_samples=num_samples,
-            max_timesteps=max_timesteps,
-            rng=rng,
-        )
+        target_samples = int(np.ceil(1.5 * num_samples))
+        datasets = []
+        collected = 0
+
+        while collected < target_samples:
+            traj = collect_traj(
+                env,
+                action_fn,
+                max_timesteps=max_timesteps,
+                seed=int(rng.integers(0, MAX_SEED)),
+            )
+            if len(traj["rewards"]) == 0:
+                raise RuntimeError("Collected an empty trajectory; check the environment and action function.")
+            datasets.append(traj)
+            collected += len(traj["rewards"])
+
+        dataset = _concat_datasets(datasets)
+        indices = rng.choice(len(dataset["rewards"]), size=num_samples, replace=False)
+        return {key: dataset[key][indices] for key in DATASET_KEYS}
     finally:
         env.close()
-
-
-def _collect_and_sample(
-    env: gym.Env,
-    action_fn: Callable[[np.ndarray], np.ndarray],
-    num_samples: int,
-    max_timesteps: int,
-    rng: np.random.Generator,
-) -> dict[str, np.ndarray]:
-    target_samples = int(np.ceil(1.5 * num_samples))
-    datasets = []
-    collected = 0
-
-    while collected < target_samples:
-        traj_seed = _next_seed(rng)
-        traj = collect_traj(env, action_fn, max_timesteps=max_timesteps, seed=traj_seed)
-        if len(traj["rewards"]) == 0:
-            raise RuntimeError("Collected an empty trajectory; check the environment and action function.")
-        datasets.append(traj)
-        collected += len(traj["rewards"])
-
-    return _sample_dataset(_concat_datasets(datasets), num_samples=num_samples, rng=rng)
 
 
 def _concat_datasets(datasets: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
     if not datasets:
         raise ValueError("Cannot concatenate an empty dataset list.")
     return {key: np.concatenate([dataset[key] for dataset in datasets], axis=0) for key in DATASET_KEYS}
-
-
-def _sample_dataset(dataset: dict[str, np.ndarray], num_samples: int, rng: np.random.Generator) -> dict[str, np.ndarray]:
-    _validate_dataset(dataset)
-    total = len(dataset["rewards"])
-    if num_samples > total:
-        raise ValueError(f"Requested {num_samples} samples from a dataset with only {total} samples.")
-    indices = rng.choice(total, size=num_samples, replace=False)
-    return {key: dataset[key][indices] for key in DATASET_KEYS}
-
-
-def _shuffle_dataset(dataset: dict[str, np.ndarray], rng: np.random.Generator) -> dict[str, np.ndarray]:
-    _validate_dataset(dataset)
-    indices = rng.permutation(len(dataset["rewards"]))
-    return {key: dataset[key][indices] for key in DATASET_KEYS}
 
 
 def _validate_dataset(dataset: dict[str, np.ndarray]) -> None:
@@ -358,7 +336,3 @@ def _split_sample_counts(num_samples: int, prop_expert: float) -> tuple[int, int
     num_expert = int(round(num_samples * prop_expert))
     num_expert = min(max(num_expert, 0), num_samples)
     return num_expert, num_samples - num_expert
-
-
-def _next_seed(rng: np.random.Generator) -> int:
-    return int(rng.integers(0, np.iinfo(np.int32).max))
