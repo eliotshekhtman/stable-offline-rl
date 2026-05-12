@@ -1,169 +1,364 @@
+import json
 from pathlib import Path
-try:
-    import gymnasium as gym
-except ImportError:
-    import gym
+from typing import Callable
+
+import gymnasium as gym
 import numpy as np
-import numpy.random as rand
-import torch
-from torch.utils.data import Dataset, DataLoader
-from stable_baselines3.common.base_class import BaseAlgorithm
-from stable_baselines3 import SAC
 from sb3_contrib import TQC
-from stable_baselines3 import PPO
-import hard_stable
+from stable_baselines3 import PPO, SAC
 
-def CollectTrajs(env_name: str,
-                         policy_path: str,
-                         max_timesteps: int = 300,
-                         num_trajectories: int = 1,
-                         noised: int = 0,
-                         noise_scale: float = 0.0,
-                         prop_noised: float = 0.5,
-                         deterministic: bool = True,
-                         seed: int = None):
+
+DATASET_KEYS = (
+    "observations",
+    "actions",
+    "next_observations",
+    "rewards",
+    "terminals",
+    "timeouts",
+)
+
+
+def load_expert_policy(env_name: str, policy_path: str):
+    """Load the SB3 expert policy convention used by this project."""
+    if env_name == "Humanoid-v5":
+        return TQC.load(policy_path)
+    if env_name == "Swimmer-v5":
+        return PPO.load(policy_path)
+    if any(env_name.endswith(f"-v{version}") for version in (2, 3, 4, 5)):
+        return SAC.load(policy_path)
+    raise ValueError(f"Unknown environment name: {env_name}")
+
+
+def collect_traj(
+    env: gym.Env,
+    action_fn: Callable[[np.ndarray], np.ndarray],
+    max_timesteps: int,
+    seed: int | None = None,
+) -> dict[str, np.ndarray]:
+    """Collect one Gymnasium trajectory as one-step transition arrays."""
+    obs, _ = env.reset(seed=seed)
+    transitions = {
+        "observations": [],
+        "actions": [],
+        "next_observations": [],
+        "rewards": [],
+        "terminals": [],
+        "timeouts": [],
+    }
+
+    for _ in range(max_timesteps):
+        action = np.asarray(action_fn(obs), dtype=np.float32)
+        obs_before_step = np.asarray(obs, dtype=np.float32).copy()
+        next_obs, reward, terminated, truncated, _ = env.step(action)
+
+        transitions["observations"].append(obs_before_step)
+        transitions["actions"].append(action.copy())
+        transitions["next_observations"].append(np.asarray(next_obs, dtype=np.float32).copy())
+        transitions["rewards"].append(np.float32(reward))
+        transitions["terminals"].append(bool(terminated))
+        transitions["timeouts"].append(bool(truncated))
+
+        obs = next_obs
+        if terminated or truncated:
+            break
+
+    return {
+        "observations": np.asarray(transitions["observations"], dtype=np.float32),
+        "actions": np.asarray(transitions["actions"], dtype=np.float32),
+        "next_observations": np.asarray(transitions["next_observations"], dtype=np.float32),
+        "rewards": np.asarray(transitions["rewards"], dtype=np.float32),
+        "terminals": np.asarray(transitions["terminals"], dtype=bool),
+        "timeouts": np.asarray(transitions["timeouts"], dtype=bool),
+    }
+
+
+def collect_expert(
+    env_name: str,
+    policy_path: str,
+    num_samples: int,
+    max_timesteps: int,
+    noise_scale: float = 0.0,
+    deterministic: bool = True,
+    rng: np.random.Generator | None = None,
+) -> dict[str, np.ndarray]:
+    """Collect transition samples from a clipped, noise-injected expert."""
+    rng = np.random.default_rng() if rng is None else rng
+
+    def make_action_fn(env: gym.Env) -> Callable[[np.ndarray], np.ndarray]:
+        policy = load_expert_policy(env_name, policy_path)
+        action_dim = int(np.prod(env.action_space.shape))
+
+        def action_fn(obs: np.ndarray) -> np.ndarray:
+            action, _ = policy.predict(obs, deterministic=deterministic)
+            action = np.asarray(action, dtype=np.float32)
+            if noise_scale > 0.0:
+                noise = rng.normal(
+                    loc=0.0,
+                    scale=noise_scale / np.sqrt(action_dim),
+                    size=env.action_space.shape,
+                ).astype(np.float32)
+                action = action + noise
+            return np.clip(action, env.action_space.low, env.action_space.high).astype(np.float32)
+
+        return action_fn
+
+    return _collect_source(
+        env_name=env_name,
+        make_action_fn=make_action_fn,
+        num_samples=num_samples,
+        max_timesteps=max_timesteps,
+        rng=rng,
+    )
+
+
+def collect_suboptimal(
+    env_name: str,
+    policy_path: str,
+    num_samples: int,
+    max_timesteps: int,
+    noise_scale: float = 0.0,
+    deterministic: bool = True,
+    rng: np.random.Generator | None = None,
+) -> dict[str, np.ndarray]:
+    """Collect transition samples from pure random actions.
+
+    policy_path, noise_scale, and deterministic are accepted for symmetry with
+    CollectExpert and CollectDataset, but random-action collection does not use
+    them.
     """
-    Collects trajectories by rolling out a pretrained expert policy in a Gymnasium environment.
+    del policy_path, noise_scale, deterministic
 
-    Args:
-        env_name (str): the Gymnasium environment ID.
-        policy_path (str): path to the saved expert policy (Stable Baselines3 format).
-        max_timesteps (int): maximum steps per trajectory.
-        num_trajectories (int): number of trajectories to collect.
-        noise_scale (float): covariance-scaling factor of unit-scaled Gaussian noise injection.
-        deterministic (bool): whether to use deterministic actions (if expert has exploration mode).
-        seed (int): random seed for environment.
+    rng = np.random.default_rng() if rng is None else rng
 
-    Returns:
-        List[dict]: a list of trajectories, each containing observations, actions, rewards, dones, infos.
+    def make_action_fn(env: gym.Env) -> Callable[[np.ndarray], np.ndarray]:
+        env.action_space.seed(_next_seed(rng))
+
+        def action_fn(_: np.ndarray) -> np.ndarray:
+            return np.asarray(env.action_space.sample(), dtype=np.float32)
+
+        return action_fn
+
+    return _collect_source(
+        env_name=env_name,
+        make_action_fn=make_action_fn,
+        num_samples=num_samples,
+        max_timesteps=max_timesteps,
+        rng=rng,
+    )
+
+
+def collect_dataset(
+    env_name: str,
+    policy_path: str,
+    max_timesteps: int = 300,
+    num_samples: int = 10000,
+    noise_scale: float = 0.0,
+    prop_expert: float = 1.0,
+    deterministic: bool = True,
+    seed: int | None = None,
+) -> tuple[dict[str, np.ndarray], dict]:
+    """Collect a shuffled offline-RL transition dataset.
+
+    prop_expert controls the fraction of samples drawn from the noise-injected
+    expert. The remainder are collected from uniform random actions.
     """
-    # policy: BaseAlgorithm = BaseAlgorithm.load(policy_path)
-    if env_name == 'Humanoid-v5':
-        env = gym.make(env_name)
-        policy = TQC.load(policy_path)
-    # Any other v2/v3/v4/v5 continuous env uses SAC
-    elif env_name == "Swimmer-v5":
-        env = gym.make(env_name)
-        policy = PPO.load(policy_path)
-    elif any(env_name.endswith(f'-v{v}') for v in (2,3,4,5)):
-        env = gym.make(env_name)
-        policy = SAC.load(policy_path)
-    # The hard_stable custom env
-    elif env_name == 'hard_stable':
-        expert_path = Path('./experts/hard_stable_perturb.pt')
-        if expert_path.exists():
-            state_dict = torch.load(expert_path)
-        else:
-            # first time: create and save
-            env = hard_stable.create_gym_environment(
-                d=4, pair_first=True, pytorch_seed=seed
+    _validate_collection_args(
+        max_timesteps=max_timesteps,
+        num_samples=num_samples,
+        noise_scale=noise_scale,
+        prop_expert=prop_expert,
+    )
+
+    rng = np.random.default_rng(seed)
+    num_expert, num_suboptimal = _split_sample_counts(num_samples, prop_expert)
+    datasets = []
+
+    if num_expert > 0:
+        datasets.append(
+            collect_expert(
+                env_name=env_name,
+                policy_path=policy_path,
+                num_samples=num_expert,
+                max_timesteps=max_timesteps,
+                noise_scale=noise_scale,
+                deterministic=deterministic,
+                rng=rng,
             )
-            state_dict = env.perturbation_model.state_dict()
-            torch.save(state_dict, expert_path)
-        env = hard_stable.create_gym_environment(
-            d=4, pair_first=True, pytorch_seed=seed, state_dict=state_dict
         )
-        policy = hard_stable.EmbedExpertTorch(
-            K=env.K.copy(), model_state_dict=state_dict, tau=env.tau, d_model_input=4
+    if num_suboptimal > 0:
+        datasets.append(
+            collect_suboptimal(
+                env_name=env_name,
+                policy_path=policy_path,
+                num_samples=num_suboptimal,
+                max_timesteps=max_timesteps,
+                noise_scale=noise_scale,
+                deterministic=deterministic,
+                rng=rng,
+            )
         )
-    else:
-        raise ValueError(f"Unknown environment name: {env_name}")
-    
-    if seed is not None:
-        env.reset(seed=seed)
+
+    dataset = _shuffle_dataset(_concat_datasets(datasets), rng)
+    metadata = make_metadata(
+        env_name=env_name,
+        policy_path=policy_path,
+        max_timesteps=max_timesteps,
+        num_samples=num_samples,
+        noise_scale=noise_scale,
+        prop_expert=prop_expert,
+        deterministic=deterministic,
+        seed=seed,
+    )
+    return dataset, metadata
 
 
-    trajectories = []
-    action_dim = env.action_space.shape[0]
-    if noise_scale > 0:
-        noise = rand.randn(num_trajectories, max_timesteps, action_dim) * (noise_scale/np.sqrt(action_dim))
-        for ep in range(num_trajectories):
-            obs, info = env.reset()
-            traj = {
-                'obs': [],
-                'acts': [],
-                'rewards': [],
-                'dones': [],
-                # 'infos': []
-            }
-            for t in range(max_timesteps):
-                traj['obs'].append(obs.copy())
-                action, _ = policy.predict(obs, deterministic=deterministic)
-                # noise injection
-                if noised == 1:
-                    # if noised=1, then record noisy action
-                    action = action + noise[ep,t]
-                    traj['acts'].append(action)
-                else:
-                    # else, record clean action, then execute noisy action
-                    traj['acts'].append(action)
-                    action = action + noise[ep,t]
-                # only collect prop_noised * num_traj noise-injected trajectories
-                if ep < int(prop_noised * num_trajectories):
-                    obs, reward, done, truncated, _ = env.step(action)
-                else:
-                    obs, reward, done, truncated, _ = env.step(action)
-                traj['rewards'].append(reward)
-                traj['dones'].append(done or truncated)
-                # traj['infos'].append(info)
-                if done or truncated:
-                    break
-            trajectories.append(traj)
-    else:
-        for ep in range(num_trajectories):
-            obs, info = env.reset()
-            traj = {
-                'obs': [],
-                'acts': [],
-                'rewards': [],
-                'dones': [],
-                # 'infos': []
-            }
-            for t in range(max_timesteps):
-                traj['obs'].append(obs.copy())
-                action, _ = policy.predict(obs, deterministic=deterministic)
-                traj['acts'].append(action)
-                obs, reward, done, truncated, _ = env.step(action)
-                traj['rewards'].append(reward)
-                traj['dones'].append(done or truncated)
-                # traj['infos'].append(info)
-                if done or truncated:
-                    break
-            trajectories.append(traj)
-    env.close()
-    return trajectories
+def make_metadata(
+    env_name: str,
+    policy_path: str,
+    max_timesteps: int,
+    num_samples: int,
+    noise_scale: float,
+    prop_expert: float,
+    deterministic: bool,
+    seed: int | None,
+) -> dict:
+    num_expert, num_suboptimal = _split_sample_counts(num_samples, prop_expert)
+    return {
+        "env_name": env_name,
+        "policy_path": str(policy_path),
+        "max_timesteps": max_timesteps,
+        "num_expert": num_expert,
+        "num_suboptimal": num_suboptimal,
+        "noise_scale": noise_scale,
+        "deterministic": deterministic,
+        "seed": seed,
+    }
 
-class TrajDataset(Dataset):
-    """
-    Convert trajectory list to torch dataset.
-    Each sample is:
-      - input: observation at time t
-      - label: stack of action(s) from t to t+chunk_len-1
-    """
-    def __init__(self, trajectories, chunk_len: int = 1):
-        self.chunk_len = chunk_len
-        obs_list = []
-        act_list = []
-        for traj in trajectories:
-            observations = traj['obs']
-            actions = traj['acts']
-            T = len(actions)
-            for t in range(T - chunk_len + 1):
-                obs_list.append(observations[t])
-                if chunk_len == 1:
-                    act_list.append(actions[t])
-                else:
-                    act_list.append(np.stack(actions[t:t+chunk_len], axis=0))
-        # Convert to tensors but keep on CPU
-        self.inputs = torch.tensor(np.stack(obs_list), dtype=torch.float32)
-        self.labels = torch.tensor(np.stack(act_list), dtype=torch.float32)
 
-    def __len__(self):
-        return self.inputs.shape[0]
+def save_dataset(dataset: dict[str, np.ndarray], dataset_path: str | Path, metadata: dict | None = None) -> None:
+    """Save dataset arrays as compressed NumPy data and optional JSON metadata."""
+    dataset_path = Path(dataset_path)
+    dataset_path.parent.mkdir(parents=True, exist_ok=True)
+    _validate_dataset(dataset)
+    np.savez_compressed(dataset_path, **dataset)
 
-    def __getitem__(self, idx):
-        return self.inputs[idx], self.labels[idx]
+    if metadata is not None:
+        with dataset_path.with_suffix(".json").open("w", encoding="utf-8") as file:
+            json.dump(metadata, file, indent=2, sort_keys=True)
 
-def TrajLoader(trajs, chunk_len: int = 1, batch_size: int = 100, device: str = 'cpu'):
-    dataset = TrajDataset(trajs, chunk_len=chunk_len)
-    return DataLoader(dataset, batch_size, shuffle=True, num_workers=0, pin_memory=(device != 'cpu'))
+
+def load_dataset(dataset_path: str | Path) -> dict[str, np.ndarray]:
+    """Load the transition arrays saved by save_dataset."""
+    with np.load(dataset_path) as data:
+        dataset = {key: data[key] for key in DATASET_KEYS}
+    _validate_dataset(dataset)
+    return dataset
+
+
+def load_metadata(dataset_path: str | Path) -> dict:
+    """Load JSON metadata next to a saved dataset."""
+    with Path(dataset_path).with_suffix(".json").open("r", encoding="utf-8") as file:
+        return json.load(file)
+
+
+def _collect_source(
+    env_name: str,
+    make_action_fn: Callable[[gym.Env], Callable[[np.ndarray], np.ndarray]],
+    num_samples: int,
+    max_timesteps: int,
+    rng: np.random.Generator,
+) -> dict[str, np.ndarray]:
+    env = gym.make(env_name)
+    try:
+        action_fn = make_action_fn(env)
+        return _collect_and_sample(
+            env=env,
+            action_fn=action_fn,
+            num_samples=num_samples,
+            max_timesteps=max_timesteps,
+            rng=rng,
+        )
+    finally:
+        env.close()
+
+
+def _collect_and_sample(
+    env: gym.Env,
+    action_fn: Callable[[np.ndarray], np.ndarray],
+    num_samples: int,
+    max_timesteps: int,
+    rng: np.random.Generator,
+) -> dict[str, np.ndarray]:
+    target_samples = int(np.ceil(1.5 * num_samples))
+    datasets = []
+    collected = 0
+
+    while collected < target_samples:
+        traj_seed = _next_seed(rng)
+        traj = collect_traj(env, action_fn, max_timesteps=max_timesteps, seed=traj_seed)
+        if len(traj["rewards"]) == 0:
+            raise RuntimeError("Collected an empty trajectory; check the environment and action function.")
+        datasets.append(traj)
+        collected += len(traj["rewards"])
+
+    return _sample_dataset(_concat_datasets(datasets), num_samples=num_samples, rng=rng)
+
+
+def _concat_datasets(datasets: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
+    if not datasets:
+        raise ValueError("Cannot concatenate an empty dataset list.")
+    return {key: np.concatenate([dataset[key] for dataset in datasets], axis=0) for key in DATASET_KEYS}
+
+
+def _sample_dataset(dataset: dict[str, np.ndarray], num_samples: int, rng: np.random.Generator) -> dict[str, np.ndarray]:
+    _validate_dataset(dataset)
+    total = len(dataset["rewards"])
+    if num_samples > total:
+        raise ValueError(f"Requested {num_samples} samples from a dataset with only {total} samples.")
+    indices = rng.choice(total, size=num_samples, replace=False)
+    return {key: dataset[key][indices] for key in DATASET_KEYS}
+
+
+def _shuffle_dataset(dataset: dict[str, np.ndarray], rng: np.random.Generator) -> dict[str, np.ndarray]:
+    _validate_dataset(dataset)
+    indices = rng.permutation(len(dataset["rewards"]))
+    return {key: dataset[key][indices] for key in DATASET_KEYS}
+
+
+def _validate_dataset(dataset: dict[str, np.ndarray]) -> None:
+    extra = [key for key in dataset if key not in DATASET_KEYS]
+    if extra:
+        raise ValueError(f"Dataset has unexpected keys: {extra}")
+    missing = [key for key in DATASET_KEYS if key not in dataset]
+    if missing:
+        raise ValueError(f"Dataset is missing required keys: {missing}")
+
+    lengths = {key: len(dataset[key]) for key in DATASET_KEYS}
+    if len(set(lengths.values())) != 1:
+        raise ValueError(f"Dataset arrays have inconsistent lengths: {lengths}")
+
+
+def _validate_collection_args(
+    max_timesteps: int,
+    num_samples: int,
+    noise_scale: float,
+    prop_expert: float,
+) -> None:
+    if max_timesteps <= 0:
+        raise ValueError("max_timesteps must be positive.")
+    if num_samples <= 0:
+        raise ValueError("num_samples must be positive.")
+    if noise_scale < 0.0:
+        raise ValueError("noise_scale must be nonnegative.")
+    if not 0.0 <= prop_expert <= 1.0:
+        raise ValueError("prop_expert must be between 0 and 1.")
+
+
+def _split_sample_counts(num_samples: int, prop_expert: float) -> tuple[int, int]:
+    num_expert = int(round(num_samples * prop_expert))
+    num_expert = min(max(num_expert, 0), num_samples)
+    return num_expert, num_samples - num_expert
+
+
+def _next_seed(rng: np.random.Generator) -> int:
+    return int(rng.integers(0, np.iinfo(np.int32).max))
