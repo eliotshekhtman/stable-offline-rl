@@ -8,6 +8,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 
+import load_offline
 import rollout
 from offlinerlkit.buffer import ReplayBuffer
 from offlinerlkit.policy_trainer import MBPolicyTrainer, MFPolicyTrainer
@@ -17,14 +18,14 @@ from policies import MODEL_BASED_ALGOS, MODEL_FREE_ALGOS, build_model_based_poli
 
 def main() -> None:
     args = parse_args()
-    for env_name in args.env:
-        expert_path = resolve_expert_path(args.expert, env_name)
-        run_sweep(env_name=env_name, expert_path=expert_path, args=args)
+    expert_path = resolve_expert_path(args.expert, args.env)
+    run_sweep(env_name=args.env, expert_path=expert_path, args=args)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Collect offline datasets and train OfflineRL-Kit policies.")
-    parser.add_argument("--env", nargs="+", required=True, help="Gymnasium environment id(s), e.g. HalfCheetah-v5")
+    parser.add_argument("--env", required=True, help="Gymnasium environment id, e.g. HalfCheetah-v5")
+    parser.add_argument("--dataset-source", choices=["generated", "minari"], default="generated")
     parser.add_argument("--expert", default="experts", help="Expert policy .zip path or directory containing <env>.zip")
     parser.add_argument("--output-dir", default="outputs", help="Root directory for datasets and runs")
     parser.add_argument("--algos", nargs="+", default=["cql"], help="Algorithms: none, bc, cql, iql, td3bc, edac, mopo, combo, mobile, rambo")
@@ -61,6 +62,10 @@ def run_sweep(env_name: str, expert_path: Path, args: argparse.Namespace) -> Non
     dataset_dir.mkdir(parents=True, exist_ok=True)
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.dataset_source == "minari":
+        run_minari_sweep(env_name=env_name, dataset_dir=dataset_dir, run_dir=run_dir, args=args)
+        return
+
     for num_samples, noise_scale, prop_expert in itertools.product(
         args.num_samples, args.noise_scale, args.prop_expert
     ):
@@ -75,6 +80,24 @@ def run_sweep(env_name: str, expert_path: Path, args: argparse.Namespace) -> Non
             prop_expert=prop_expert,
             args=args,
         )
+
+        for algo in args.algos:
+            if algo == "none":
+                continue
+            train_algo(
+                algo=algo,
+                env_name=env_name,
+                dataset=dataset,
+                run_dir=run_dir / f"{algo}_{dataset_tag}",
+                args=args,
+            )
+
+
+def run_minari_sweep(env_name: str, dataset_dir: Path, run_dir: Path, args: argparse.Namespace) -> None:
+    for dataset_id in load_offline.list_minari_dataset_ids(env_name):
+        dataset_tag = load_offline.make_minari_dataset_tag(dataset_id)
+        dataset_path = dataset_dir / f"{dataset_tag}.npz"
+        dataset = get_or_load_minari_dataset(dataset_id=dataset_id, dataset_path=dataset_path, args=args)
 
         for algo in args.algos:
             if algo == "none":
@@ -115,6 +138,21 @@ def get_or_collect_dataset(
         deterministic=True,
         seed=args.seed,
     )
+    rollout.save_dataset(dataset, dataset_path, metadata)
+    return dataset
+
+
+def get_or_load_minari_dataset(
+    dataset_id: str,
+    dataset_path: Path,
+    args: argparse.Namespace,
+) -> dict[str, np.ndarray]:
+    if args.reuse_datasets and dataset_path.exists():
+        print(f"Loading converted Minari dataset: {dataset_path}")
+        return rollout.load_dataset(dataset_path)
+
+    print(f"Loading Minari dataset: {dataset_id}")
+    dataset, metadata = load_offline.load_minari_dataset(dataset_id, seed=args.seed)
     rollout.save_dataset(dataset, dataset_path, metadata)
     return dataset
 
