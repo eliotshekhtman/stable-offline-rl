@@ -24,12 +24,18 @@ def main() -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate trained stable-offline-rl runs.")
-    parser.add_argument("--run-dir", type=Path, required=True)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--eval-episodes", type=int, default=10)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--jacobian-samples", type=int, default=8)
-    parser.add_argument("--fd-eps", type=float, default=1e-4)
+
+    run = parser.add_argument_group("run")
+    run.add_argument("--run-dir", type=Path, required=True, help="Directory containing run_manifest.json and the trained model files")
+    run.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Torch device used to reload the trained policy and dynamics")
+    run.add_argument("--seed", type=int, default=0, help="Random seed for evaluation rollouts and sampled Jacobian states")
+
+    rollout_eval = parser.add_argument_group("rollout evaluation")
+    rollout_eval.add_argument("--eval-episodes", type=int, default=10, help="Number of true-environment episodes used to estimate policy and expert returns")
+
+    jacobian_eval = parser.add_argument_group("model-based jacobian evaluation")
+    jacobian_eval.add_argument("--jacobian-samples", type=int, default=8, help="Number of held-out dataset states and policy-rollout states used for finite-difference Jacobian evaluation")
+    jacobian_eval.add_argument("--fd-eps", type=float, default=1e-4, help="Central finite-difference perturbation size for closed-loop Jacobian estimates")
     return parser.parse_args()
 
 
