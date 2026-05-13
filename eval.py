@@ -28,6 +28,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--eval-episodes", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--jacobian-samples", type=int, default=8)
+    parser.add_argument("--fd-eps", type=float, default=1e-4)
     return parser.parse_args()
 
 
@@ -85,6 +87,32 @@ def evaluate_run(run_dir: Path, args: argparse.Namespace) -> None:
         )
         results["dataset_next_obs_mse"] = float(np.mean(dataset_errors))
         results["rollout_next_obs_mse"] = float(np.mean(rollout_info["next_obs_sq_error"]))
+        dataset_jacobians = evaluate_jacobians_on_observations(
+            policy=policy,
+            dynamics=dynamics,
+            env_name=manifest["env_name"],
+            observations=test_dataset["observations"],
+            sample_count=args.jacobian_samples,
+            seed=args.seed,
+            fd_eps=args.fd_eps,
+            obs_mean=obs_mean,
+            obs_std=obs_std,
+        )
+        rollout_jacobians = evaluate_jacobians_on_observations(
+            policy=policy,
+            dynamics=dynamics,
+            env_name=manifest["env_name"],
+            observations=rollout_info["dynamics_observations"],
+            sample_count=args.jacobian_samples,
+            seed=args.seed,
+            fd_eps=args.fd_eps,
+            obs_mean=obs_mean,
+            obs_std=obs_std,
+        )
+        np.savez_compressed(eval_dir / "jacobian_dataset.npz", **dataset_jacobians)
+        np.savez_compressed(eval_dir / "jacobian_rollout.npz", **rollout_jacobians)
+        results["dataset_closed_loop_jacobian_mse"] = float(np.mean(dataset_jacobians["closed_loop_jacobian_sq_error"]))
+        results["rollout_closed_loop_jacobian_mse"] = float(np.mean(rollout_jacobians["closed_loop_jacobian_sq_error"]))
 
     with (eval_dir / "results.json").open("w", encoding="utf-8") as file:
         json.dump(results, file, indent=2, sort_keys=True)
@@ -131,7 +159,7 @@ def evaluate_policy_rollouts(
 ) -> dict[str, np.ndarray]:
     env = gym.make(env_name)
     returns = []
-    next_obs_errors, error_episode_ids, error_timesteps = [], [], []
+    next_obs_errors, error_observations, error_episode_ids, error_timesteps = [], [], [], []
 
     try:
         for episode in range(episodes):
@@ -144,6 +172,7 @@ def evaluate_policy_rollouts(
                 action = policy.select_action(obs.reshape(1, -1), deterministic=True).reshape(-1)
                 next_obs, reward, terminated, truncated, _ = env.step(action)
                 if dynamics is not None:
+                    error_observations.append(np.asarray(obs, dtype=np.float32).copy())
                     pred_next_obs = predict_next_obs(
                         dynamics,
                         obs.reshape(1, -1),
@@ -166,6 +195,7 @@ def evaluate_policy_rollouts(
     return {
         "returns": np.asarray(returns, dtype=np.float32),
         "next_obs_sq_error": np.asarray(next_obs_errors, dtype=np.float32),
+        "dynamics_observations": np.asarray(error_observations, dtype=np.float32),
         "dynamics_episode_ids": np.asarray(error_episode_ids, dtype=np.int64),
         "dynamics_timesteps": np.asarray(error_timesteps, dtype=np.int64),
     }
@@ -226,6 +256,102 @@ def predict_next_obs(
     if obs_mean is not None:
         return pred_model_next_obs * obs_std + obs_mean
     return pred_model_next_obs
+
+
+def evaluate_jacobians_on_observations(
+    policy,
+    dynamics,
+    env_name: str,
+    observations: np.ndarray,
+    sample_count: int,
+    seed: int,
+    fd_eps: float,
+    obs_mean: np.ndarray | None = None,
+    obs_std: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    env = gym.make(env_name)
+    env.reset(seed=seed)
+    columns = reconstructible_observation_columns(env)
+    sample_count = min(sample_count, len(observations))
+    indices = np.random.default_rng(seed).choice(len(observations), size=sample_count, replace=False)
+    errors = []
+
+    try:
+        for index in indices:
+            true_jacobian = closed_loop_jacobian(
+                lambda obs: true_next_obs(env, policy, obs),
+                env,
+                observations[index],
+                columns,
+                fd_eps,
+            )
+            learned_jacobian = closed_loop_jacobian(
+                lambda obs: learned_next_obs(policy, dynamics, obs, obs_mean, obs_std),
+                env,
+                observations[index],
+                columns,
+                fd_eps,
+            )
+            errors.append(float(np.sum((learned_jacobian - true_jacobian) ** 2)))
+    finally:
+        env.close()
+
+    return {
+        "closed_loop_jacobian_sq_error": np.asarray(errors, dtype=np.float32),
+        "sample_indices": indices.astype(np.int64),
+        "columns": columns.astype(np.int64),
+    }
+
+
+def closed_loop_jacobian(next_obs_fn, env: gym.Env, obs: np.ndarray, columns: np.ndarray, fd_eps: float) -> np.ndarray:
+    jacobian = np.empty((len(obs), len(columns)), dtype=np.float32)
+    for column_index, obs_index in enumerate(columns):
+        obs_plus = np.asarray(obs, dtype=np.float32).copy()
+        obs_minus = np.asarray(obs, dtype=np.float32).copy()
+        obs_plus[obs_index] += fd_eps
+        obs_minus[obs_index] -= fd_eps
+        set_env_from_obs(env, obs_plus)
+        physical_obs_plus = env.unwrapped._get_obs().astype(np.float32)
+        set_env_from_obs(env, obs_minus)
+        physical_obs_minus = env.unwrapped._get_obs().astype(np.float32)
+        jacobian[:, column_index] = (next_obs_fn(physical_obs_plus) - next_obs_fn(physical_obs_minus)) / (2.0 * fd_eps)
+    return jacobian
+
+
+def true_next_obs(env: gym.Env, policy, obs: np.ndarray) -> np.ndarray:
+    set_env_from_obs(env, obs)
+    action = policy.select_action(obs.reshape(1, -1), deterministic=True).reshape(-1)
+    next_obs, *_ = env.unwrapped.step(action)
+    return np.asarray(next_obs, dtype=np.float32)
+
+
+def learned_next_obs(
+    policy,
+    dynamics,
+    obs: np.ndarray,
+    obs_mean: np.ndarray | None,
+    obs_std: np.ndarray | None,
+) -> np.ndarray:
+    action = policy.select_action(obs.reshape(1, -1), deterministic=True).reshape(1, -1)
+    return predict_next_obs(dynamics, obs.reshape(1, -1), action, obs_mean=obs_mean, obs_std=obs_std)[0]
+
+
+def reconstructible_observation_columns(env: gym.Env) -> np.ndarray:
+    structure = env.unwrapped.observation_structure
+    return np.arange(structure["qpos"] + structure["qvel"], dtype=np.int64)
+
+
+def set_env_from_obs(env: gym.Env, obs: np.ndarray) -> None:
+    unwrapped = env.unwrapped
+    structure = unwrapped.observation_structure
+    skipped_qpos = structure["skipped_qpos"]
+    qpos = np.zeros(unwrapped.model.nq, dtype=np.float64)
+    qvel = np.zeros(unwrapped.model.nv, dtype=np.float64)
+    offset = 0
+    qpos[skipped_qpos:] = obs[offset : offset + structure["qpos"]]
+    offset += structure["qpos"]
+    qvel[:] = obs[offset : offset + structure["qvel"]]
+    unwrapped.set_state(qpos, qvel)
 
 if __name__ == "__main__":
     main()

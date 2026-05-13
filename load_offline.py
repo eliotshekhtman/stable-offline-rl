@@ -31,7 +31,7 @@ def list_minari_dataset_ids(env_name: str) -> list[str]:
 
     prefix = MINARI_PREFIXES[env_name]
     datasets = minari.list_remote_datasets(prefix=prefix)
-    dataset_ids = sorted(datasets)
+    dataset_ids = sorted(dataset_id for dataset_id in datasets if dataset_id.startswith(prefix + "/"))
     if not dataset_ids:
         raise ValueError(f"No Minari datasets found for env {env_name!r} with prefix {prefix!r}.")
     return dataset_ids
