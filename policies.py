@@ -1,3 +1,9 @@
+# Tasks:
+# - Build OfflineRL-Kit policy objects for the algorithms supported by sweep.py.
+# - Keep algorithm architecture choices and default coefficients in one place.
+# - Build shared actor, critic, entropy-temperature, and dynamics components.
+# - Avoid owning datasets, replay-buffer construction, logging, or training loops.
+
 import argparse
 
 import gymnasium as gym

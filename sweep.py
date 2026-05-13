@@ -1,3 +1,9 @@
+# Tasks:
+# - Parse the experiment CLI and keep one run focused on one Gymnasium environment.
+# - Choose the dataset source: generated rollouts or converted Minari datasets.
+# - Cache/load datasets, build OfflineRL-Kit replay buffers, and launch trainers.
+# - Own experiment directories, logging, seeding, and run naming.
+
 import argparse
 import itertools
 import random

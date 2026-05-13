@@ -1,3 +1,9 @@
+# Tasks:
+# - Load premade offline datasets from external sources such as Minari.
+# - Convert external episode formats into this project's canonical transition schema.
+# - Discover all relevant Minari datasets for a requested Gymnasium environment.
+# - Keep external dataset loading separate from generated rollout collection.
+
 from typing import Any
 
 import numpy as np

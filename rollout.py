@@ -1,3 +1,9 @@
+# Tasks:
+# - Generate offline transition datasets by rolling out Gymnasium environments.
+# - Implement noise-injected expert collection and random-action suboptimal collection.
+# - Save/load this project's canonical .npz transition schema and JSON metadata.
+# - Preserve Gymnasium terminated vs truncated signals as terminals vs timeouts.
+
 import json
 from pathlib import Path
 from typing import Callable
