@@ -29,7 +29,7 @@ def list_minari_dataset_ids(env_name: str) -> list[str]:
     """Return all remote Minari datasets that belong to the requested env."""
     import minari
 
-    prefix = minari_prefix_for_env(env_name)
+    prefix = MINARI_PREFIXES[env_name]
     datasets = minari.list_remote_datasets(prefix=prefix)
     dataset_ids = sorted(datasets)
     if not dataset_ids:
@@ -37,28 +37,21 @@ def list_minari_dataset_ids(env_name: str) -> list[str]:
     return dataset_ids
 
 
-def minari_prefix_for_env(env_name: str) -> str:
-    if env_name not in MINARI_PREFIXES:
-        raise ValueError(f"No Minari prefix is configured for environment: {env_name}")
-    return MINARI_PREFIXES[env_name]
-
-
 def load_minari_dataset(dataset_id: str, seed: int | None = None) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     """Download/load one Minari dataset and convert it to this project's transition schema."""
     import minari
 
     minari_dataset = minari.load_dataset(dataset_id, download=True)
-    dataset = minari_to_transition_dataset(minari_dataset, seed=seed)
-    metadata = make_minari_metadata(dataset_id, minari_dataset, dataset, seed)
-    return dataset, metadata
-
-
-def minari_to_transition_dataset(minari_dataset: Any, seed: int | None = None) -> dict[str, np.ndarray]:
-    datasets = [episode_to_transitions(episode) for episode in minari_dataset.iterate_episodes()]
-    dataset = concat_datasets(datasets)
-    rng = np.random.default_rng(seed)
-    indices = rng.permutation(len(dataset["rewards"]))
-    return {key: dataset[key][indices] for key in DATASET_KEYS}
+    dataset = concat_datasets([episode_to_transitions(episode) for episode in minari_dataset.iterate_episodes()])
+    env_spec = getattr(minari_dataset, "env_spec", None)
+    return dataset, {
+        "source": "minari",
+        "dataset_id": dataset_id,
+        "env_id": getattr(env_spec, "id", None),
+        "num_episodes": int(getattr(minari_dataset, "total_episodes")),
+        "num_transitions": int(len(dataset["rewards"])),
+        "seed": seed,
+    }
 
 
 def episode_to_transitions(episode: Any) -> dict[str, np.ndarray]:
@@ -90,6 +83,7 @@ def episode_to_transitions(episode: Any) -> dict[str, np.ndarray]:
         "rewards": rewards,
         "terminals": terminals,
         "timeouts": timeouts,
+        "episode_ids": np.full(transition_count, episode.id, dtype=np.int64),
     }
 
 
@@ -97,23 +91,6 @@ def concat_datasets(datasets: list[dict[str, np.ndarray]]) -> dict[str, np.ndarr
     if not datasets:
         raise ValueError("Cannot concatenate an empty dataset list.")
     return {key: np.concatenate([dataset[key] for dataset in datasets], axis=0) for key in DATASET_KEYS}
-
-
-def make_minari_metadata(
-    dataset_id: str,
-    minari_dataset: Any,
-    dataset: dict[str, np.ndarray],
-    seed: int | None,
-) -> dict[str, Any]:
-    env_spec = getattr(minari_dataset, "env_spec", None)
-    return {
-        "source": "minari",
-        "dataset_id": dataset_id,
-        "env_id": getattr(env_spec, "id", None),
-        "num_episodes": int(getattr(minari_dataset, "total_episodes")),
-        "num_transitions": int(len(dataset["rewards"])),
-        "seed": seed,
-    }
 
 
 def make_minari_dataset_tag(dataset_id: str) -> str:

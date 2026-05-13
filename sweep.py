@@ -6,6 +6,7 @@
 
 import argparse
 import itertools
+import json
 import random
 import shutil
 from pathlib import Path
@@ -32,13 +33,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Collect offline datasets and train OfflineRL-Kit policies.")
     parser.add_argument("--env", required=True, help="Gymnasium environment id, e.g. HalfCheetah-v5")
     parser.add_argument("--dataset-source", choices=["generated", "minari"], default="generated")
-    parser.add_argument("--expert", default="experts", help="Expert policy .zip path or directory containing <env>.zip")
+    parser.add_argument("--expert", default="/home/shekhe/stable-offline-rl/experts", help="Expert policy .zip path or directory containing <env>.zip")
     parser.add_argument("--output-dir", default="outputs", help="Root directory for datasets and runs")
     parser.add_argument("--algos", nargs="+", default=["cql"], help="Algorithms: none, bc, cql, iql, td3bc, edac, mopo, combo, mobile, rambo")
     parser.add_argument("--num-samples", type=int, nargs="+", default=[10000], help="Dataset sample counts")
     parser.add_argument("--noise-scale", type=float, nargs="+", default=[0.0], help="Expert action noise scales")
     parser.add_argument("--prop-expert", type=float, nargs="+", default=[1.0], help="Fraction of samples from expert")
     parser.add_argument("--max-timesteps", type=int, default=1000, help="Maximum steps per collected trajectory")
+    parser.add_argument("--test-fraction", type=float, default=0.2)
+    parser.add_argument("--split-level", choices=["transition", "episode"], default="transition")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--epoch", type=int, default=1000)
@@ -76,65 +79,53 @@ def run_sweep(env_name: str, expert_path: Path, args: argparse.Namespace) -> Non
         args.num_samples, args.noise_scale, args.prop_expert
     ):
         dataset_tag = make_dataset_tag(num_samples, noise_scale, prop_expert, args.seed)
-        dataset_path = dataset_dir / f"{dataset_tag}.npz"
-        dataset = get_or_collect_dataset(
-            env_name=env_name,
-            expert_path=expert_path,
-            dataset_path=dataset_path,
-            num_samples=num_samples,
-            noise_scale=noise_scale,
-            prop_expert=prop_expert,
-            args=args,
-        )
-
-        for algo in args.algos:
-            if algo == "none":
-                continue
-            train_algo(
-                algo=algo,
+        tag_dir = dataset_dir / dataset_tag
+        if args.reuse_datasets and (tag_dir / "train.npz").exists():
+            print(f"Loading dataset split: {tag_dir}")
+            train_dataset = rollout.load_dataset(tag_dir / "train.npz")
+            paths = split_paths(tag_dir)
+        else:
+            dataset, metadata = collect_generated_dataset(
                 env_name=env_name,
-                dataset=dataset,
-                run_dir=run_dir / f"{algo}_{dataset_tag}",
+                expert_path=expert_path,
+                num_samples=num_samples,
+                noise_scale=noise_scale,
+                prop_expert=prop_expert,
                 args=args,
             )
+            train_dataset, paths = save_dataset_splits(tag_dir, dataset, metadata, args)
+
+        train_algos(env_name, train_dataset, run_dir, dataset_tag, paths, args)
 
 
 def run_minari_sweep(env_name: str, dataset_dir: Path, run_dir: Path, args: argparse.Namespace) -> None:
     for dataset_id in load_offline.list_minari_dataset_ids(env_name):
         dataset_tag = load_offline.make_minari_dataset_tag(dataset_id)
-        dataset_path = dataset_dir / f"{dataset_tag}.npz"
-        dataset = get_or_load_minari_dataset(dataset_id=dataset_id, dataset_path=dataset_path, args=args)
+        tag_dir = dataset_dir / dataset_tag
+        if args.reuse_datasets and (tag_dir / "train.npz").exists():
+            print(f"Loading dataset split: {tag_dir}")
+            train_dataset = rollout.load_dataset(tag_dir / "train.npz")
+            paths = split_paths(tag_dir)
+        else:
+            dataset, metadata = load_offline.load_minari_dataset(dataset_id, seed=args.seed)
+            train_dataset, paths = save_dataset_splits(tag_dir, dataset, metadata, args)
 
-        for algo in args.algos:
-            if algo == "none":
-                continue
-            train_algo(
-                algo=algo,
-                env_name=env_name,
-                dataset=dataset,
-                run_dir=run_dir / f"{algo}_{dataset_tag}",
-                args=args,
-            )
+        train_algos(env_name, train_dataset, run_dir, dataset_tag, paths, args)
 
 
-def get_or_collect_dataset(
+def collect_generated_dataset(
     env_name: str,
     expert_path: Path,
-    dataset_path: Path,
     num_samples: int,
     noise_scale: float,
     prop_expert: float,
     args: argparse.Namespace,
-) -> dict[str, np.ndarray]:
-    if args.reuse_datasets and dataset_path.exists():
-        print(f"Loading dataset: {dataset_path}")
-        return rollout.load_dataset(dataset_path)
-
+) -> tuple[dict[str, np.ndarray], dict]:
     if prop_expert > 0.0 and not expert_path.exists():
         raise FileNotFoundError(f"Expert policy not found: {expert_path}")
 
-    print(f"Collecting dataset: {dataset_path}")
-    dataset, metadata = rollout.collect_dataset(
+    print("Collecting generated dataset")
+    return rollout.collect_dataset(
         env_name=env_name,
         policy_path=str(expert_path),
         max_timesteps=args.max_timesteps,
@@ -144,23 +135,71 @@ def get_or_collect_dataset(
         deterministic=True,
         seed=args.seed,
     )
-    rollout.save_dataset(dataset, dataset_path, metadata)
-    return dataset
 
 
-def get_or_load_minari_dataset(
-    dataset_id: str,
-    dataset_path: Path,
+def save_dataset_splits(
+    dataset_dir: Path,
+    dataset: dict[str, np.ndarray],
+    metadata: dict,
     args: argparse.Namespace,
-) -> dict[str, np.ndarray]:
-    if args.reuse_datasets and dataset_path.exists():
-        print(f"Loading converted Minari dataset: {dataset_path}")
-        return rollout.load_dataset(dataset_path)
+) -> tuple[dict[str, np.ndarray], dict]:
+    full_path = dataset_dir / "full.npz"
+    train_path = dataset_dir / "train.npz"
+    test_path = dataset_dir / "test.npz"
+    metadata_path = dataset_dir / "metadata.json"
 
-    print(f"Loading Minari dataset: {dataset_id}")
-    dataset, metadata = load_offline.load_minari_dataset(dataset_id, seed=args.seed)
-    rollout.save_dataset(dataset, dataset_path, metadata)
-    return dataset
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    metadata = {
+        **metadata,
+        "split_level": args.split_level,
+        "test_fraction": args.test_fraction,
+        "full_dataset_path": str(full_path),
+        "train_dataset_path": str(train_path),
+        "test_dataset_path": str(test_path),
+    }
+    train_dataset, test_dataset = rollout.split_dataset(
+        dataset,
+        test_fraction=args.test_fraction,
+        split_level=args.split_level,
+        seed=args.seed,
+    )
+    rollout.save_dataset(dataset, full_path)
+    rollout.save_dataset(train_dataset, train_path)
+    rollout.save_dataset(test_dataset, test_path)
+    with metadata_path.open("w", encoding="utf-8") as file:
+        json.dump(metadata, file, indent=2, sort_keys=True)
+    return train_dataset, split_paths(dataset_dir)
+
+
+def train_algos(
+    env_name: str,
+    train_dataset: dict[str, np.ndarray],
+    run_dir: Path,
+    dataset_tag: str,
+    paths: dict,
+    args: argparse.Namespace,
+) -> None:
+    for algo in args.algos:
+        if algo != "none":
+            train_algo(
+                algo=algo,
+                env_name=env_name,
+                dataset=train_dataset,
+                run_dir=run_dir / f"{algo}_{dataset_tag}",
+                split_paths=paths,
+                args=args,
+            )
+
+
+def split_paths(dataset_dir: Path) -> dict:
+    return {
+        "dataset_dir": str(dataset_dir),
+        "full_dataset_path": str(dataset_dir / "full.npz"),
+        "train_dataset_path": str(dataset_dir / "train.npz"),
+        "test_dataset_path": str(dataset_dir / "test.npz"),
+        "dataset_metadata_path": str(dataset_dir / "metadata.json"),
+        "dataset_tag": dataset_dir.name,
+    }
 
 
 def train_algo(
@@ -168,6 +207,7 @@ def train_algo(
     env_name: str,
     dataset: dict[str, np.ndarray],
     run_dir: Path,
+    split_paths: dict,
     args: argparse.Namespace,
 ) -> None:
     if algo not in MODEL_FREE_ALGOS and algo not in MODEL_BASED_ALGOS:
@@ -243,6 +283,7 @@ def train_algo(
 
         print(f"Training {algo}: {run_dir}")
         trainer.train()
+        save_run_manifest(run_dir, algo, env_name, split_paths, args)
     finally:
         eval_env.close()
 
@@ -259,6 +300,31 @@ def build_buffer(dataset: dict[str, np.ndarray], env: gym.Env, device: str) -> R
     )
     buffer.load_dataset(train_dataset)
     return buffer
+
+
+def save_run_manifest(
+    run_dir: Path,
+    algo: str,
+    env_name: str,
+    split_paths: dict,
+    args: argparse.Namespace,
+) -> None:
+    manifest = {
+        "env_name": env_name,
+        "algo": algo,
+        "dataset_source": args.dataset_source,
+        "model_dir": str(run_dir / "model"),
+        "test_fraction": args.test_fraction,
+        "split_level": args.split_level,
+        "epoch": args.epoch,
+        "adv_weight": args.adv_weight,
+        "adv_batch_size": args.adv_batch_size,
+        "rollout_length": args.rollout_length,
+        "expert": str(resolve_expert_path(args.expert, env_name)),
+        **split_paths,
+    }
+    with (run_dir / "run_manifest.json").open("w", encoding="utf-8") as file:
+        json.dump(manifest, file, indent=2, sort_keys=True)
 
 
 def build_logger(run_dir: Path, args: argparse.Namespace, algo: str, env_name: str) -> Logger:

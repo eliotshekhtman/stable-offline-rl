@@ -4,7 +4,6 @@
 # - Save/load this project's canonical .npz transition schema and JSON metadata.
 # - Preserve Gymnasium terminated vs truncated signals as terminals vs timeouts.
 
-import json
 from pathlib import Path
 from typing import Callable
 
@@ -21,6 +20,7 @@ DATASET_KEYS = (
     "rewards",
     "terminals",
     "timeouts",
+    "episode_ids",
 )
 MAX_SEED = np.iinfo(np.int32).max
 
@@ -40,6 +40,7 @@ def collect_traj(
     env: gym.Env,
     action_fn: Callable[[np.ndarray], np.ndarray],
     max_timesteps: int,
+    episode_id: int,
     seed: int | None = None,
 ) -> dict[str, np.ndarray]:
     """Collect one Gymnasium trajectory as one-step transition arrays."""
@@ -51,6 +52,7 @@ def collect_traj(
         "rewards": [],
         "terminals": [],
         "timeouts": [],
+        "episode_ids": [],
     }
 
     for _ in range(max_timesteps):
@@ -64,6 +66,7 @@ def collect_traj(
         transitions["rewards"].append(np.float32(reward))
         transitions["terminals"].append(bool(terminated))
         transitions["timeouts"].append(bool(truncated))
+        transitions["episode_ids"].append(episode_id)
 
         obs = next_obs
         if terminated or truncated:
@@ -76,6 +79,7 @@ def collect_traj(
         "rewards": np.asarray(transitions["rewards"], dtype=np.float32),
         "terminals": np.asarray(transitions["terminals"], dtype=bool),
         "timeouts": np.asarray(transitions["timeouts"], dtype=bool),
+        "episode_ids": np.asarray(transitions["episode_ids"], dtype=np.int64),
     }
 
 
@@ -87,6 +91,7 @@ def collect_expert(
     noise_scale: float = 0.0,
     deterministic: bool = True,
     rng: np.random.Generator | None = None,
+    episode_id_start: int = 0,
 ) -> dict[str, np.ndarray]:
     """Collect transition samples from a clipped, noise-injected expert."""
     rng = np.random.default_rng() if rng is None else rng
@@ -115,6 +120,7 @@ def collect_expert(
         num_samples=num_samples,
         max_timesteps=max_timesteps,
         rng=rng,
+        episode_id_start=episode_id_start,
     )
 
 
@@ -126,15 +132,9 @@ def collect_suboptimal(
     noise_scale: float = 0.0,
     deterministic: bool = True,
     rng: np.random.Generator | None = None,
+    episode_id_start: int = 0,
 ) -> dict[str, np.ndarray]:
-    """Collect transition samples from pure random actions.
-
-    policy_path, noise_scale, and deterministic are accepted for symmetry with
-    CollectExpert and CollectDataset, but random-action collection does not use
-    them.
-    """
-    del policy_path, noise_scale, deterministic
-
+    """Collect transition samples from pure random actions."""
     rng = np.random.default_rng() if rng is None else rng
 
     def make_action_fn(env: gym.Env) -> Callable[[np.ndarray], np.ndarray]:
@@ -151,6 +151,7 @@ def collect_suboptimal(
         num_samples=num_samples,
         max_timesteps=max_timesteps,
         rng=rng,
+        episode_id_start=episode_id_start,
     )
 
 
@@ -179,31 +180,33 @@ def collect_dataset(
     rng = np.random.default_rng(seed)
     num_expert, num_suboptimal = _split_sample_counts(num_samples, prop_expert)
     datasets = []
+    next_episode_id = 0
 
     if num_expert > 0:
-        datasets.append(
-            collect_expert(
-                env_name=env_name,
-                policy_path=policy_path,
-                num_samples=num_expert,
-                max_timesteps=max_timesteps,
-                noise_scale=noise_scale,
-                deterministic=deterministic,
-                rng=rng,
-            )
+        expert_dataset = collect_expert(
+            env_name=env_name,
+            policy_path=policy_path,
+            num_samples=num_expert,
+            max_timesteps=max_timesteps,
+            noise_scale=noise_scale,
+            deterministic=deterministic,
+            rng=rng,
+            episode_id_start=next_episode_id,
         )
+        datasets.append(expert_dataset)
+        next_episode_id = int(expert_dataset["episode_ids"].max()) + 1
     if num_suboptimal > 0:
-        datasets.append(
-            collect_suboptimal(
-                env_name=env_name,
-                policy_path=policy_path,
-                num_samples=num_suboptimal,
-                max_timesteps=max_timesteps,
-                noise_scale=noise_scale,
-                deterministic=deterministic,
-                rng=rng,
-            )
+        suboptimal_dataset = collect_suboptimal(
+            env_name=env_name,
+            policy_path=policy_path,
+            num_samples=num_suboptimal,
+            max_timesteps=max_timesteps,
+            noise_scale=noise_scale,
+            deterministic=deterministic,
+            rng=rng,
+            episode_id_start=next_episode_id,
         )
+        datasets.append(suboptimal_dataset)
 
     dataset = _concat_datasets(datasets)
     indices = rng.permutation(len(dataset["rewards"]))
@@ -244,16 +247,12 @@ def make_metadata(
     }
 
 
-def save_dataset(dataset: dict[str, np.ndarray], dataset_path: str | Path, metadata: dict | None = None) -> None:
-    """Save dataset arrays as compressed NumPy data and optional JSON metadata."""
+def save_dataset(dataset: dict[str, np.ndarray], dataset_path: str | Path) -> None:
+    """Save dataset arrays as compressed NumPy data."""
     dataset_path = Path(dataset_path)
     dataset_path.parent.mkdir(parents=True, exist_ok=True)
     _validate_dataset(dataset)
     np.savez_compressed(dataset_path, **dataset)
-
-    if metadata is not None:
-        with dataset_path.with_suffix(".json").open("w", encoding="utf-8") as file:
-            json.dump(metadata, file, indent=2, sort_keys=True)
 
 
 def load_dataset(dataset_path: str | Path) -> dict[str, np.ndarray]:
@@ -264,10 +263,33 @@ def load_dataset(dataset_path: str | Path) -> dict[str, np.ndarray]:
     return dataset
 
 
-def load_metadata(dataset_path: str | Path) -> dict:
-    """Load JSON metadata next to a saved dataset."""
-    with Path(dataset_path).with_suffix(".json").open("r", encoding="utf-8") as file:
-        return json.load(file)
+def split_dataset(
+    dataset: dict[str, np.ndarray],
+    test_fraction: float,
+    split_level: str,
+    seed: int | None = None,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    _validate_dataset(dataset)
+    if not 0.0 < test_fraction < 1.0:
+        raise ValueError("test_fraction must be between 0 and 1.")
+
+    rng = np.random.default_rng(seed)
+    if split_level == "transition":
+        indices = rng.permutation(len(dataset["rewards"]))
+        test_size = max(1, int(round(len(indices) * test_fraction)))
+        train_indices, test_indices = indices[test_size:], indices[:test_size]
+    else:
+        unique_episode_ids = rng.permutation(np.unique(dataset["episode_ids"]))
+        test_size = max(1, int(round(len(unique_episode_ids) * test_fraction)))
+        test_episode_ids = set(unique_episode_ids[:test_size])
+        test_mask = np.asarray([episode_id in test_episode_ids for episode_id in dataset["episode_ids"]])
+        indices = np.arange(len(dataset["episode_ids"]))
+        train_indices, test_indices = indices[~test_mask], indices[test_mask]
+
+    return (
+        {key: dataset[key][train_indices] for key in DATASET_KEYS},
+        {key: dataset[key][test_indices] for key in DATASET_KEYS},
+    )
 
 
 def _collect_source(
@@ -276,6 +298,7 @@ def _collect_source(
     num_samples: int,
     max_timesteps: int,
     rng: np.random.Generator,
+    episode_id_start: int = 0,
 ) -> dict[str, np.ndarray]:
     env = gym.make(env_name)
     try:
@@ -289,6 +312,7 @@ def _collect_source(
                 env,
                 action_fn,
                 max_timesteps=max_timesteps,
+                episode_id=episode_id_start + len(datasets),
                 seed=int(rng.integers(0, MAX_SEED)),
             )
             if len(traj["rewards"]) == 0:
