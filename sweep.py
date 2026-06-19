@@ -58,6 +58,9 @@ def parse_args() -> argparse.Namespace:
     training.add_argument("--step-per-epoch", type=int, default=1000, help="Gradient-update steps per policy-training epoch")
     training.add_argument("--batch-size", type=int, default=256, help="Policy-training batch size")
     training.add_argument("--eval-episodes", type=int, default=10, help="Episodes used by OfflineRL-Kit trainer evaluation during training")
+    training.add_argument("--eval", action="store_true", help="After training, run full evaluation for each trained policy and then generate plots")
+    training.add_argument("--jacobian-samples", type=int, default=8, help="Evaluation-only number of dataset and rollout states used for finite-difference Jacobian metrics")
+    training.add_argument("--fd-eps", type=float, default=1e-4, help="Evaluation-only central finite-difference perturbation size for Jacobian metrics")
 
     model_based = parser.add_argument_group("model-based algorithm options")
     model_based.add_argument("--dynamics-max-epochs", type=int, default=5, help="Maximum epochs for fitting the learned dynamics model before policy training")
@@ -83,6 +86,7 @@ def run_sweep(env_name: str, expert_path: Path, args: argparse.Namespace) -> Non
 
     if args.dataset_source == "minari":
         run_minari_sweep(env_name=env_name, dataset_dir=dataset_dir, run_dir=run_dir, args=args)
+        maybe_plot(output_root, args)
         return
 
     for num_samples, noise_scale, prop_expert in itertools.product(
@@ -106,6 +110,8 @@ def run_sweep(env_name: str, expert_path: Path, args: argparse.Namespace) -> Non
             train_dataset, paths = save_dataset_splits(tag_dir, dataset, metadata, args)
 
         train_algos(env_name, train_dataset, run_dir, dataset_tag, paths, args)
+
+    maybe_plot(output_root, args)
 
 
 def run_minari_sweep(env_name: str, dataset_dir: Path, run_dir: Path, args: argparse.Namespace) -> None:
@@ -191,14 +197,41 @@ def train_algos(
 ) -> None:
     for algo in args.algos:
         if algo != "none":
+            algo_run_dir = run_dir / f"{algo}_{dataset_tag}"
             train_algo(
                 algo=algo,
                 env_name=env_name,
                 dataset=train_dataset,
-                run_dir=run_dir / f"{algo}_{dataset_tag}",
+                run_dir=algo_run_dir,
                 split_paths=paths,
                 args=args,
             )
+            maybe_evaluate(algo_run_dir, args)
+
+
+def maybe_evaluate(run_dir: Path, args: argparse.Namespace) -> None:
+    if not args.eval:
+        return
+    from eval import evaluate_run
+
+    evaluate_run(
+        run_dir,
+        argparse.Namespace(
+            device=args.device,
+            eval_episodes=args.eval_episodes,
+            seed=args.seed,
+            jacobian_samples=args.jacobian_samples,
+            fd_eps=args.fd_eps,
+        ),
+    )
+
+
+def maybe_plot(output_root: Path, args: argparse.Namespace) -> None:
+    if not args.eval:
+        return
+    from plot import plot_root
+
+    plot_root(output_root)
 
 
 def split_paths(dataset_dir: Path) -> dict:
