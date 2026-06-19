@@ -20,6 +20,7 @@ import rollout
 from offlinerlkit.buffer import ReplayBuffer
 from offlinerlkit.policy_trainer import MBPolicyTrainer, MFPolicyTrainer
 from offlinerlkit.utils.logger import Logger
+from dql import CLEANDIFFUSER_COMMIT, train_dql
 from policies import MODEL_BASED_ALGOS, MODEL_FREE_ALGOS, build_model_based_policy, build_model_free_policy
 
 
@@ -53,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     generated.add_argument("--max-timesteps", type=int, default=1000, help="Maximum length of each generated rollout trajectory")
 
     training = parser.add_argument_group("policy training")
-    training.add_argument("--algos", nargs="+", default=["cql"], help="Algorithms to train: none, bc, cql, iql, td3bc, edac, mopo, combo, mobile, rambo")
+    training.add_argument("--algos", nargs="+", default=["cql"], help="Algorithms to train: none, bc, cql, iql, td3bc, edac, dql, mopo, combo, mobile, rambo")
     training.add_argument("--epoch", type=int, default=1000, help="Number of policy-training epochs")
     training.add_argument("--step-per-epoch", type=int, default=1000, help="Gradient-update steps per policy-training epoch")
     training.add_argument("--batch-size", type=int, default=256, help="Policy-training batch size")
@@ -269,17 +270,18 @@ def train_algo(
         if algo in MODEL_FREE_ALGOS:
             buffer = build_buffer(dataset, eval_env, args.device)
             policy, lr_scheduler = build_model_free_policy(algo, eval_env, buffer, args)
-            trainer = MFPolicyTrainer(
-                policy=policy,
-                eval_env=eval_env,
-                buffer=buffer,
-                logger=logger,
-                epoch=args.epoch,
-                step_per_epoch=args.step_per_epoch,
-                batch_size=args.batch_size,
-                eval_episodes=args.eval_episodes,
-                lr_scheduler=lr_scheduler,
-            )
+            if algo != "dql":
+                trainer = MFPolicyTrainer(
+                    policy=policy,
+                    eval_env=eval_env,
+                    buffer=buffer,
+                    logger=logger,
+                    epoch=args.epoch,
+                    step_per_epoch=args.step_per_epoch,
+                    batch_size=args.batch_size,
+                    eval_episodes=args.eval_episodes,
+                    lr_scheduler=lr_scheduler,
+                )
         else:
             real_buffer = build_buffer(dataset, eval_env, args.device)
             obs_mean = obs_std = None
@@ -325,7 +327,10 @@ def train_algo(
             )
 
         print(f"Training {algo}: {run_dir}")
-        trainer.train()
+        if algo == "dql":
+            train_dql(policy, buffer, logger, args.epoch, args.step_per_epoch, args.batch_size)
+        else:
+            trainer.train()
         save_run_manifest(run_dir, algo, env_name, split_paths, args)
     finally:
         eval_env.close()
@@ -360,12 +365,15 @@ def save_run_manifest(
         "test_fraction": args.test_fraction,
         "split_level": args.split_level,
         "epoch": args.epoch,
+        "step_per_epoch": args.step_per_epoch,
         "adv_weight": args.adv_weight,
         "adv_batch_size": args.adv_batch_size,
         "rollout_length": args.rollout_length,
         "expert": str(resolve_expert_path(args.expert, env_name)),
         **split_paths,
     }
+    if algo == "dql":
+        manifest["cleandiffuser_commit"] = CLEANDIFFUSER_COMMIT
     with (run_dir / "run_manifest.json").open("w", encoding="utf-8") as file:
         json.dump(manifest, file, indent=2, sort_keys=True)
 

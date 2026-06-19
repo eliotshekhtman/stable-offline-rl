@@ -18,9 +18,10 @@ from offlinerlkit.policy import BCPolicy, COMBOPolicy, CQLPolicy, EDACPolicy, IQ
 from offlinerlkit.utils.noise import GaussianNoise
 from offlinerlkit.utils.scaler import StandardScaler
 from offlinerlkit.utils.termination_fns import get_termination_fn, obs_unnormalization
+from dql import build_dql_policy
 
 
-MODEL_FREE_ALGOS = ("bc", "cql", "iql", "td3bc", "edac")
+MODEL_FREE_ALGOS = ("bc", "cql", "iql", "td3bc", "edac", "dql")
 MODEL_BASED_ALGOS = ("mopo", "combo", "mobile", "rambo")
 
 MODEL_BASED_DEFAULTS = {
@@ -40,6 +41,17 @@ def build_model_free_policy(
     obs_dim = int(np.prod(env.observation_space.shape))
     action_dim = int(np.prod(env.action_space.shape))
     max_action = float(env.action_space.high[0])
+
+    if algo == "dql":
+        if env.spec.id != "HalfCheetah-v5":
+            raise ValueError("DQL currently has validated inference defaults only for HalfCheetah-v5.")
+        return build_dql_policy(
+            buffer,
+            action_low=env.action_space.low,
+            action_high=env.action_space.high,
+            total_steps=args.epoch * args.step_per_epoch,
+            device=args.device,
+        ), None
 
     if algo == "bc":
         actor_backbone = MLP(input_dim=obs_dim, hidden_dims=[256, 256])

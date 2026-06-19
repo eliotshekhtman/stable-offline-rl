@@ -40,6 +40,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def evaluate_run(run_dir: Path, args: argparse.Namespace) -> None:
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
     with (run_dir / "run_manifest.json").open("r", encoding="utf-8") as file:
         manifest = json.load(file)
     policy, dynamics, obs_mean, obs_std = load_policy_and_dynamics(manifest, args.device)
@@ -131,6 +134,7 @@ def load_policy_and_dynamics(manifest: dict, device: str):
     build_args = argparse.Namespace(
         device=device,
         epoch=manifest["epoch"],
+        step_per_epoch=manifest.get("step_per_epoch", 1),
         adv_weight=manifest["adv_weight"],
         rollout_length=manifest["rollout_length"],
         adv_batch_size=manifest["adv_batch_size"],
