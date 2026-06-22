@@ -455,7 +455,7 @@ def checkpoint_epochs(epochs: int) -> list[int]:
 
 def checkpoint_schedule(epochs: int) -> list[dict]:
     by_epoch = {0: 0}
-    for percent in (1, 5, 10, 25, 50, 75, 100):
+    for percent in range(10, 101, 10):
         by_epoch[math.ceil(percent * epochs / 100)] = percent
     return [
         {

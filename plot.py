@@ -46,6 +46,7 @@ def plot_root(root: Path, out: Path | None = None) -> None:
         dataset_out.mkdir(exist_ok=True)
         dataset_rows = [row for row in rows if row["dataset_tag"] == dataset_tag]
         dataset_histories = [history for history in histories if history["dataset_tag"] == dataset_tag]
+        plot_stability_distances(dataset_rows, dataset_out)
         plot_mismatch_ratios(dataset_rows, dataset_out)
         plot_history_relationships(dataset_histories, dataset_out)
         plot_training_histories(dataset_histories, dataset_out)
@@ -63,7 +64,7 @@ def load_rows(root: Path) -> list[dict]:
         manifest = load_json(manifest_path)
         results = load_json(results_path)
         metadata = load_json(Path(manifest["dataset_metadata_path"]))
-        row = {**manifest, **results, **dataset_fields(metadata)}
+        row = {**manifest, **results, **dataset_fields(metadata), "run_dir": str(run_dir.resolve())}
         rows.append(row)
     return rows
 
@@ -149,6 +150,59 @@ def plot_minari_reward_bars(rows: list[dict], out: Path) -> None:
     ax.legend()
     fig.tight_layout()
     fig.savefig(out / "minari_reward_by_dataset.png", dpi=200)
+    plt.close(fig)
+
+
+def plot_stability_distances(rows: list[dict], out: Path) -> None:
+    stability_distance_plot(rows, out, "global")
+    stability_distance_plot(rows, out, "local")
+
+
+def stability_distance_plot(rows: list[dict], out: Path, stability_type: str) -> None:
+    filename = f"{stability_type}_stability.npz"
+    available = [row for row in rows if (Path(row["run_dir"]) / "eval" / filename).exists()]
+    if not available:
+        return
+
+    available.sort(key=lambda row: row["algo"])
+    fig, axes = plt.subplots(
+        2, len(available), figsize=(4 * len(available), 7),
+        squeeze=False, sharex="col",
+    )
+    for column, row in enumerate(available):
+        with np.load(Path(row["run_dir"]) / "eval" / filename) as data:
+            curves = data["distance_curves"]
+            envelope = data["envelope"]
+            support = data["support"]
+            c = float(data["c"])
+            rho = float(data["rho"])
+
+        normalized = curves / np.maximum(curves[:, :1], EPS)
+        normalized[normalized <= 0.0] = np.nan
+        timesteps = np.arange(len(envelope))
+        bound = c * rho**timesteps
+        bound[bound <= 0.0] = np.nan
+
+        distance_axis = axes[0, column]
+        pair_lines = distance_axis.plot(normalized.T, color="tab:blue", alpha=0.2, linewidth=0.7)
+        pair_lines[0].set_label("trajectory pairs")
+        distance_axis.plot(envelope, color="tab:red", linewidth=2, label="maximum envelope")
+        distance_axis.plot(bound, color="black", linestyle="--", linewidth=1.5, label=r"$C\rho^t$")
+        distance_axis.axhline(1.0, color="gray", linestyle=":", label="initial distance")
+        distance_axis.set_yscale("log")
+        distance_axis.set_title(f"{row['algo'].upper()}\nC={c:.3g}, rho={rho:.6g}")
+
+        support_axis = axes[1, column]
+        support_axis.plot(support / support[0], color="tab:purple", linewidth=2)
+        support_axis.set_ylim(-0.02, 1.02)
+        support_axis.set_xlabel("timestep")
+
+    axes[0, 0].set_ylabel("normalized state distance")
+    axes[1, 0].set_ylabel("pair support fraction")
+    axes[0, 0].legend(fontsize=8)
+    fig.suptitle(f"{stability_type.capitalize()} final-policy stability distances")
+    fig.tight_layout()
+    fig.savefig(out / f"{stability_type}_stability_distances.png", dpi=200)
     plt.close(fig)
 
 
