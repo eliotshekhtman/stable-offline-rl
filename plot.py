@@ -3,6 +3,7 @@
 # - Plot generated-dataset reward ablations when exactly one generated axis varies.
 # - Plot Minari reward bars without implying a numeric ablation.
 # - Plot run-level dynamics mismatch ratios against learned policy reward.
+# - Plot stability and conservativity over policy-training checkpoints.
 
 import argparse
 import json
@@ -34,10 +35,20 @@ def parse_args() -> argparse.Namespace:
 def plot_root(root: Path, out: Path | None = None) -> None:
     out = root / "plots" if out is None else out
     rows = load_rows(root)
+    histories = load_histories(root)
     out.mkdir(parents=True, exist_ok=True)
     plot_generated_reward_ablation(rows, out)
     plot_minari_reward_bars(rows, out)
-    plot_mismatch_ratios(rows, out)
+
+    dataset_tags = sorted({row["dataset_tag"] for row in rows} | {history["dataset_tag"] for history in histories})
+    for dataset_tag in dataset_tags:
+        dataset_out = out / dataset_tag
+        dataset_out.mkdir(exist_ok=True)
+        dataset_rows = [row for row in rows if row["dataset_tag"] == dataset_tag]
+        dataset_histories = [history for history in histories if history["dataset_tag"] == dataset_tag]
+        plot_mismatch_ratios(dataset_rows, dataset_out)
+        plot_history_relationships(dataset_histories, dataset_out)
+        plot_training_histories(dataset_histories, dataset_out)
 
 
 def load_rows(root: Path) -> list[dict]:
@@ -73,6 +84,15 @@ def dataset_fields(metadata: dict) -> dict:
         "noise_scale": metadata["noise_scale"],
         "prop_expert": num_expert / num_samples,
     }
+
+
+def load_histories(root: Path) -> list[dict]:
+    histories = []
+    for history_path in sorted((root / "runs").glob("*/eval/history.json")):
+        history = load_json(history_path)
+        history["label"] = history["algo"]
+        histories.append(history)
+    return histories
 
 
 def plot_generated_reward_ablation(rows: list[dict], out: Path) -> None:
@@ -175,6 +195,103 @@ def plot_mismatch_ratios(rows: list[dict], out: Path) -> None:
         color_label="next-state mismatch ratio",
         path=out / "reward_vs_jacobian_ratio.png",
     )
+
+
+def plot_history_relationships(histories: list[dict], out: Path) -> None:
+    if not histories:
+        return
+
+    history_relationship_plot(
+        histories, "global_stability_rho", "global_stability_c",
+        "global empirical rho", out / "global_stability_vs_reward.png", reference_x=1.0,
+    )
+    history_relationship_plot(
+        histories, "local_stability_rho", "local_stability_c",
+        "local empirical rho", out / "local_stability_vs_reward.png", reference_x=1.0,
+    )
+    history_relationship_plot(
+        histories, "state_ood_ratio", None,
+        "state OOD ratio", out / "state_ood_vs_reward.png", reference_x=1.0,
+    )
+    history_relationship_plot(
+        histories, "state_action_ood_ratio", None,
+        "state-action OOD ratio", out / "state_action_ood_vs_reward.png", reference_x=1.0,
+    )
+
+
+def history_relationship_plot(
+    histories: list[dict],
+    x_key: str,
+    c_key: str | None,
+    xlabel: str,
+    path: Path,
+    reference_x: float | None = None,
+) -> None:
+    fig, ax = plt.subplots(figsize=(8, 5))
+    color_scale = plt.Normalize(0, 100)
+    color_map = plt.get_cmap("viridis")
+    for history in histories:
+        records = history["records"]
+        x = np.asarray([record[x_key] for record in records])
+        reward = np.asarray([record["policy_return_mean"] for record in records])
+        percent = np.asarray([record["actual_percent"] for record in records])
+        sizes = 35 if c_key is None else 25 + 20 * np.log1p([record[c_key] for record in records])
+        ax.plot(x, reward, linewidth=1, alpha=0.7, label=history["label"])
+        ax.scatter(x, reward, c=percent, s=sizes, cmap=color_map, norm=color_scale)
+
+    if reference_x is not None:
+        ax.axvline(reference_x, color="gray", linestyle=":", label=f"{xlabel} = 1")
+    ax.axhline(np.mean([history["expert_return_mean"] for history in histories]), color="black", linestyle=":", label="expert return")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("policy return")
+    if c_key is not None:
+        ax.set_title("Marker size scales with log(1 + C)")
+    ax.legend(fontsize=8)
+    fig.colorbar(plt.cm.ScalarMappable(norm=color_scale, cmap=color_map), ax=ax, label="training completed (%)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+
+
+def plot_training_histories(histories: list[dict], out: Path) -> None:
+    if not histories:
+        return
+
+    history_line_plot(
+        histories, ("policy_return_mean",), ("policy return",),
+        out / "reward_vs_training_percent.png",
+    )
+    history_line_plot(
+        histories,
+        ("global_stability_rho", "local_stability_rho", "global_stability_c", "local_stability_c"),
+        ("global rho", "local rho", "global C", "local C"),
+        out / "stability_vs_training_percent.png",
+    )
+    history_line_plot(
+        histories, ("state_ood_ratio", "state_action_ood_ratio"),
+        ("state OOD", "state-action OOD"), out / "ood_vs_training_percent.png",
+    )
+
+
+def history_line_plot(histories: list[dict], keys: tuple[str, ...], names: tuple[str, ...], path: Path) -> None:
+    fig, axes = plt.subplots(len(keys), 1, figsize=(8, 3 * len(keys)), squeeze=False, sharex=True)
+    for axis, key, name in zip(axes[:, 0], keys, names):
+        for history in histories:
+            records = history["records"]
+            axis.plot(
+                [record["actual_percent"] for record in records],
+                [record[key] for record in records],
+                marker="o",
+                label=history["label"],
+            )
+        if key.endswith("_rho") or key.endswith("_ood_ratio"):
+            axis.axhline(1.0, color="gray", linestyle=":")
+        axis.set_ylabel(name)
+    axes[0, 0].legend(fontsize=8)
+    axes[-1, 0].set_xlabel("training completed (%)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
 
 
 def scatter(rows: list[dict], x_key: str, y_key: str, color_key: str, xlabel: str, ylabel: str, color_label: str, path: Path) -> None:

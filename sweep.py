@@ -2,11 +2,12 @@
 # - Parse the experiment CLI and keep one run focused on one Gymnasium environment.
 # - Choose the dataset source: generated rollouts or converted Minari datasets.
 # - Cache/load datasets, build OfflineRL-Kit replay buffers, and launch trainers.
-# - Own experiment directories, logging, seeding, and run naming.
+# - Own experiment directories, milestone checkpoints, logging, seeding, and run naming.
 
 import argparse
 import itertools
 import json
+import math
 import random
 import shutil
 from pathlib import Path
@@ -63,6 +64,13 @@ def parse_args() -> argparse.Namespace:
     training.add_argument("--jacobian-samples", type=int, default=8, help="Evaluation-only number of dataset and rollout states used for finite-difference Jacobian metrics")
     training.add_argument("--fd-eps", type=float, default=1e-4, help="Evaluation-only central finite-difference perturbation size for Jacobian metrics")
 
+    stability = parser.add_argument_group("stability and conservativity evaluation")
+    stability.add_argument("--stability-trajectories", type=int, default=8, help="Evaluation-only number of global trajectories and local perturbed-state pairs")
+    stability.add_argument("--stability-horizon", type=int, default=300, help="Evaluation-only maximum rollout steps for global and local stability trajectories")
+    stability.add_argument("--global-max-offset", type=int, default=30, help="Evaluation-only maximum timestep offset for global trajectory phase alignment")
+    stability.add_argument("--local-perturbation-scale", type=float, default=0.01, help="Evaluation-only local perturbation norm in standardized physical-state coordinates")
+    stability.add_argument("--ood-samples", type=int, default=10000, help="Evaluation-only maximum held-out and rollout samples used for OOD metrics")
+
     model_based = parser.add_argument_group("model-based algorithm options")
     model_based.add_argument("--dynamics-max-epochs", type=int, default=5, help="Maximum epochs for fitting the learned dynamics model before policy training")
     model_based.add_argument("--rollout-freq", type=int, default=1000, help="Policy-training step interval between learned-dynamics rollout generation")
@@ -116,7 +124,15 @@ def run_sweep(env_name: str, expert_path: Path, args: argparse.Namespace) -> Non
 
 
 def run_minari_sweep(env_name: str, dataset_dir: Path, run_dir: Path, args: argparse.Namespace) -> None:
-    for dataset_id in load_offline.list_minari_dataset_ids(env_name):
+    if args.reuse_datasets:
+        dataset_ids = [
+            json.loads(path.read_text(encoding="utf-8"))["dataset_id"]
+            for path in sorted(dataset_dir.glob("minari_*/metadata.json"))
+        ]
+    else:
+        dataset_ids = load_offline.list_minari_dataset_ids(env_name)
+
+    for dataset_id in dataset_ids:
         dataset_tag = load_offline.make_minari_dataset_tag(dataset_id)
         tag_dir = dataset_dir / dataset_tag
         if args.reuse_datasets and (tag_dir / "train.npz").exists():
@@ -223,6 +239,11 @@ def maybe_evaluate(run_dir: Path, args: argparse.Namespace) -> None:
             seed=args.seed,
             jacobian_samples=args.jacobian_samples,
             fd_eps=args.fd_eps,
+            stability_trajectories=args.stability_trajectories,
+            stability_horizon=args.stability_horizon,
+            global_max_offset=args.global_max_offset,
+            local_perturbation_scale=args.local_perturbation_scale,
+            ood_samples=args.ood_samples,
         ),
     )
 
@@ -281,6 +302,7 @@ def train_algo(
                     batch_size=args.batch_size,
                     eval_episodes=args.eval_episodes,
                     lr_scheduler=lr_scheduler,
+                    checkpoint_epochs=checkpoint_epochs(args.epoch),
                 )
         else:
             real_buffer = build_buffer(dataset, eval_env, args.device)
@@ -324,11 +346,21 @@ def train_algo(
                 eval_episodes=args.eval_episodes,
                 lr_scheduler=lr_scheduler,
                 dynamics_update_freq=args.dynamics_update_freq if algo == "rambo" else 0,
+                checkpoint_epochs=checkpoint_epochs(args.epoch),
             )
+
+        initial_checkpoint = Path(logger.checkpoint_dir) / "step_0"
+        initial_checkpoint.mkdir(exist_ok=True)
+        torch.save(policy.state_dict(), initial_checkpoint / "policy.pth")
+        if algo in MODEL_BASED_ALGOS:
+            dynamics.save(initial_checkpoint)
 
         print(f"Training {algo}: {run_dir}")
         if algo == "dql":
-            train_dql(policy, buffer, logger, args.epoch, args.step_per_epoch, args.batch_size)
+            train_dql(
+                policy, buffer, logger, args.epoch, args.step_per_epoch,
+                args.batch_size, checkpoint_epochs(args.epoch),
+            )
         else:
             trainer.train()
         save_run_manifest(run_dir, algo, env_name, split_paths, args)
@@ -370,6 +402,7 @@ def save_run_manifest(
         "adv_batch_size": args.adv_batch_size,
         "rollout_length": args.rollout_length,
         "expert": str(resolve_expert_path(args.expert, env_name)),
+        "checkpoints": checkpoint_manifest(run_dir, algo, args.epoch, args.step_per_epoch),
         **split_paths,
     }
     if algo == "dql":
@@ -414,6 +447,41 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
+
+
+def checkpoint_epochs(epochs: int) -> list[int]:
+    return [item["epoch"] for item in checkpoint_schedule(epochs) if item["epoch"] > 0]
+
+
+def checkpoint_schedule(epochs: int) -> list[dict]:
+    by_epoch = {0: 0}
+    for percent in (1, 5, 10, 25, 50, 75, 100):
+        by_epoch[math.ceil(percent * epochs / 100)] = percent
+    return [
+        {
+            "requested_percent": requested_percent,
+            "actual_percent": 100.0 * epoch / epochs,
+            "epoch": epoch,
+        }
+        for epoch, requested_percent in sorted(by_epoch.items())
+    ]
+
+
+def checkpoint_manifest(run_dir: Path, algo: str, epochs: int, steps_per_epoch: int) -> list[dict]:
+    records = []
+    for item in checkpoint_schedule(epochs):
+        step = item["epoch"] * steps_per_epoch
+        checkpoint_dir = run_dir / "checkpoint" / f"step_{step}"
+        record = {
+            **item,
+            "step": step,
+            "policy_path": str(checkpoint_dir / "policy.pth"),
+        }
+        if algo in MODEL_BASED_ALGOS:
+            dynamics_dir = checkpoint_dir if algo == "rambo" else run_dir / "checkpoint" / "step_0"
+            record["dynamics_path"] = str(dynamics_dir)
+        records.append(record)
+    return records
 
 
 def make_dataset_tag(num_samples: int, noise_scale: float, prop_expert: float, seed: int) -> str:

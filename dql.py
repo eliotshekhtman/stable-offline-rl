@@ -1,9 +1,10 @@
 # Tasks:
 # - Adapt CleanDiffuser's DQL actor and critic to OfflineRL-Kit's policy interface.
-# - Train DQL without OfflineRL-Kit's costly per-epoch environment evaluation.
+# - Train and checkpoint DQL without OfflineRL-Kit's per-epoch environment evaluation.
 
 import time
 from copy import deepcopy
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -190,7 +191,15 @@ def build_dql_policy(buffer: ReplayBuffer, action_low: np.ndarray, action_high: 
     )
 
 
-def train_dql(policy: DQLPolicy, buffer: ReplayBuffer, logger: Logger, epochs: int, steps_per_epoch: int, batch_size: int) -> None:
+def train_dql(
+    policy: DQLPolicy,
+    buffer: ReplayBuffer,
+    logger: Logger,
+    epochs: int,
+    steps_per_epoch: int,
+    batch_size: int,
+    checkpoint_epochs: list[int],
+) -> None:
     start_time = time.time()
     total_steps = 0
     for epoch in range(1, epochs + 1):
@@ -205,6 +214,10 @@ def train_dql(policy: DQLPolicy, buffer: ReplayBuffer, logger: Logger, epochs: i
         logger.set_timestep(total_steps)
         logger.dumpkvs()
         torch.save(policy.state_dict(), f"{logger.checkpoint_dir}/policy.pth")
+        if epoch in checkpoint_epochs:
+            checkpoint_dir = Path(logger.checkpoint_dir) / f"step_{total_steps}"
+            checkpoint_dir.mkdir(exist_ok=True)
+            torch.save(policy.state_dict(), checkpoint_dir / "policy.pth")
 
     logger.log(f"total time: {time.time() - start_time:.2f}s")
     torch.save(policy.state_dict(), f"{logger.model_dir}/policy.pth")

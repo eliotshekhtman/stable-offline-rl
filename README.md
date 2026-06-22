@@ -32,3 +32,16 @@ python sweep.py \
   --split-level episode \
   --eval
 ```
+
+## Evaluation over training
+
+Every run saves policy checkpoints at approximately 0, 1, 5, 10, 25, 50, 75, and 100 percent of policy training. Milestones that fall in the same epoch are collapsed. Checkpoints live under `checkpoint/step_<gradient_step>/`; fixed model-based dynamics are stored once at step zero, while RAMBO saves its changing dynamics with each checkpoint.
+
+Passing `--eval` runs both final-policy evaluation and checkpoint-history evaluation before plotting. In addition to reward and the model-based next-state/Jacobian metrics, evaluation reports:
+
+- **Global stability:** trajectories from different reset states are phase-aligned by the offset minimizing second-half state distance. This alignment is an explicit heuristic for periodic motion.
+- **Local stability:** held-out states are paired with small perturbations in reconstructible `qpos/qvel` coordinates, without phase alignment.
+- **Empirical `(C, rho)`:** standardized distances are bounded at every observed timestep by `C * rho**t`. Values of `rho` are not constrained below one.
+- **State and state-action OOD ratios:** mean rollout-to-training k-nearest-neighbor distance divided by the corresponding held-out-to-training distance. A ratio near one means the rollout is about as far from training data as held-out data is.
+
+Dynamics mismatch and finite-difference Jacobian mismatch are evaluated only for the final model. Reward, stability, and OOD metrics are evaluated at every saved policy checkpoint. Raw arrays are saved under each run's `eval/` directory, and aggregate plots are written under the environment output directory's `plots/` directory.
