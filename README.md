@@ -14,9 +14,11 @@ git -C /home/shekhe/CleanDiffuser checkout 05f17fc9dbeae7c19a5e264632c9ae9aaac59
 python -m pip install --editable /home/shekhe/CleanDiffuser --no-deps --no-build-isolation
 ```
 
-The integration currently supports `HalfCheetah-v5`. It uses CleanDiffuser's five-step DDPM actor, twin critic, EMA updates, and 50-candidate inference defaults. Training length is `epoch * step_per_epoch`; the upstream two-million-step schedule corresponds to `--epoch 2000 --step-per-epoch 1000`.
+The integration supports flat continuous-control environments, including Gymnasium MuJoCo tasks such as `HalfCheetah-v5` and `Humanoid-v5`. Actions are normalized to `[-1, 1]` inside DQL and converted back to the environment's native bounds for execution. It uses CleanDiffuser's five-step DDPM actor, twin critic, EMA updates, and 50-candidate inference defaults. Training length is `epoch * step_per_epoch`; the upstream two-million-step schedule corresponds to `--epoch 2000 --step-per-epoch 1000`.
 
-CleanDiffuser's episodic reward-range normalization is disabled. Generated datasets sample individual transitions from collected trajectories, so they do not retain the complete episodes needed to calculate that normalization correctly. This keeps preprocessing consistent between generated and Minari datasets.
+Published CleanDiffuser defaults are used when available: Q-selection weight temperature 50 for HalfCheetah, 300 for Walker2d, 100 for Hopper medium/replay, and 8 for Hopper medium-expert, with `eta=1`. Other environments use 50 and record that it is a fallback. `--dql-weight-temperature` and `--dql-eta` override these choices.
+
+`--dql-reward-normalization auto` applies CleanDiffuser-style episodic return-range scaling to the training episodes of Minari datasets split by episode. It leaves rewards unchanged for generated datasets and transition-level splits, which do not necessarily retain complete episodes. Every resolved DQL setting and its source are saved in `run_manifest.json`.
 
 ```bash
 cd /home/shekhe/stable-offline-rl
@@ -35,7 +37,7 @@ python sweep.py \
 
 ## Evaluation over training
 
-Every run saves policy checkpoints at approximately 0, 1, 5, 10, 25, 50, 75, and 100 percent of policy training. Milestones that fall in the same epoch are collapsed. Checkpoints live under `checkpoint/step_<gradient_step>/`; fixed model-based dynamics are stored once at step zero, while RAMBO saves its changing dynamics with each checkpoint.
+Every run saves policy checkpoints at approximately 0, 10, 20, ..., 100 percent of policy training. Milestones that fall in the same epoch are collapsed. Checkpoints live under `checkpoint/step_<gradient_step>/`; fixed model-based dynamics are stored once at step zero, while RAMBO saves its changing dynamics with each checkpoint.
 
 Passing `--eval` runs both final-policy evaluation and checkpoint-history evaluation before plotting. In addition to reward and the model-based next-state/Jacobian metrics, evaluation reports:
 

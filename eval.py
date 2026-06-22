@@ -180,7 +180,12 @@ def load_policy_and_dynamics(
         )
         dynamics.load(str(dynamics_path))
     else:
-        policy, _ = build_model_free_policy(manifest["algo"], env, buffer, build_args)
+        dql_config = manifest.get("dql_config", {
+            "eta": 1.0,
+            "weight_temperature": 50.0,
+            "reward_scale": 1.0,
+        })
+        policy, _ = build_model_free_policy(manifest["algo"], env, buffer, build_args, dql_config)
         dynamics = None
 
     policy.load_state_dict(torch.load(policy_path, map_location=device, weights_only=True))

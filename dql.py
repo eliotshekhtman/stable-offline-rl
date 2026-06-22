@@ -24,6 +24,64 @@ from offlinerlkit.utils.logger import Logger
 CLEANDIFFUSER_COMMIT = "05f17fc9dbeae7c19a5e264632c9ae9aaac5994e"
 
 
+def resolve_dql_config(
+    env_name: str,
+    dataset_tag: str,
+    dataset: dict[str, np.ndarray],
+    dataset_source: str,
+    split_level: str,
+    eta_override: float | None,
+    weight_temperature_override: float | None,
+    reward_normalization: str,
+) -> dict:
+    eta = 1.0 if eta_override is None else eta_override
+    if eta_override is not None:
+        eta_source = "CLI override"
+    elif env_name in {"HalfCheetah-v5", "Hopper-v5", "Walker2d-v5"}:
+        eta_source = "CleanDiffuser locomotion default"
+    else:
+        eta_source = "fallback; no CleanDiffuser task default"
+
+    if weight_temperature_override is not None:
+        weight_temperature = weight_temperature_override
+        weight_temperature_source = "CLI override"
+    elif env_name == "HalfCheetah-v5":
+        weight_temperature = 50.0
+        weight_temperature_source = "CleanDiffuser HalfCheetah default"
+    elif env_name == "Walker2d-v5":
+        weight_temperature = 300.0
+        weight_temperature_source = "CleanDiffuser Walker2d default"
+    elif env_name == "Hopper-v5" and (
+        "medium-expert" in dataset_tag or dataset_tag.endswith("_expert-v0")
+    ):
+        weight_temperature = 8.0
+        weight_temperature_source = "CleanDiffuser Hopper medium-expert proxy"
+    elif env_name == "Hopper-v5":
+        weight_temperature = 100.0
+        weight_temperature_source = "CleanDiffuser Hopper medium/replay proxy"
+    else:
+        weight_temperature = 50.0
+        weight_temperature_source = "fallback; no CleanDiffuser task default"
+
+    if reward_normalization == "auto":
+        reward_normalization = "episode-range" if dataset_source == "minari" and split_level == "episode" else "none"
+    reward_scale = 1.0
+    if reward_normalization == "episode-range":
+        _, episode_indices = np.unique(dataset["episode_ids"], return_inverse=True)
+        episode_returns = np.bincount(episode_indices, weights=dataset["rewards"])
+        reward_scale = 1000.0 / float(episode_returns.max() - episode_returns.min())
+
+    return {
+        "eta": eta,
+        "eta_source": eta_source,
+        "weight_temperature": weight_temperature,
+        "weight_temperature_source": weight_temperature_source,
+        "reward_normalization": reward_normalization,
+        "reward_scale": reward_scale,
+        "action_normalization": "[-1, 1]",
+    }
+
+
 class DQLPolicy(BasePolicy):
     def __init__(
         self,
@@ -34,16 +92,26 @@ class DQLPolicy(BasePolicy):
         obs_std: np.ndarray,
         total_steps: int,
         device: str,
+        eta: float,
+        weight_temperature: float,
+        reward_scale: float,
     ) -> None:
         super().__init__()
         self.device = torch.device(device)
         self.action_dim = len(action_low)
         self.discount = 0.99
-        self.eta = 1.0
+        self.eta = eta
         self.diffusion_steps = 5
         self.num_candidates = 50
-        self.weight_temperature = 50.0
+        self.weight_temperature = weight_temperature
         self.inference_temperature = 0.5
+        self.reward_scale = reward_scale
+        self.action_bias = torch.as_tensor(
+            (action_high + action_low) / 2.0, dtype=torch.float32, device=self.device
+        )
+        self.action_scale = torch.as_tensor(
+            (action_high - action_low) / 2.0, dtype=torch.float32, device=self.device
+        )
 
         diffusion_model = DQLMlp(obs_dim, self.action_dim, emb_dim=64, timestep_emb_type="positional")
         self.actor = DiscreteDiffusionSDE(
@@ -51,8 +119,8 @@ class DQLPolicy(BasePolicy):
             IdentityCondition(dropout=0.0),
             predict_noise=True,
             optim_params={"lr": 3e-4},
-            x_min=torch.as_tensor(action_low, dtype=torch.float32, device=self.device)[None],
-            x_max=torch.as_tensor(action_high, dtype=torch.float32, device=self.device)[None],
+            x_min=-torch.ones((1, self.action_dim), dtype=torch.float32, device=self.device),
+            x_max=torch.ones((1, self.action_dim), dtype=torch.float32, device=self.device),
             diffusion_steps=self.diffusion_steps,
             ema_rate=0.995,
             device=self.device,
@@ -84,9 +152,8 @@ class DQLPolicy(BasePolicy):
     def learn(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
         obs = self._normalize(batch["observations"])
         next_obs = self._normalize(batch["next_observations"])
-        actions = batch["actions"]
-        # Keep rewards unnormalized because generated datasets do not retain complete episodes.
-        rewards = batch["rewards"]
+        actions = self._normalize_action(batch["actions"])
+        rewards = batch["rewards"] * self.reward_scale
         terminals = batch["terminals"]
         batch_size = len(obs)
 
@@ -148,10 +215,17 @@ class DQLPolicy(BasePolicy):
         weights = torch.softmax(q_values * self.weight_temperature, dim=1)
         indices = torch.multinomial(weights, 1).squeeze(1)
         candidates = candidates.view(batch_size, self.num_candidates, self.action_dim)
-        return candidates[torch.arange(batch_size, device=self.device), indices].cpu().numpy()
+        actions = candidates[torch.arange(batch_size, device=self.device), indices]
+        return self._denormalize_action(actions).cpu().numpy()
 
     def _normalize(self, observations: torch.Tensor) -> torch.Tensor:
         return (observations - self.obs_mean) / self.obs_std
+
+    def _normalize_action(self, actions: torch.Tensor) -> torch.Tensor:
+        return (actions - self.action_bias) / self.action_scale
+
+    def _denormalize_action(self, actions: torch.Tensor) -> torch.Tensor:
+        return self.action_bias + self.action_scale * actions
 
     def _sample(
         self,
@@ -176,7 +250,14 @@ class DQLPolicy(BasePolicy):
         return actions
 
 
-def build_dql_policy(buffer: ReplayBuffer, action_low: np.ndarray, action_high: np.ndarray, total_steps: int, device: str) -> DQLPolicy:
+def build_dql_policy(
+    buffer: ReplayBuffer,
+    action_low: np.ndarray,
+    action_high: np.ndarray,
+    total_steps: int,
+    device: str,
+    config: dict,
+) -> DQLPolicy:
     obs_mean = buffer.observations.mean(axis=0, keepdims=True)
     obs_std = buffer.observations.std(axis=0, keepdims=True)
     obs_std[obs_std == 0.0] = 1.0
@@ -188,6 +269,9 @@ def build_dql_policy(buffer: ReplayBuffer, action_low: np.ndarray, action_high: 
         obs_std=obs_std,
         total_steps=total_steps,
         device=device,
+        eta=config["eta"],
+        weight_temperature=config["weight_temperature"],
+        reward_scale=config["reward_scale"],
     )
 
 

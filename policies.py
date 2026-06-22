@@ -37,20 +37,20 @@ def build_model_free_policy(
     env: gym.Env,
     buffer: ReplayBuffer,
     args: argparse.Namespace,
+    dql_config: dict | None = None,
 ):
     obs_dim = int(np.prod(env.observation_space.shape))
     action_dim = int(np.prod(env.action_space.shape))
     max_action = float(env.action_space.high[0])
 
     if algo == "dql":
-        if env.spec.id != "HalfCheetah-v5":
-            raise ValueError("DQL currently has validated inference defaults only for HalfCheetah-v5.")
         return build_dql_policy(
             buffer,
             action_low=env.action_space.low,
             action_high=env.action_space.high,
             total_steps=args.epoch * args.step_per_epoch,
             device=args.device,
+            config=dql_config,
         ), None
 
     if algo == "bc":

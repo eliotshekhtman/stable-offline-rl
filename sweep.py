@@ -21,7 +21,7 @@ import rollout
 from offlinerlkit.buffer import ReplayBuffer
 from offlinerlkit.policy_trainer import MBPolicyTrainer, MFPolicyTrainer
 from offlinerlkit.utils.logger import Logger
-from dql import CLEANDIFFUSER_COMMIT, train_dql
+from dql import CLEANDIFFUSER_COMMIT, resolve_dql_config, train_dql
 from policies import MODEL_BASED_ALGOS, MODEL_FREE_ALGOS, build_model_based_policy, build_model_free_policy
 
 
@@ -63,6 +63,11 @@ def parse_args() -> argparse.Namespace:
     training.add_argument("--eval", action="store_true", help="After training, run full evaluation for each trained policy and then generate plots")
     training.add_argument("--jacobian-samples", type=int, default=8, help="Evaluation-only number of dataset and rollout states used for finite-difference Jacobian metrics")
     training.add_argument("--fd-eps", type=float, default=1e-4, help="Evaluation-only central finite-difference perturbation size for Jacobian metrics")
+
+    dql = parser.add_argument_group("DQL options")
+    dql.add_argument("--dql-eta", type=float, default=None, help="Override the DQL Q-guidance loss weight; defaults to CleanDiffuser's locomotion value of 1")
+    dql.add_argument("--dql-weight-temperature", type=float, default=None, help="Override the DQL candidate-action softmax weight; defaults to a CleanDiffuser task value when available")
+    dql.add_argument("--dql-reward-normalization", choices=["auto", "none", "episode-range"], default="auto", help="DQL reward scaling: auto uses CleanDiffuser episode-return-range scaling for episode-split Minari data and no scaling otherwise")
 
     stability = parser.add_argument_group("stability and conservativity evaluation")
     stability.add_argument("--stability-trajectories", type=int, default=8, help="Evaluation-only number of global trajectories and local perturbed-state pairs")
@@ -257,6 +262,8 @@ def maybe_plot(output_root: Path, args: argparse.Namespace) -> None:
 
 
 def split_paths(dataset_dir: Path) -> dict:
+    with (dataset_dir / "metadata.json").open("r", encoding="utf-8") as file:
+        metadata = json.load(file)
     return {
         "dataset_dir": str(dataset_dir),
         "full_dataset_path": str(dataset_dir / "full.npz"),
@@ -264,6 +271,8 @@ def split_paths(dataset_dir: Path) -> dict:
         "test_dataset_path": str(dataset_dir / "test.npz"),
         "dataset_metadata_path": str(dataset_dir / "metadata.json"),
         "dataset_tag": dataset_dir.name,
+        "split_level": metadata["split_level"],
+        "test_fraction": metadata["test_fraction"],
     }
 
 
@@ -285,12 +294,24 @@ def train_algo(
     eval_env.reset(seed=args.seed)
     eval_env.action_space.seed(args.seed)
 
-    logger = build_logger(run_dir, args, algo, env_name)
+    dql_config = None
+    if algo == "dql":
+        dql_config = resolve_dql_config(
+            env_name=env_name,
+            dataset_tag=split_paths["dataset_tag"],
+            dataset=dataset,
+            dataset_source=args.dataset_source,
+            split_level=split_paths["split_level"],
+            eta_override=args.dql_eta,
+            weight_temperature_override=args.dql_weight_temperature,
+            reward_normalization=args.dql_reward_normalization,
+        )
+    logger = build_logger(run_dir, args, algo, env_name, dql_config)
 
     try:
         if algo in MODEL_FREE_ALGOS:
             buffer = build_buffer(dataset, eval_env, args.device)
-            policy, lr_scheduler = build_model_free_policy(algo, eval_env, buffer, args)
+            policy, lr_scheduler = build_model_free_policy(algo, eval_env, buffer, args, dql_config)
             if algo != "dql":
                 trainer = MFPolicyTrainer(
                     policy=policy,
@@ -363,7 +384,7 @@ def train_algo(
             )
         else:
             trainer.train()
-        save_run_manifest(run_dir, algo, env_name, split_paths, args)
+        save_run_manifest(run_dir, algo, env_name, split_paths, args, dql_config)
     finally:
         eval_env.close()
 
@@ -388,6 +409,7 @@ def save_run_manifest(
     env_name: str,
     split_paths: dict,
     args: argparse.Namespace,
+    dql_config: dict | None,
 ) -> None:
     manifest = {
         "env_name": env_name,
@@ -407,29 +429,31 @@ def save_run_manifest(
     }
     if algo == "dql":
         manifest["cleandiffuser_commit"] = CLEANDIFFUSER_COMMIT
+        manifest["dql_config"] = dql_config
     with (run_dir / "run_manifest.json").open("w", encoding="utf-8") as file:
         json.dump(manifest, file, indent=2, sort_keys=True)
 
 
-def build_logger(run_dir: Path, args: argparse.Namespace, algo: str, env_name: str) -> Logger:
+def build_logger(run_dir: Path, args: argparse.Namespace, algo: str, env_name: str, dql_config: dict | None) -> Logger:
     output_config = {
         "consoleout_backup": "stdout",
         "policy_training_progress": "csv",
         "tb": "tensorboard",
     }
     logger = Logger(str(run_dir), output_config)
-    logger.log_hyperparameters(
-        {
-            "algo": algo,
-            "env": env_name,
-            "seed": args.seed,
-            "device": args.device,
-            "epoch": args.epoch,
-            "step_per_epoch": args.step_per_epoch,
-            "batch_size": args.batch_size,
-            "eval_episodes": args.eval_episodes,
-        }
-    )
+    hyperparameters = {
+        "algo": algo,
+        "env": env_name,
+        "seed": args.seed,
+        "device": args.device,
+        "epoch": args.epoch,
+        "step_per_epoch": args.step_per_epoch,
+        "batch_size": args.batch_size,
+        "eval_episodes": args.eval_episodes,
+    }
+    if dql_config is not None:
+        hyperparameters["dql"] = dql_config
+    logger.log_hyperparameters(hyperparameters)
     return logger
 
 
