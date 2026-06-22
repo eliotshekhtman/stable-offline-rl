@@ -187,7 +187,7 @@ def stability_distance_plot(rows: list[dict], out: Path, stability_type: str) ->
         pair_lines = distance_axis.plot(normalized.T, color="tab:blue", alpha=0.2, linewidth=0.7)
         pair_lines[0].set_label("trajectory pairs")
         distance_axis.plot(envelope, color="tab:red", linewidth=2, label="maximum envelope")
-        distance_axis.plot(bound, color="black", linestyle="--", linewidth=1.5, label=r"$C\rho^t$")
+        distance_axis.plot(bound, color="black", linestyle="--", linewidth=1.5, label=r"tight $C\rho^t$ upper bound")
         distance_axis.axhline(1.0, color="gray", linestyle=":", label="initial distance")
         distance_axis.set_yscale("log")
         distance_axis.set_title(f"{row['algo'].upper()}\nC={c:.3g}, rho={rho:.6g}")

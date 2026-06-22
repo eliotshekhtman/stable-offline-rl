@@ -4,10 +4,12 @@
 # - Measure distance from rollout samples to an offline training distribution.
 
 import numpy as np
+from scipy.optimize import linprog
 from scipy.spatial import cKDTree
 
 
 EPS = 1e-12
+BOUND_MARGIN = 1e-5
 
 
 def align_trajectory_pair(
@@ -48,7 +50,7 @@ def align_trajectory_pair(
 
 
 def fit_empirical_bound(distance_curves: list[np.ndarray]) -> tuple[float, float, np.ndarray, np.ndarray]:
-    """Fit rho to the maximum normalized distance and inflate C to bound every point."""
+    """Fit the tightest mean-log-slack exponential upper bound to normalized distances."""
     if not distance_curves:
         raise ValueError("At least one distance curve is required")
 
@@ -65,9 +67,18 @@ def fit_empirical_bound(distance_curves: list[np.ndarray]) -> tuple[float, float
 
     timesteps = np.arange(max_length, dtype=np.float64)
     positive = envelope > EPS
-    slope = np.polyfit(timesteps[positive], np.log(envelope[positive]), 1)[0] if np.sum(positive) > 1 else 0.0
-    rho = float(np.exp(slope))
-    c = float(max(1.0, np.max(envelope / np.maximum(rho**timesteps, EPS))))
+    fit_times = timesteps[positive]
+    log_envelope = np.log(envelope[positive]) + np.log1p(BOUND_MARGIN)
+    result = linprog(
+        c=[1.0, fit_times.mean()],
+        A_ub=np.column_stack((-np.ones(len(fit_times)), -fit_times)),
+        b_ub=-log_envelope,
+        bounds=[(0.0, None), (None, None)],
+        method="highs",
+    )
+    log_c, log_rho = result.x
+    c = float(np.exp(log_c))
+    rho = float(np.exp(log_rho))
     return c, rho, envelope.astype(np.float32), support
 
 
