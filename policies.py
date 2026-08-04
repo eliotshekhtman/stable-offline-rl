@@ -23,6 +23,7 @@ from dql import build_dql_policy
 
 MODEL_FREE_ALGOS = ("bc", "cql", "iql", "td3bc", "edac", "dql")
 MODEL_BASED_ALGOS = ("mopo", "combo", "mobile", "rambo")
+ROBOMIMIC_TASKS = {"can", "lift", "square", "transport", "toolhang"}
 
 MODEL_BASED_DEFAULTS = {
     "mopo": {"hidden_dims": [256, 256], "dynamics_penalty_coef": 0.5},
@@ -64,6 +65,7 @@ def build_model_free_policy(
         critic1, critic1_optim = build_critic(obs_dim, action_dim, hidden_dims, args.device, 3e-4)
         critic2, critic2_optim = build_critic(obs_dim, action_dim, hidden_dims, args.device, 3e-4)
         alpha = build_auto_alpha(action_dim, args.device, 1e-4)
+        cql_weight = 1.0 if env.spec.id.lower() in ROBOMIMIC_TASKS else 5.0
         return CQLPolicy(
             actor,
             critic1,
@@ -75,7 +77,7 @@ def build_model_free_policy(
             tau=0.005,
             gamma=0.99,
             alpha=alpha,
-            cql_weight=5.0,
+            cql_weight=cql_weight,
             temperature=1.0,
             max_q_backup=False,
             deterministic_backup=True,
@@ -311,7 +313,10 @@ def build_dynamics(
         device=args.device,
     )
     dynamics_optim = torch.optim.Adam(dynamics_model.parameters(), lr=1e-3)
-    termination_fn = get_termination_fn(task)
+    if task.lower() in ROBOMIMIC_TASKS:
+        termination_fn = termination_fn_never
+    else:
+        termination_fn = get_termination_fn(task)
     if obs_mean is not None and obs_std is not None:
         termination_fn = obs_unnormalization(termination_fn, obs_mean, obs_std)
     return EnsembleDynamics(
@@ -321,6 +326,10 @@ def build_dynamics(
         termination_fn,
         penalty_coef=penalty_coef,
     )
+
+
+def termination_fn_never(obs, act, next_obs):
+    return np.zeros((len(obs), 1), dtype=bool)
 
 
 def build_prob_actor(obs_dim: int, action_dim: int, max_action: float, hidden_dims: list[int], device: str, lr: float):

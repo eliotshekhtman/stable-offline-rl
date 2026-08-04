@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 import metrics
+import load_offline
 import rollout
 from policies import MODEL_BASED_ALGOS, build_model_based_policy, build_model_free_policy
 from sweep import build_buffer
@@ -65,15 +66,10 @@ def evaluate_run(run_dir: Path, args: argparse.Namespace) -> None:
         train_dataset,
     )
     rollout_info, global_stability, local_stability, conservativity = evaluate_policy_behavior(
-        policy, manifest["env_name"], train_dataset, test_dataset, args,
+        policy, manifest, train_dataset, test_dataset, args,
         dynamics=dynamics, obs_mean=obs_mean, obs_std=obs_std,
     )
-    expert_info = evaluate_expert(
-        env_name=manifest["env_name"],
-        expert_path=Path(manifest["expert"]),
-        episodes=args.eval_episodes,
-        seed=args.seed,
-    )
+    expert_info = evaluate_expert(manifest, args.eval_episodes, args.seed)
 
     eval_dir = run_dir / "eval"
     eval_dir.mkdir(exist_ok=True)
@@ -83,8 +79,8 @@ def evaluate_run(run_dir: Path, args: argparse.Namespace) -> None:
         "dataset_tag": manifest["dataset_tag"],
         "policy_return_mean": float(np.mean(rollout_info["returns"])),
         "policy_return_std": float(np.std(rollout_info["returns"])),
-        "expert_return_mean": float(np.mean(expert_info["returns"])),
-        "expert_return_std": float(np.std(expert_info["returns"])),
+        "expert_return_mean": expert_info["return_mean"],
+        "expert_return_std": expert_info["return_std"],
     }
     np.savez_compressed(
         eval_dir / "returns.npz",
@@ -93,16 +89,19 @@ def evaluate_run(run_dir: Path, args: argparse.Namespace) -> None:
     )
 
     np.savez_compressed(eval_dir / "global_stability.npz", **global_stability)
-    np.savez_compressed(eval_dir / "local_stability.npz", **local_stability)
     np.savez_compressed(eval_dir / "conservativity.npz", **conservativity)
     results.update(
         global_stability_c=float(global_stability["c"]),
         global_stability_rho=float(global_stability["rho"]),
-        local_stability_c=float(local_stability["c"]),
-        local_stability_rho=float(local_stability["rho"]),
         state_ood_ratio=float(conservativity["state_ood_ratio"]),
         state_action_ood_ratio=float(conservativity["state_action_ood_ratio"]),
     )
+    if local_stability is not None:
+        np.savez_compressed(eval_dir / "local_stability.npz", **local_stability)
+        results.update(
+            local_stability_c=float(local_stability["c"]),
+            local_stability_rho=float(local_stability["rho"]),
+        )
 
     if dynamics is not None:
         dataset_errors = evaluate_dynamics_on_dataset(
@@ -120,32 +119,33 @@ def evaluate_run(run_dir: Path, args: argparse.Namespace) -> None:
         )
         results["dataset_next_obs_mse"] = float(np.mean(dataset_errors))
         results["rollout_next_obs_mse"] = float(np.mean(rollout_info["next_obs_sq_error"]))
-        dataset_jacobians = evaluate_jacobians_on_observations(
-            policy=policy,
-            dynamics=dynamics,
-            env_name=manifest["env_name"],
-            observations=test_dataset["observations"],
-            sample_count=args.jacobian_samples,
-            seed=args.seed,
-            fd_eps=args.fd_eps,
-            obs_mean=obs_mean,
-            obs_std=obs_std,
-        )
-        rollout_jacobians = evaluate_jacobians_on_observations(
-            policy=policy,
-            dynamics=dynamics,
-            env_name=manifest["env_name"],
-            observations=rollout_info["dynamics_observations"],
-            sample_count=args.jacobian_samples,
-            seed=args.seed,
-            fd_eps=args.fd_eps,
-            obs_mean=obs_mean,
-            obs_std=obs_std,
-        )
-        np.savez_compressed(eval_dir / "jacobian_dataset.npz", **dataset_jacobians)
-        np.savez_compressed(eval_dir / "jacobian_rollout.npz", **rollout_jacobians)
-        results["dataset_closed_loop_jacobian_mse"] = float(np.mean(dataset_jacobians["closed_loop_jacobian_sq_error"]))
-        results["rollout_closed_loop_jacobian_mse"] = float(np.mean(rollout_jacobians["closed_loop_jacobian_sq_error"]))
+        if manifest.get("dataset_source") != "robomimic":
+            dataset_jacobians = evaluate_jacobians_on_observations(
+                policy=policy,
+                dynamics=dynamics,
+                env_name=manifest["env_name"],
+                observations=test_dataset["observations"],
+                sample_count=args.jacobian_samples,
+                seed=args.seed,
+                fd_eps=args.fd_eps,
+                obs_mean=obs_mean,
+                obs_std=obs_std,
+            )
+            rollout_jacobians = evaluate_jacobians_on_observations(
+                policy=policy,
+                dynamics=dynamics,
+                env_name=manifest["env_name"],
+                observations=rollout_info["dynamics_observations"],
+                sample_count=args.jacobian_samples,
+                seed=args.seed,
+                fd_eps=args.fd_eps,
+                obs_mean=obs_mean,
+                obs_std=obs_std,
+            )
+            np.savez_compressed(eval_dir / "jacobian_dataset.npz", **dataset_jacobians)
+            np.savez_compressed(eval_dir / "jacobian_rollout.npz", **rollout_jacobians)
+            results["dataset_closed_loop_jacobian_mse"] = float(np.mean(dataset_jacobians["closed_loop_jacobian_sq_error"]))
+            results["rollout_closed_loop_jacobian_mse"] = float(np.mean(rollout_jacobians["closed_loop_jacobian_sq_error"]))
 
     with (eval_dir / "results.json").open("w", encoding="utf-8") as file:
         json.dump(results, file, indent=2, sort_keys=True)
@@ -160,7 +160,7 @@ def load_policy_and_dynamics(
     dynamics_path: Path | None,
     train_dataset: dict[str, np.ndarray],
 ):
-    env = gym.make(manifest["env_name"])
+    env = make_eval_env(manifest)
     buffer = build_buffer(train_dataset, env, device)
     build_args = argparse.Namespace(
         device=device,
@@ -196,7 +196,7 @@ def load_policy_and_dynamics(
 
 def evaluate_policy_behavior(
     policy,
-    env_name: str,
+    manifest: dict,
     train_dataset: dict[str, np.ndarray],
     test_dataset: dict[str, np.ndarray],
     args: argparse.Namespace,
@@ -205,23 +205,41 @@ def evaluate_policy_behavior(
     obs_std: np.ndarray | None = None,
 ):
     rollout_info = evaluate_policy_rollouts(
-        policy, env_name, args.eval_episodes, args.seed,
+        policy, manifest, args.eval_episodes, args.seed,
         dynamics=dynamics, obs_mean=obs_mean, obs_std=obs_std,
     )
     global_stability = evaluate_global_stability(
-        policy, env_name, train_dataset, args.stability_trajectories,
+        policy, manifest, train_dataset, args.stability_trajectories,
         args.stability_horizon, args.global_max_offset, args.seed,
     )
-    local_stability = evaluate_local_stability(
-        policy, env_name, train_dataset, test_dataset,
-        args.stability_trajectories, args.stability_horizon,
-        args.local_perturbation_scale, args.seed,
-    )
+    local_stability = None
+    if manifest.get("dataset_source") != "robomimic":
+        local_stability = evaluate_local_stability(
+            policy, manifest["env_name"], train_dataset, test_dataset,
+            args.stability_trajectories, args.stability_horizon,
+            args.local_perturbation_scale, args.seed,
+        )
     conservativity = evaluate_conservativity(
         train_dataset, test_dataset, rollout_info["observations"],
         rollout_info["actions"], args.ood_samples, args.seed,
     )
     return rollout_info, global_stability, local_stability, conservativity
+
+
+def make_eval_env(manifest: dict):
+    if manifest.get("dataset_source") == "robomimic":
+        metadata = load_offline.load_metadata(manifest["dataset_metadata_path"])
+        return load_offline.make_robomimic_env(metadata)
+    return gym.make(manifest["env_name"])
+
+
+def robomimic_expert_metadata(manifest: dict) -> dict:
+    metadata_path = Path(manifest["dataset_metadata_path"])
+    metadata = load_offline.load_metadata(metadata_path)
+    if metadata["dataset_type"] == "ph":
+        return metadata
+    ph_metadata_path = metadata_path.parent.parent / f"robomimic_{metadata['task'].lower()}_ph" / "metadata.json"
+    return load_offline.load_metadata(ph_metadata_path)
 
 
 def evaluate_history(
@@ -249,31 +267,33 @@ def evaluate_history(
                 dynamics.load(checkpoint["dynamics_path"])
             policy.eval()
         rollout_info, global_stability, local_stability, conservativity = evaluate_policy_behavior(
-            policy, manifest["env_name"], train_dataset, test_dataset, args
+            policy, manifest, train_dataset, test_dataset, args
         )
-        records.append(
-            {
-                "requested_percent": checkpoint["requested_percent"],
-                "actual_percent": checkpoint["actual_percent"],
-                "step": checkpoint["step"],
-                "policy_return_mean": float(rollout_info["returns"].mean()),
-                "policy_return_std": float(rollout_info["returns"].std()),
-                "global_stability_c": float(global_stability["c"]),
-                "global_stability_rho": float(global_stability["rho"]),
-                "global_survival_fraction": float(global_stability["support"][-1] / global_stability["support"][0]),
-                "local_stability_c": float(local_stability["c"]),
-                "local_stability_rho": float(local_stability["rho"]),
-                "local_survival_fraction": float(local_stability["support"][-1] / local_stability["support"][0]),
-                "state_ood_ratio": float(conservativity["state_ood_ratio"]),
-                "state_action_ood_ratio": float(conservativity["state_action_ood_ratio"]),
-            }
-        )
+        record = {
+            "requested_percent": checkpoint["requested_percent"],
+            "actual_percent": checkpoint["actual_percent"],
+            "step": checkpoint["step"],
+            "policy_return_mean": float(rollout_info["returns"].mean()),
+            "policy_return_std": float(rollout_info["returns"].std()),
+            "global_stability_c": float(global_stability["c"]),
+            "global_stability_rho": float(global_stability["rho"]),
+            "global_survival_fraction": float(global_stability["support"][-1] / global_stability["support"][0]),
+            "state_ood_ratio": float(conservativity["state_ood_ratio"]),
+            "state_action_ood_ratio": float(conservativity["state_action_ood_ratio"]),
+        }
+        if local_stability is not None:
+            record.update(
+                local_stability_c=float(local_stability["c"]),
+                local_stability_rho=float(local_stability["rho"]),
+                local_survival_fraction=float(local_stability["support"][-1] / local_stability["support"][0]),
+            )
+        records.append(record)
 
     history = {
         "env_name": manifest["env_name"],
         "algo": manifest["algo"],
         "dataset_tag": manifest["dataset_tag"],
-        "expert_return_mean": float(expert_info["returns"].mean()),
+        "expert_return_mean": expert_info["return_mean"],
         "records": records,
     }
     with (eval_dir / "history.json").open("w", encoding="utf-8") as file:
@@ -286,14 +306,14 @@ def evaluate_history(
 
 def evaluate_policy_rollouts(
     policy,
-    env_name: str,
+    manifest: dict,
     episodes: int,
     seed: int,
     dynamics=None,
     obs_mean: np.ndarray | None = None,
     obs_std: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
-    env = gym.make(env_name)
+    env = make_eval_env(manifest)
     returns = []
     observations, actions = [], []
     next_obs_errors, error_observations, error_episode_ids, error_timesteps = [], [], [], []
@@ -342,7 +362,17 @@ def evaluate_policy_rollouts(
     }
 
 
-def evaluate_expert(env_name: str, expert_path: Path, episodes: int, seed: int) -> dict[str, np.ndarray]:
+def evaluate_expert(manifest: dict, episodes: int, seed: int) -> dict[str, np.ndarray]:
+    if manifest.get("dataset_source") == "robomimic":
+        metadata = robomimic_expert_metadata(manifest)
+        return {
+            "returns": np.asarray([metadata["episode_return_mean"]], dtype=np.float32),
+            "return_mean": float(metadata["episode_return_mean"]),
+            "return_std": float(metadata["episode_return_std"]),
+        }
+
+    env_name = manifest["env_name"]
+    expert_path = Path(manifest["expert"])
     policy = rollout.load_expert_policy(env_name, str(expert_path))
     env = gym.make(env_name)
     returns = []
@@ -361,20 +391,25 @@ def evaluate_expert(env_name: str, expert_path: Path, episodes: int, seed: int) 
     finally:
         env.close()
 
-    return {"returns": np.asarray(returns, dtype=np.float32)}
+    returns = np.asarray(returns, dtype=np.float32)
+    return {
+        "returns": returns,
+        "return_mean": float(returns.mean()),
+        "return_std": float(returns.std()),
+    }
 
 
 def evaluate_global_stability(
     policy,
-    env_name: str,
+    manifest: dict,
     train_dataset: dict[str, np.ndarray],
     trajectory_count: int,
     horizon: int,
     max_offset: int,
     seed: int,
 ) -> dict[str, np.ndarray]:
-    env = gym.make(env_name)
-    columns = reconstructible_observation_columns(env)
+    env = make_eval_env(manifest)
+    columns = observation_columns(env, manifest)
     state_std = train_dataset["observations"][:, columns].std(axis=0)
     state_std[state_std == 0.0] = 1.0
     trajectories = []
@@ -382,7 +417,10 @@ def evaluate_global_stability(
         for index in range(trajectory_count):
             obs, _ = env.reset(seed=seed + index)
             seed_policy_randomness(seed + 100000)
-            trajectories.append(rollout_state_trajectory(env, policy, obs, columns, state_std, horizon))
+            if manifest.get("dataset_source") == "robomimic":
+                trajectories.append(rollout_current_env_trajectory(env, policy, obs, columns, state_std, horizon))
+            else:
+                trajectories.append(rollout_state_trajectory(env, policy, obs, columns, state_std, horizon))
     finally:
         env.close()
 
@@ -474,6 +512,24 @@ def rollout_state_trajectory(
     set_env_from_obs(env, initial_obs)
     obs = env.unwrapped._get_obs().astype(np.float32)
     states = [obs[columns] / state_std]
+    for _ in range(horizon):
+        action = policy.select_action(obs.reshape(1, -1), deterministic=True).reshape(-1)
+        obs, _, terminated, truncated, _ = env.step(action)
+        states.append(np.asarray(obs, dtype=np.float32)[columns] / state_std)
+        if terminated or truncated:
+            break
+    return np.asarray(states, dtype=np.float32)
+
+
+def rollout_current_env_trajectory(
+    env: gym.Env,
+    policy,
+    obs: np.ndarray,
+    columns: np.ndarray,
+    state_std: np.ndarray,
+    horizon: int,
+) -> np.ndarray:
+    states = [np.asarray(obs, dtype=np.float32)[columns] / state_std]
     for _ in range(horizon):
         action = policy.select_action(obs.reshape(1, -1), deterministic=True).reshape(-1)
         obs, _, terminated, truncated, _ = env.step(action)
@@ -672,6 +728,12 @@ def learned_next_obs(
 def reconstructible_observation_columns(env: gym.Env) -> np.ndarray:
     structure = env.unwrapped.observation_structure
     return np.arange(structure["qpos"] + structure["qvel"], dtype=np.int64)
+
+
+def observation_columns(env: gym.Env, manifest: dict) -> np.ndarray:
+    if manifest.get("dataset_source") == "robomimic":
+        return np.arange(env.observation_space.shape[0], dtype=np.int64)
+    return reconstructible_observation_columns(env)
 
 
 def set_env_from_obs(env: gym.Env, obs: np.ndarray) -> None:

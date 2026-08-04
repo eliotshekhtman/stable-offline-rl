@@ -14,6 +14,7 @@ import numpy as np
 
 
 DATASET_ORDER = ("simple", "medium", "expert")
+ROBOMIMIC_DATASET_ORDER = ("ph", "mh", "mg_sparse", "mg_dense", "paired")
 EPS = 1e-12
 
 
@@ -39,6 +40,7 @@ def plot_root(root: Path, out: Path | None = None) -> None:
     out.mkdir(parents=True, exist_ok=True)
     plot_generated_reward_ablation(rows, out)
     plot_minari_reward_bars(rows, out)
+    plot_robomimic_reward_bars(rows, out)
 
     dataset_tags = sorted({row["dataset_tag"] for row in rows} | {history["dataset_tag"] for history in histories})
     for dataset_tag in dataset_tags:
@@ -74,6 +76,12 @@ def dataset_fields(metadata: dict) -> dict:
         return {
             "dataset_source": "minari",
             "minari_dataset": metadata["dataset_id"].split("/")[-1].removesuffix("-v0"),
+        }
+    if metadata.get("source") == "robomimic":
+        return {
+            "dataset_source": "robomimic",
+            "robomimic_task": metadata["task"],
+            "robomimic_dataset": metadata["dataset_type"],
         }
 
     num_expert = metadata["num_expert"]
@@ -153,6 +161,36 @@ def plot_minari_reward_bars(rows: list[dict], out: Path) -> None:
     plt.close(fig)
 
 
+def plot_robomimic_reward_bars(rows: list[dict], out: Path) -> None:
+    robomimic = [row for row in rows if row["dataset_source"] == "robomimic"]
+    if not robomimic:
+        return
+
+    datasets = [name for name in ROBOMIMIC_DATASET_ORDER if any(row["robomimic_dataset"] == name for row in robomimic)]
+    algos = sorted({row["algo"] for row in robomimic})
+    width = 0.8 / max(len(algos), 1)
+    x = np.arange(len(datasets))
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for algo_index, algo in enumerate(algos):
+        values = []
+        for dataset in datasets:
+            matching = [row["policy_return_mean"] for row in robomimic if row["algo"] == algo and row["robomimic_dataset"] == dataset]
+            values.append(np.mean(matching) if matching else np.nan)
+        ax.bar(x + (algo_index - (len(algos) - 1) / 2) * width, values, width=width, label=algo)
+
+    ax.axhline(np.mean([row["expert_return_mean"] for row in robomimic]), color="black", linestyle=":", label="PH return")
+    ax.set_xticks(x)
+    ax.set_xticklabels(datasets)
+    ax.set_xlabel("robomimic dataset")
+    ax.set_ylabel("policy return")
+    ax.set_title("Policy reward by robomimic dataset")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out / "robomimic_reward_by_dataset.png", dpi=200)
+    plt.close(fig)
+
+
 def plot_stability_distances(rows: list[dict], out: Path) -> None:
     stability_distance_plot(rows, out, "global")
     stability_distance_plot(rows, out, "local")
@@ -207,20 +245,38 @@ def stability_distance_plot(rows: list[dict], out: Path, stability_type: str) ->
 
 
 def plot_mismatch_ratios(rows: list[dict], out: Path) -> None:
-    model_rows = [
+    next_obs_rows = [
+        row for row in rows
+        if "dataset_next_obs_mse" in row and "rollout_next_obs_mse" in row
+    ]
+    for row in next_obs_rows:
+        row["next_obs_ratio"] = row["dataset_next_obs_mse"] / (row["rollout_next_obs_mse"] + EPS)
+
+    if next_obs_rows:
+        scatter(
+            next_obs_rows,
+            x_key="next_obs_ratio",
+            y_key="policy_return_mean",
+            color_key="expert_return_mean",
+            xlabel="dataset next-state MSE / rollout next-state MSE",
+            ylabel="policy return",
+            color_label="expert return",
+            path=out / "reward_vs_next_obs_ratio.png",
+        )
+
+    jacobian_rows = [
         row for row in rows
         if "dataset_next_obs_mse" in row and "dataset_closed_loop_jacobian_mse" in row
     ]
-    if not model_rows:
+    if not jacobian_rows:
         return
 
-    for row in model_rows:
-        row["next_obs_ratio"] = row["dataset_next_obs_mse"] / (row["rollout_next_obs_mse"] + EPS)
+    for row in jacobian_rows:
         row["jacobian_ratio"] = row["dataset_closed_loop_jacobian_mse"] / (row["rollout_closed_loop_jacobian_mse"] + EPS)
         row["normalized_return"] = row["policy_return_mean"] / (row["expert_return_mean"] + EPS)
 
     scatter(
-        model_rows,
+        jacobian_rows,
         x_key="next_obs_ratio",
         y_key="jacobian_ratio",
         color_key="policy_return_mean",
@@ -230,17 +286,7 @@ def plot_mismatch_ratios(rows: list[dict], out: Path) -> None:
         path=out / "mismatch_ratio_reward_scatter.png",
     )
     scatter(
-        model_rows,
-        x_key="next_obs_ratio",
-        y_key="policy_return_mean",
-        color_key="jacobian_ratio",
-        xlabel="dataset next-state MSE / rollout next-state MSE",
-        ylabel="policy return",
-        color_label="Jacobian mismatch ratio",
-        path=out / "reward_vs_next_obs_ratio.png",
-    )
-    scatter(
-        model_rows,
+        jacobian_rows,
         x_key="jacobian_ratio",
         y_key="policy_return_mean",
         color_key="next_obs_ratio",
@@ -281,6 +327,13 @@ def history_relationship_plot(
     path: Path,
     reference_x: float | None = None,
 ) -> None:
+    histories = [
+        history for history in histories
+        if history["records"] and x_key in history["records"][0] and (c_key is None or c_key in history["records"][0])
+    ]
+    if not histories:
+        return
+
     fig, ax = plt.subplots(figsize=(8, 5))
     color_scale = plt.Normalize(0, 100)
     color_map = plt.get_cmap("viridis")
@@ -330,7 +383,11 @@ def plot_training_histories(histories: list[dict], out: Path) -> None:
 def history_line_plot(histories: list[dict], keys: tuple[str, ...], names: tuple[str, ...], path: Path) -> None:
     fig, axes = plt.subplots(len(keys), 1, figsize=(8, 3 * len(keys)), squeeze=False, sharex=True)
     for axis, key, name in zip(axes[:, 0], keys, names):
-        for history in histories:
+        key_histories = [history for history in histories if history["records"] and key in history["records"][0]]
+        if not key_histories:
+            axis.set_visible(False)
+            continue
+        for history in key_histories:
             records = history["records"]
             axis.plot(
                 [record["actual_percent"] for record in records],

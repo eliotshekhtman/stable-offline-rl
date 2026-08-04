@@ -2,10 +2,16 @@
 # - Load premade offline datasets from external sources such as Minari.
 # - Convert external episode formats into this project's canonical transition schema.
 # - Discover all relevant Minari datasets for a requested Gymnasium environment.
+# - Discover and load low-dimensional robomimic robosuite datasets.
 # - Keep external dataset loading separate from generated rollout collection.
 
+import copy
+import json
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+import h5py
 import numpy as np
 
 from rollout import DATASET_KEYS
@@ -22,6 +28,37 @@ MINARI_PREFIXES = {
     "Reacher-v5": "mujoco/reacher",
     "Swimmer-v5": "mujoco/swimmer",
     "Walker2d-v5": "mujoco/walker2d",
+}
+
+ROBOMIMIC_HF_REPO_ID = "robomimic/robomimic_datasets"
+ROBOMIMIC_OBS_KEYS = ("robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos", "object")
+ROBOMIMIC_ENV_KEYS = ("robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos", "object-state")
+
+ROBOMIMIC_LOW_DIM_DATASETS = {
+    "Can": [
+        ("ph", "v1.5/can/ph/low_dim_v15.hdf5", 400),
+        ("mh", "v1.5/can/mh/low_dim_v15.hdf5", 500),
+        ("mg_sparse", "v1.5/can/mg/low_dim_sparse_v15.hdf5", 400),
+        ("mg_dense", "v1.5/can/mg/low_dim_dense_v15.hdf5", 400),
+        ("paired", "v1.5/can/paired/low_dim_v15.hdf5", 400),
+    ],
+    "Lift": [
+        ("ph", "v1.5/lift/ph/low_dim_v15.hdf5", 400),
+        ("mh", "v1.5/lift/mh/low_dim_v15.hdf5", 500),
+        ("mg_sparse", "v1.5/lift/mg/low_dim_sparse_v15.hdf5", 400),
+        ("mg_dense", "v1.5/lift/mg/low_dim_dense_v15.hdf5", 400),
+    ],
+    "Square": [
+        ("ph", "v1.5/square/ph/low_dim_v15.hdf5", 400),
+        ("mh", "v1.5/square/mh/low_dim_v15.hdf5", 500),
+    ],
+    "Transport": [
+        ("ph", "v1.5/transport/ph/low_dim_v15.hdf5", 700),
+        ("mh", "v1.5/transport/mh/low_dim_v15.hdf5", 1100),
+    ],
+    "ToolHang": [
+        ("ph", "v1.5/tool_hang/ph/low_dim_v15.hdf5", 700),
+    ],
 }
 
 
@@ -95,3 +132,104 @@ def concat_datasets(datasets: list[dict[str, np.ndarray]]) -> dict[str, np.ndarr
 
 def make_minari_dataset_tag(dataset_id: str) -> str:
     return "minari_" + dataset_id.replace("/", "_")
+
+
+def list_robomimic_dataset_specs(env_name: str) -> list[dict[str, Any]]:
+    """Return all low-dimensional robomimic dataset specs for one robosuite task."""
+    specs = ROBOMIMIC_LOW_DIM_DATASETS[env_name]
+    return [
+        {
+            "source": "robomimic",
+            "task": env_name,
+            "dataset_type": dataset_type,
+            "repo_path": repo_path,
+            "horizon": horizon,
+        }
+        for dataset_type, repo_path, horizon in specs
+    ]
+
+
+def load_robomimic_dataset(spec: dict[str, Any], seed: int | None = None) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Download/load one robomimic low-dimensional HDF5 dataset."""
+    from huggingface_hub import hf_hub_download
+
+    dataset_path = hf_hub_download(repo_id=ROBOMIMIC_HF_REPO_ID, filename=spec["repo_path"], repo_type="dataset")
+    with h5py.File(dataset_path, "r") as file:
+        dataset = concat_datasets([
+            robomimic_demo_to_transitions(file["data"][demo_key], episode_id)
+            for episode_id, demo_key in enumerate(sorted(file["data"].keys()))
+        ])
+        env_args = json.loads(file["data"].attrs["env_args"])
+        episode_returns = [
+            float(np.asarray(file["data"][demo_key]["rewards"], dtype=np.float32).sum())
+            for demo_key in sorted(file["data"].keys())
+        ]
+
+    return dataset, {
+        **spec,
+        "dataset_id": f"{spec['task']}_{spec['dataset_type']}",
+        "hdf5_path": dataset_path,
+        "obs_keys": list(ROBOMIMIC_OBS_KEYS),
+        "env_keys": list(ROBOMIMIC_ENV_KEYS),
+        "env_args": env_args,
+        "num_episodes": len(episode_returns),
+        "num_transitions": int(len(dataset["rewards"])),
+        "episode_return_mean": float(np.mean(episode_returns)),
+        "episode_return_std": float(np.std(episode_returns)),
+        "seed": seed,
+    }
+
+
+def robomimic_demo_to_transitions(demo: h5py.Group, episode_id: int) -> dict[str, np.ndarray]:
+    observations = np.concatenate([np.asarray(demo["obs"][key], dtype=np.float32) for key in ROBOMIMIC_OBS_KEYS], axis=1)
+    next_observations = np.concatenate([
+        np.asarray(demo["next_obs"][key], dtype=np.float32) for key in ROBOMIMIC_OBS_KEYS
+    ], axis=1)
+    actions = np.asarray(demo["actions"], dtype=np.float32)
+    rewards = np.asarray(demo["rewards"], dtype=np.float32)
+    terminals = np.asarray(demo["dones"], dtype=bool)
+    timeouts = np.zeros(len(actions), dtype=bool)
+    if len(timeouts) and not terminals[-1]:
+        timeouts[-1] = True
+
+    return {
+        "observations": observations,
+        "actions": actions,
+        "next_observations": next_observations,
+        "rewards": rewards,
+        "terminals": terminals,
+        "timeouts": timeouts,
+        "episode_ids": np.full(len(actions), episode_id, dtype=np.int64),
+    }
+
+
+def make_robomimic_dataset_tag(spec: dict[str, Any]) -> str:
+    return f"robomimic_{spec['task'].lower()}_{spec['dataset_type']}"
+
+
+def load_metadata(metadata_path: str | Path) -> dict[str, Any]:
+    with Path(metadata_path).open("r", encoding="utf-8") as file:
+        return json.load(file)
+
+
+def make_robomimic_env(metadata: dict[str, Any]):
+    """Build a flat Gymnasium-compatible robosuite env matching a robomimic low-dim dataset."""
+    import robosuite
+    from robosuite.wrappers import GymWrapper
+
+    env_args = copy.deepcopy(metadata["env_args"])
+    env_name = env_args["env_name"]
+    env_kwargs = env_args["env_kwargs"]
+    env_kwargs.pop("env_name", None)
+    env_kwargs.pop("env_lang", None)
+    env_kwargs.update(
+        has_renderer=False,
+        has_offscreen_renderer=False,
+        horizon=metadata["horizon"],
+        ignore_done=False,
+        use_object_obs=True,
+        use_camera_obs=False,
+    )
+    env = GymWrapper(robosuite.make(env_name, **env_kwargs), keys=list(ROBOMIMIC_ENV_KEYS), flatten_obs=True)
+    env.spec = SimpleNamespace(id=metadata["task"])
+    return env

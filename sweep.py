@@ -1,6 +1,6 @@
 # Tasks:
 # - Parse the experiment CLI and keep one run focused on one Gymnasium environment.
-# - Choose the dataset source: generated rollouts or converted Minari datasets.
+# - Choose the dataset source: generated rollouts, converted Minari datasets, or robomimic datasets.
 # - Cache/load datasets, build OfflineRL-Kit replay buffers, and launch trainers.
 # - Own experiment directories, milestone checkpoints, logging, seeding, and run naming.
 
@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     experiment.add_argument("--overwrite", action="store_true", help="Remove an existing run directory before training")
 
     dataset = parser.add_argument_group("dataset source and split")
-    dataset.add_argument("--dataset-source", choices=["generated", "minari"], default="generated", help="Use generated expert/random rollouts or all matching Minari datasets for the environment")
+    dataset.add_argument("--dataset-source", choices=["generated", "minari", "robomimic"], default="generated", help="Use generated expert/random rollouts, all matching Minari datasets, or low-dimensional robomimic datasets for the environment")
     dataset.add_argument("--test-fraction", type=float, default=0.2, help="Fraction of each dataset held out for post-training evaluation")
     dataset.add_argument("--split-level", choices=["transition", "episode"], default="transition", help="Split train/test by individual transitions or by whole episodes")
 
@@ -102,6 +102,10 @@ def run_sweep(env_name: str, expert_path: Path, args: argparse.Namespace) -> Non
         run_minari_sweep(env_name=env_name, dataset_dir=dataset_dir, run_dir=run_dir, args=args)
         maybe_plot(output_root, args)
         return
+    if args.dataset_source == "robomimic":
+        run_robomimic_sweep(env_name=env_name, dataset_dir=dataset_dir, run_dir=run_dir, args=args)
+        maybe_plot(output_root, args)
+        return
 
     for num_samples, noise_scale, prop_expert in itertools.product(
         args.num_samples, args.noise_scale, args.prop_expert
@@ -148,6 +152,28 @@ def run_minari_sweep(env_name: str, dataset_dir: Path, run_dir: Path, args: argp
             dataset, metadata = load_offline.load_minari_dataset(dataset_id, seed=args.seed)
             train_dataset, paths = save_dataset_splits(tag_dir, dataset, metadata, args)
 
+        train_algos(env_name, train_dataset, run_dir, dataset_tag, paths, args)
+
+
+def run_robomimic_sweep(env_name: str, dataset_dir: Path, run_dir: Path, args: argparse.Namespace) -> None:
+    if args.reuse_datasets:
+        tag_dirs = sorted(path.parent for path in dataset_dir.glob("robomimic_*/metadata.json"))
+    else:
+        tag_dirs = []
+
+    if args.reuse_datasets and tag_dirs:
+        for tag_dir in tag_dirs:
+            print(f"Loading dataset split: {tag_dir}")
+            train_dataset = rollout.load_dataset(tag_dir / "train.npz")
+            paths = split_paths(tag_dir)
+            train_algos(env_name, train_dataset, run_dir, tag_dir.name, paths, args)
+        return
+
+    for spec in load_offline.list_robomimic_dataset_specs(env_name):
+        dataset_tag = load_offline.make_robomimic_dataset_tag(spec)
+        tag_dir = dataset_dir / dataset_tag
+        dataset, metadata = load_offline.load_robomimic_dataset(spec, seed=args.seed)
+        train_dataset, paths = save_dataset_splits(tag_dir, dataset, metadata, args)
         train_algos(env_name, train_dataset, run_dir, dataset_tag, paths, args)
 
 
@@ -290,7 +316,7 @@ def train_algo(
     prepare_run_dir(run_dir, args.overwrite)
     seed_everything(args.seed)
 
-    eval_env = gym.make(env_name)
+    eval_env = make_env(env_name, split_paths, args)
     eval_env.reset(seed=args.seed)
     eval_env.action_space.seed(args.seed)
 
@@ -401,6 +427,13 @@ def build_buffer(dataset: dict[str, np.ndarray], env: gym.Env, device: str) -> R
     )
     buffer.load_dataset(train_dataset)
     return buffer
+
+
+def make_env(env_name: str, split_paths: dict, args: argparse.Namespace):
+    if args.dataset_source == "robomimic":
+        metadata = load_offline.load_metadata(split_paths["dataset_metadata_path"])
+        return load_offline.make_robomimic_env(metadata)
+    return gym.make(env_name)
 
 
 def save_run_manifest(
