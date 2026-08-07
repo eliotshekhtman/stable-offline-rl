@@ -1,5 +1,22 @@
 # stable-offline-rl
 
+## Saved artifacts
+
+Runs are independent of the working directory and are saved inside this repository:
+
+```text
+datasets/<environment>/<dataset-name>/<dataset-timestamp>/
+trained/<environment>/<algorithm>_<dataset-name>/<training-timestamp>/
+evals/<environment>/<algorithm>_<dataset-name>/<training-timestamp>/
+evals/<environment>/plots/
+```
+
+Each training manifest records the dataset identity and all algorithm-relevant training arguments. Before training, `sweep.py` searches the timestamped variants under the corresponding run name and reuses the newest complete run with an identical training schema. Evaluation arguments are not part of that schema, so adding `--eval` or changing an evaluation setting reloads the existing model instead of retraining it. A different training schema creates another timestamped variant and leaves prior variants intact. Dataset reuse is automatic; `--output-dir`, `--reuse-datasets`, and `--overwrite` are no longer used.
+
+Dataset splits are reused by the same rule. Paths in new metadata and manifests are absolute. Runs previously written under `/home/shekhe/train_dir` are not searched or modified.
+
+`DATASET_SCHEMA_VERSION` and `TRAINING_SCHEMA_VERSION` in `sweep.py` invalidate cached artifacts when dataset conversion or training behavior changes without a corresponding CLI change. Increment the relevant value when making such a change; evaluation-only edits require neither increment.
+
 ## CleanDiffuser DQL
 
 DQL uses CleanDiffuser commit `05f17fc9dbeae7c19a5e264632c9ae9aaac5994e`. Install it without dependency resolution because CleanDiffuser's package metadata pins old versions of Gym, MuJoCo, NumPy, and Torch that are incompatible with the `mujocold` environment:
@@ -26,7 +43,6 @@ python sweep.py \
   --env HalfCheetah-v5 \
   --dataset-source minari \
   --algos dql \
-  --output-dir /home/shekhe/train_dir/stable_offline_rl \
   --device cuda \
   --epoch 2000 \
   --step-per-epoch 1000 \
@@ -46,4 +62,4 @@ Passing `--eval` runs both final-policy evaluation and checkpoint-history evalua
 - **Empirical `(C, rho)`:** standardized distances are bounded at every observed timestep by `C * rho**t`. Values of `rho` are not constrained below one.
 - **State and state-action OOD ratios:** mean rollout-to-training k-nearest-neighbor distance divided by the corresponding held-out-to-training distance. A ratio near one means the rollout is about as far from training data as held-out data is.
 
-Dynamics mismatch and finite-difference Jacobian mismatch are evaluated only for the final model. Reward, stability, and OOD metrics are evaluated at every saved policy checkpoint. Raw arrays are saved under each run's `eval/` directory, and aggregate plots are written under the environment output directory's `plots/` directory.
+Dynamics mismatch and finite-difference Jacobian mismatch are evaluated only for the final model. Reward, stability, and OOD metrics are evaluated at every saved policy checkpoint. Raw arrays are saved under the matching `evals/<environment>/<run-name>/<training-timestamp>/` directory, and plots for the runs selected by the current sweep are written under `evals/<environment>/plots/`.

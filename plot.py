@@ -7,6 +7,7 @@
 
 import argparse
 import json
+import shutil
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -25,7 +26,7 @@ def main() -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot stable-offline-rl sweep and evaluation results.")
-    parser.add_argument("--root", type=Path, required=True, help="Environment output directory containing runs/ and datasets/")
+    parser.add_argument("--root", type=Path, required=True, help="Environment directory under stable-offline-rl/evals")
     parser.add_argument("--out", type=Path, default=None, help="Directory for saved plots; defaults to <root>/plots")
     args = parser.parse_args()
     if args.out is None:
@@ -33,11 +34,18 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def plot_root(root: Path, out: Path | None = None) -> None:
+def plot_root(root: Path, out: Path | None = None, eval_dirs: list[Path] | None = None) -> None:
     out = root / "plots" if out is None else out
-    rows = load_rows(root)
-    histories = load_histories(root)
-    out.mkdir(parents=True, exist_ok=True)
+    if eval_dirs is None:
+        latest = {}
+        for results_path in sorted(root.glob("*/*/results.json")):
+            latest[results_path.parent.parent.name] = results_path.parent
+        eval_dirs = sorted(latest.values())
+    rows = load_rows(eval_dirs)
+    histories = load_histories(eval_dirs)
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True)
     plot_generated_reward_ablation(rows, out)
     plot_minari_reward_bars(rows, out)
     plot_robomimic_reward_bars(rows, out)
@@ -54,19 +62,25 @@ def plot_root(root: Path, out: Path | None = None) -> None:
         plot_training_histories(dataset_histories, dataset_out)
 
 
-def load_rows(root: Path) -> list[dict]:
+def load_rows(eval_dirs: list[Path]) -> list[dict]:
     rows = []
-    for manifest_path in sorted((root / "runs").glob("*/run_manifest.json")):
-        run_dir = manifest_path.parent
-        results_path = run_dir / "eval" / "results.json"
+    for eval_dir in sorted(eval_dirs):
+        results_path = eval_dir / "results.json"
         if not results_path.exists():
-            print(f"Skipping unevaluated run: {run_dir}")
+            print(f"Skipping incomplete evaluation: {eval_dir}")
             continue
 
-        manifest = load_json(manifest_path)
         results = load_json(results_path)
+        manifest_path = Path(results["run_manifest_path"])
+        manifest = load_json(manifest_path)
         metadata = load_json(Path(manifest["dataset_metadata_path"]))
-        row = {**manifest, **results, **dataset_fields(metadata), "run_dir": str(run_dir.resolve())}
+        row = {
+            **manifest,
+            **results,
+            **dataset_fields(metadata),
+            "run_dir": str(manifest_path.parent),
+            "eval_dir": str(eval_dir.resolve()),
+        }
         rows.append(row)
     return rows
 
@@ -95,9 +109,12 @@ def dataset_fields(metadata: dict) -> dict:
     }
 
 
-def load_histories(root: Path) -> list[dict]:
+def load_histories(eval_dirs: list[Path]) -> list[dict]:
     histories = []
-    for history_path in sorted((root / "runs").glob("*/eval/history.json")):
+    for eval_dir in sorted(eval_dirs):
+        history_path = eval_dir / "history.json"
+        if not history_path.exists():
+            continue
         history = load_json(history_path)
         history["label"] = history["algo"]
         histories.append(history)
@@ -198,7 +215,7 @@ def plot_stability_distances(rows: list[dict], out: Path) -> None:
 
 def stability_distance_plot(rows: list[dict], out: Path, stability_type: str) -> None:
     filename = f"{stability_type}_stability.npz"
-    available = [row for row in rows if (Path(row["run_dir"]) / "eval" / filename).exists()]
+    available = [row for row in rows if (Path(row["eval_dir"]) / filename).exists()]
     if not available:
         return
 
@@ -208,7 +225,7 @@ def stability_distance_plot(rows: list[dict], out: Path, stability_type: str) ->
         squeeze=False, sharex="col",
     )
     for column, row in enumerate(available):
-        with np.load(Path(row["run_dir"]) / "eval" / filename) as data:
+        with np.load(Path(row["eval_dir"]) / filename) as data:
             curves = data["distance_curves"]
             envelope = data["envelope"]
             support = data["support"]

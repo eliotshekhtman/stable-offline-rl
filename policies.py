@@ -60,12 +60,19 @@ def build_model_free_policy(
         return BCPolicy(actor, torch.optim.Adam(actor.parameters(), lr=3e-4)), None
 
     if algo == "cql":
-        hidden_dims = [256, 256, 256]
-        actor, actor_optim = build_prob_actor(obs_dim, action_dim, max_action, hidden_dims, args.device, 1e-4)
-        critic1, critic1_optim = build_critic(obs_dim, action_dim, hidden_dims, args.device, 3e-4)
-        critic2, critic2_optim = build_critic(obs_dim, action_dim, hidden_dims, args.device, 3e-4)
+        # Use robomimic's published low-dimensional CQL policy defaults for manipulation tasks.
+        is_robomimic = env.spec.id.lower() in ROBOMIMIC_TASKS
+        hidden_dims = [300, 400] if is_robomimic else [256, 256, 256]
+        actor_lr = 3e-4 if is_robomimic else 1e-4
+        critic_lr = 1e-3 if is_robomimic else 3e-4
+        actor, actor_optim = build_prob_actor(obs_dim, action_dim, max_action, hidden_dims, args.device, actor_lr)
+        critic1, critic1_optim = build_critic(obs_dim, action_dim, hidden_dims, args.device, critic_lr)
+        critic2, critic2_optim = build_critic(obs_dim, action_dim, hidden_dims, args.device, critic_lr)
+        if is_robomimic:
+            for head in (actor.dist_net.mu, actor.dist_net.sigma):
+                torch.nn.init.uniform_(head.weight, -1e-3, 1e-3)
+                torch.nn.init.uniform_(head.bias, -1e-3, 1e-3)
         alpha = build_auto_alpha(action_dim, args.device, 1e-4)
-        cql_weight = 1.0 if env.spec.id.lower() in ROBOMIMIC_TASKS else 5.0
         return CQLPolicy(
             actor,
             critic1,
@@ -77,13 +84,13 @@ def build_model_free_policy(
             tau=0.005,
             gamma=0.99,
             alpha=alpha,
-            cql_weight=cql_weight,
+            cql_weight=1.0 if is_robomimic else 5.0,
             temperature=1.0,
             max_q_backup=False,
             deterministic_backup=True,
-            with_lagrange=False,
-            lagrange_threshold=10.0,
-            cql_alpha_lr=3e-4,
+            with_lagrange=is_robomimic,
+            lagrange_threshold=5.0 if is_robomimic else 10.0,
+            cql_alpha_lr=1e-3 if is_robomimic else 3e-4,
             num_repeart_actions=10,
         ), None
 

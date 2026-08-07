@@ -7,6 +7,7 @@
 
 import argparse
 import json
+import shutil
 from pathlib import Path
 
 import gymnasium as gym
@@ -33,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     run.add_argument("--run-dir", type=Path, required=True, help="Directory containing run_manifest.json and the trained model files")
     run.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Torch device used to reload the trained policy and dynamics")
     run.add_argument("--seed", type=int, default=0, help="Random seed for evaluation rollouts and sampled Jacobian states")
+    run.add_argument("--expert", default=None, help="Expert policy .zip path or directory containing <env>.zip; defaults to the expert recorded during training")
 
     rollout_eval = parser.add_argument_group("rollout evaluation")
     rollout_eval.add_argument("--eval-episodes", type=int, default=10, help="Number of true-environment episodes used to estimate policy and expert returns")
@@ -50,12 +52,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def evaluate_run(run_dir: Path, args: argparse.Namespace) -> None:
+def evaluate_run(run_dir: Path, args: argparse.Namespace) -> Path:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
-    with (run_dir / "run_manifest.json").open("r", encoding="utf-8") as file:
+    manifest_path = (run_dir / "run_manifest.json").resolve()
+    with manifest_path.open("r", encoding="utf-8") as file:
         manifest = json.load(file)
+    if args.expert is not None:
+        expert_path = Path(args.expert).expanduser()
+        if expert_path.suffix != ".zip":
+            expert_path = expert_path / f"{manifest['env_name']}.zip"
+        manifest["expert"] = str(expert_path.resolve())
     train_dataset = rollout.load_dataset(manifest["train_dataset_path"])
     test_dataset = rollout.load_dataset(manifest["test_dataset_path"])
     policy, dynamics, obs_mean, obs_std = load_policy_and_dynamics(
@@ -71,9 +79,25 @@ def evaluate_run(run_dir: Path, args: argparse.Namespace) -> None:
     )
     expert_info = evaluate_expert(manifest, args.eval_episodes, args.seed)
 
-    eval_dir = run_dir / "eval"
-    eval_dir.mkdir(exist_ok=True)
+    eval_dir = Path(manifest.get("eval_dir", run_dir / "eval"))
+    if eval_dir.exists():
+        shutil.rmtree(eval_dir)
+    eval_dir.mkdir(parents=True)
     results = {
+        "run_manifest_path": str(manifest_path),
+        "evaluation_config": {
+            "device": args.device,
+            "eval_episodes": args.eval_episodes,
+            "expert": manifest["expert"],
+            "seed": args.seed,
+            "jacobian_samples": args.jacobian_samples,
+            "fd_eps": args.fd_eps,
+            "stability_trajectories": args.stability_trajectories,
+            "stability_horizon": args.stability_horizon,
+            "global_max_offset": args.global_max_offset,
+            "local_perturbation_scale": args.local_perturbation_scale,
+            "ood_samples": args.ood_samples,
+        },
         "env_name": manifest["env_name"],
         "algo": manifest["algo"],
         "dataset_tag": manifest["dataset_tag"],
@@ -151,6 +175,7 @@ def evaluate_run(run_dir: Path, args: argparse.Namespace) -> None:
         json.dump(results, file, indent=2, sort_keys=True)
     evaluate_history(manifest, train_dataset, test_dataset, expert_info, eval_dir, args)
     print(f"Saved evaluation: {eval_dir}")
+    return eval_dir
 
 
 def load_policy_and_dynamics(
@@ -238,7 +263,8 @@ def robomimic_expert_metadata(manifest: dict) -> dict:
     metadata = load_offline.load_metadata(metadata_path)
     if metadata["dataset_type"] == "ph":
         return metadata
-    ph_metadata_path = metadata_path.parent.parent / f"robomimic_{metadata['task'].lower()}_ph" / "metadata.json"
+    ph_dataset_dir = metadata_path.parents[2] / f"robomimic_{metadata['task'].lower()}_ph"
+    ph_metadata_path = sorted(ph_dataset_dir.glob("*/metadata.json"), reverse=True)[0]
     return load_offline.load_metadata(ph_metadata_path)
 
 

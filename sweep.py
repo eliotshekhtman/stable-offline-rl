@@ -9,7 +9,7 @@ import itertools
 import json
 import math
 import random
-import shutil
+from datetime import datetime
 from pathlib import Path
 
 import gymnasium as gym
@@ -25,6 +25,14 @@ from dql import CLEANDIFFUSER_COMMIT, resolve_dql_config, train_dql
 from policies import MODEL_BASED_ALGOS, MODEL_FREE_ALGOS, build_model_based_policy, build_model_free_policy
 
 
+PROJECT_DIR = Path(__file__).resolve().parent
+DATASET_ROOT = PROJECT_DIR / "datasets"
+TRAINED_ROOT = PROJECT_DIR / "trained"
+EVAL_ROOT = PROJECT_DIR / "evals"
+DATASET_SCHEMA_VERSION = 1
+TRAINING_SCHEMA_VERSION = 1
+
+
 def main() -> None:
     args = parse_args()
     expert_path = resolve_expert_path(args.expert, args.env)
@@ -36,11 +44,8 @@ def parse_args() -> argparse.Namespace:
 
     experiment = parser.add_argument_group("experiment")
     experiment.add_argument("--env", required=True, help="Gymnasium environment id to train on, e.g. HalfCheetah-v5")
-    experiment.add_argument("--output-dir", default="outputs", help="Root directory for saved datasets, logs, checkpoints, and run manifests")
     experiment.add_argument("--seed", type=int, default=0, help="Random seed used for dataset splitting, generated rollouts, and training")
     experiment.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Torch device used for OfflineRL-Kit policies and dynamics")
-    experiment.add_argument("--reuse-datasets", action="store_true", help="Load existing dataset splits from disk instead of recreating them")
-    experiment.add_argument("--overwrite", action="store_true", help="Remove an existing run directory before training")
 
     dataset = parser.add_argument_group("dataset source and split")
     dataset.add_argument("--dataset-source", choices=["generated", "minari", "robomimic"], default="generated", help="Use generated expert/random rollouts, all matching Minari datasets, or low-dimensional robomimic datasets for the environment")
@@ -59,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     training.add_argument("--epoch", type=int, default=1000, help="Number of policy-training epochs")
     training.add_argument("--step-per-epoch", type=int, default=1000, help="Gradient-update steps per policy-training epoch")
     training.add_argument("--batch-size", type=int, default=256, help="Policy-training batch size")
-    training.add_argument("--eval-episodes", type=int, default=10, help="Episodes used by OfflineRL-Kit trainer evaluation during training")
+    training.add_argument("--eval-episodes", type=int, default=10, help="Episodes used for trainer evaluation and, with --eval, post-training return evaluation")
     training.add_argument("--eval", action="store_true", help="After training, run full evaluation for each trained policy and then generate plots")
     training.add_argument("--jacobian-samples", type=int, default=8, help="Evaluation-only number of dataset and rollout states used for finite-difference Jacobian metrics")
     training.add_argument("--fd-eps", type=float, default=1e-4, help="Evaluation-only central finite-difference perturbation size for Jacobian metrics")
@@ -92,89 +97,104 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_sweep(env_name: str, expert_path: Path, args: argparse.Namespace) -> None:
-    output_root = Path(args.output_dir) / env_name
-    dataset_dir = output_root / "datasets"
-    run_dir = output_root / "runs"
-    dataset_dir.mkdir(parents=True, exist_ok=True)
-    run_dir.mkdir(parents=True, exist_ok=True)
+    dataset_root = DATASET_ROOT / env_name
+    trained_root = TRAINED_ROOT / env_name
+    eval_root = EVAL_ROOT / env_name
+    dataset_root.mkdir(parents=True, exist_ok=True)
+    trained_root.mkdir(parents=True, exist_ok=True)
+    eval_dirs = []
 
     if args.dataset_source == "minari":
-        run_minari_sweep(env_name=env_name, dataset_dir=dataset_dir, run_dir=run_dir, args=args)
-        maybe_plot(output_root, args)
-        return
-    if args.dataset_source == "robomimic":
-        run_robomimic_sweep(env_name=env_name, dataset_dir=dataset_dir, run_dir=run_dir, args=args)
-        maybe_plot(output_root, args)
-        return
-
-    for num_samples, noise_scale, prop_expert in itertools.product(
-        args.num_samples, args.noise_scale, args.prop_expert
-    ):
-        dataset_tag = make_dataset_tag(num_samples, noise_scale, prop_expert, args.seed)
-        tag_dir = dataset_dir / dataset_tag
-        if args.reuse_datasets and (tag_dir / "train.npz").exists():
-            print(f"Loading dataset split: {tag_dir}")
-            train_dataset = rollout.load_dataset(tag_dir / "train.npz")
-            paths = split_paths(tag_dir)
-        else:
-            dataset, metadata = collect_generated_dataset(
-                env_name=env_name,
-                expert_path=expert_path,
-                num_samples=num_samples,
-                noise_scale=noise_scale,
-                prop_expert=prop_expert,
-                args=args,
-            )
-            train_dataset, paths = save_dataset_splits(tag_dir, dataset, metadata, args)
-
-        train_algos(env_name, train_dataset, run_dir, dataset_tag, paths, args)
-
-    maybe_plot(output_root, args)
-
-
-def run_minari_sweep(env_name: str, dataset_dir: Path, run_dir: Path, args: argparse.Namespace) -> None:
-    if args.reuse_datasets:
-        dataset_ids = [
-            json.loads(path.read_text(encoding="utf-8"))["dataset_id"]
-            for path in sorted(dataset_dir.glob("minari_*/metadata.json"))
-        ]
+        eval_dirs = run_minari_sweep(env_name, dataset_root, trained_root, eval_root, args)
+    elif args.dataset_source == "robomimic":
+        eval_dirs = run_robomimic_sweep(env_name, dataset_root, trained_root, eval_root, args)
     else:
-        dataset_ids = load_offline.list_minari_dataset_ids(env_name)
+        for num_samples, noise_scale, prop_expert in itertools.product(
+            args.num_samples, args.noise_scale, args.prop_expert
+        ):
+            dataset_tag = make_dataset_tag(num_samples, noise_scale, prop_expert, args.seed)
+            dataset_schema = {
+                "version": DATASET_SCHEMA_VERSION,
+                "source": "generated",
+                "env_name": env_name,
+                "expert_path": str(expert_path),
+                "max_timesteps": args.max_timesteps,
+                "num_samples": num_samples,
+                "noise_scale": noise_scale,
+                "prop_expert": prop_expert,
+                "deterministic": True,
+                "seed": args.seed,
+                "split_level": args.split_level,
+                "test_fraction": args.test_fraction,
+            }
+            eval_dirs.extend(
+                train_algos(
+                    env_name, trained_root, eval_root, dataset_root / dataset_tag,
+                    dataset_tag, dataset_schema, args,
+                    lambda: collect_generated_dataset(
+                        env_name, expert_path, num_samples, noise_scale, prop_expert, args
+                    ),
+                )
+            )
 
+    maybe_plot(eval_root, eval_dirs, args)
+
+
+def run_minari_sweep(
+    env_name: str,
+    dataset_root: Path,
+    trained_root: Path,
+    eval_root: Path,
+    args: argparse.Namespace,
+) -> list[Path]:
+    eval_dirs = []
+    dataset_ids = load_offline.list_minari_dataset_ids(env_name)
     for dataset_id in dataset_ids:
         dataset_tag = load_offline.make_minari_dataset_tag(dataset_id)
-        tag_dir = dataset_dir / dataset_tag
-        if args.reuse_datasets and (tag_dir / "train.npz").exists():
-            print(f"Loading dataset split: {tag_dir}")
-            train_dataset = rollout.load_dataset(tag_dir / "train.npz")
-            paths = split_paths(tag_dir)
-        else:
-            dataset, metadata = load_offline.load_minari_dataset(dataset_id, seed=args.seed)
-            train_dataset, paths = save_dataset_splits(tag_dir, dataset, metadata, args)
+        dataset_schema = {
+            "version": DATASET_SCHEMA_VERSION,
+            "source": "minari",
+            "env_name": env_name,
+            "dataset_id": dataset_id,
+            "seed": args.seed,
+            "split_level": args.split_level,
+            "test_fraction": args.test_fraction,
+        }
+        eval_dirs.extend(
+            train_algos(
+                env_name, trained_root, eval_root, dataset_root / dataset_tag,
+                dataset_tag, dataset_schema, args,
+                lambda dataset_id=dataset_id: load_offline.load_minari_dataset(dataset_id, seed=args.seed),
+            )
+        )
+    return eval_dirs
 
-        train_algos(env_name, train_dataset, run_dir, dataset_tag, paths, args)
 
-
-def run_robomimic_sweep(env_name: str, dataset_dir: Path, run_dir: Path, args: argparse.Namespace) -> None:
-    if args.reuse_datasets:
-        tag_dirs = sorted(path.parent for path in dataset_dir.glob("robomimic_*/metadata.json"))
-    else:
-        tag_dirs = []
-
-    if args.reuse_datasets and tag_dirs:
-        for tag_dir in tag_dirs:
-            print(f"Loading dataset split: {tag_dir}")
-            train_dataset = rollout.load_dataset(tag_dir / "train.npz")
-            paths = split_paths(tag_dir)
-            train_algos(env_name, train_dataset, run_dir, tag_dir.name, paths, args)
-        return
-
+def run_robomimic_sweep(
+    env_name: str,
+    dataset_root: Path,
+    trained_root: Path,
+    eval_root: Path,
+    args: argparse.Namespace,
+) -> list[Path]:
+    eval_dirs = []
     for spec in load_offline.list_robomimic_dataset_specs(env_name):
         dataset_tag = load_offline.make_robomimic_dataset_tag(spec)
-        tag_dir = dataset_dir / dataset_tag
-        dataset, metadata = load_offline.load_robomimic_dataset(spec, seed=args.seed)
-        train_dataset, paths = save_dataset_splits(tag_dir, dataset, metadata, args)
-        train_algos(env_name, train_dataset, run_dir, dataset_tag, paths, args)
+        dataset_schema = {
+            "version": DATASET_SCHEMA_VERSION,
+            **spec,
+            "seed": args.seed,
+            "split_level": args.split_level,
+            "test_fraction": args.test_fraction,
+        }
+        eval_dirs.extend(
+            train_algos(
+                env_name, trained_root, eval_root, dataset_root / dataset_tag,
+                dataset_tag, dataset_schema, args,
+                lambda spec=spec: load_offline.load_robomimic_dataset(spec, seed=args.seed),
+            )
+        )
+    return eval_dirs
 
 
 def collect_generated_dataset(
@@ -201,10 +221,31 @@ def collect_generated_dataset(
     )
 
 
+def get_or_create_dataset(
+    dataset_parent: Path,
+    dataset_schema: dict,
+    create_dataset,
+    args: argparse.Namespace,
+) -> tuple[dict[str, np.ndarray], dict]:
+    for metadata_path in sorted(dataset_parent.glob("*/metadata.json"), reverse=True):
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        dataset_dir = metadata_path.parent
+        if metadata.get("dataset_schema") == dataset_schema and all(
+            (dataset_dir / filename).exists() for filename in ("full.npz", "train.npz", "test.npz")
+        ):
+            print(f"Loading dataset split: {dataset_dir}")
+            return rollout.load_dataset(dataset_dir / "train.npz"), split_paths(dataset_dir)
+
+    dataset, metadata = create_dataset()
+    dataset_dir = dataset_parent / timestamp_name()
+    return save_dataset_splits(dataset_dir, dataset, metadata, dataset_schema, args)
+
+
 def save_dataset_splits(
     dataset_dir: Path,
     dataset: dict[str, np.ndarray],
     metadata: dict,
+    dataset_schema: dict,
     args: argparse.Namespace,
 ) -> tuple[dict[str, np.ndarray], dict]:
     full_path = dataset_dir / "full.npz"
@@ -215,11 +256,12 @@ def save_dataset_splits(
     dataset_dir.mkdir(parents=True, exist_ok=True)
     metadata = {
         **metadata,
+        "dataset_schema": dataset_schema,
         "split_level": args.split_level,
         "test_fraction": args.test_fraction,
-        "full_dataset_path": str(full_path),
-        "train_dataset_path": str(train_path),
-        "test_dataset_path": str(test_path),
+        "full_dataset_path": str(full_path.resolve()),
+        "train_dataset_path": str(train_path.resolve()),
+        "test_dataset_path": str(test_path.resolve()),
     }
     train_dataset, test_dataset = rollout.split_dataset(
         dataset,
@@ -237,36 +279,136 @@ def save_dataset_splits(
 
 def train_algos(
     env_name: str,
-    train_dataset: dict[str, np.ndarray],
-    run_dir: Path,
+    trained_root: Path,
+    eval_root: Path,
+    dataset_parent: Path,
     dataset_tag: str,
-    paths: dict,
+    dataset_schema: dict,
     args: argparse.Namespace,
-) -> None:
+    create_dataset,
+) -> list[Path]:
+    eval_dirs = []
+    dataset_and_paths = None
+    if args.algos == ["none"]:
+        get_or_create_dataset(dataset_parent, dataset_schema, create_dataset, args)
+        return eval_dirs
+
     for algo in args.algos:
-        if algo != "none":
-            algo_run_dir = run_dir / f"{algo}_{dataset_tag}"
+        if algo == "none":
+            continue
+
+        run_name = f"{algo}_{dataset_tag}"
+        schema = make_training_schema(algo, env_name, dataset_schema, args)
+        run_dir = find_trained_run(trained_root / run_name, schema)
+        if run_dir is None:
+            if dataset_and_paths is None:
+                dataset_and_paths = get_or_create_dataset(
+                    dataset_parent, dataset_schema, create_dataset, args
+                )
+            train_dataset, paths = dataset_and_paths
+            variant = timestamp_name()
+            run_dir = trained_root / run_name / variant
             train_algo(
                 algo=algo,
                 env_name=env_name,
                 dataset=train_dataset,
-                run_dir=algo_run_dir,
+                run_dir=run_dir,
+                eval_dir=eval_root / run_name / variant,
                 split_paths=paths,
+                training_schema=schema,
                 args=args,
             )
-            maybe_evaluate(algo_run_dir, args)
+        else:
+            print(f"Reusing trained run: {run_dir}")
+
+        eval_dir = maybe_evaluate(run_dir, args)
+        if eval_dir is not None:
+            eval_dirs.append(eval_dir)
+    return eval_dirs
 
 
-def maybe_evaluate(run_dir: Path, args: argparse.Namespace) -> None:
+def make_training_schema(
+    algo: str,
+    env_name: str,
+    dataset_schema: dict,
+    args: argparse.Namespace,
+) -> dict:
+    schema = {
+        "version": TRAINING_SCHEMA_VERSION,
+        "env_name": env_name,
+        "algo": algo,
+        "dataset": dataset_schema,
+        "seed": args.seed,
+        "epoch": args.epoch,
+        "step_per_epoch": args.step_per_epoch,
+        "batch_size": args.batch_size,
+    }
+    if algo == "dql":
+        schema["dql"] = {
+            "eta": args.dql_eta,
+            "weight_temperature": args.dql_weight_temperature,
+            "reward_normalization": args.dql_reward_normalization,
+        }
+    if algo in {"cql", "combo"}:
+        schema["implementation_version"] = 2
+    if algo in MODEL_BASED_ALGOS:
+        schema["model_based"] = {
+            "dynamics_max_epochs": args.dynamics_max_epochs,
+            "rollout_freq": args.rollout_freq,
+            "rollout_batch_size": args.rollout_batch_size,
+            "rollout_length": args.rollout_length,
+            "model_retain_epochs": args.model_retain_epochs,
+            "real_ratio": args.real_ratio,
+        }
+    if algo == "rambo":
+        schema["rambo"] = {
+            "dynamics_update_freq": args.dynamics_update_freq,
+            "adv_batch_size": args.adv_batch_size,
+            "adv_weight": args.adv_weight,
+            "bc_epoch": args.bc_epoch,
+            "bc_batch_size": args.bc_batch_size,
+        }
+    return schema
+
+
+def find_trained_run(run_parent: Path, training_schema: dict) -> Path | None:
+    for manifest_path in sorted(run_parent.glob("*/run_manifest.json"), reverse=True):
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("training_schema") == training_schema and run_is_complete(manifest):
+            return manifest_path.parent
+    return None
+
+
+def run_is_complete(manifest: dict) -> bool:
+    paths = [
+        Path(manifest["model_dir"]) / "policy.pth",
+        Path(manifest["full_dataset_path"]),
+        Path(manifest["train_dataset_path"]),
+        Path(manifest["test_dataset_path"]),
+        Path(manifest["dataset_metadata_path"]),
+    ]
+    for checkpoint in manifest["checkpoints"]:
+        paths.append(Path(checkpoint["policy_path"]))
+        if "dynamics_path" in checkpoint:
+            dynamics_dir = Path(checkpoint["dynamics_path"])
+            paths.extend((dynamics_dir / "dynamics.pth", dynamics_dir / "mu.npy", dynamics_dir / "std.npy"))
+    if manifest["algo"] in MODEL_BASED_ALGOS:
+        model_dir = Path(manifest["model_dir"])
+        paths.extend((model_dir / "dynamics.pth", model_dir / "mu.npy", model_dir / "std.npy"))
+    return all(path.exists() for path in paths)
+
+
+def maybe_evaluate(run_dir: Path, args: argparse.Namespace) -> Path | None:
     if not args.eval:
-        return
+        return None
     from eval import evaluate_run
 
-    evaluate_run(
+    return evaluate_run(
         run_dir,
         argparse.Namespace(
             device=args.device,
             eval_episodes=args.eval_episodes,
+            expert=args.expert,
             seed=args.seed,
             jacobian_samples=args.jacobian_samples,
             fd_eps=args.fd_eps,
@@ -279,24 +421,24 @@ def maybe_evaluate(run_dir: Path, args: argparse.Namespace) -> None:
     )
 
 
-def maybe_plot(output_root: Path, args: argparse.Namespace) -> None:
-    if not args.eval:
+def maybe_plot(eval_root: Path, eval_dirs: list[Path], args: argparse.Namespace) -> None:
+    if not args.eval or not eval_dirs:
         return
     from plot import plot_root
 
-    plot_root(output_root)
+    plot_root(eval_root, eval_dirs=eval_dirs)
 
 
 def split_paths(dataset_dir: Path) -> dict:
     with (dataset_dir / "metadata.json").open("r", encoding="utf-8") as file:
         metadata = json.load(file)
     return {
-        "dataset_dir": str(dataset_dir),
-        "full_dataset_path": str(dataset_dir / "full.npz"),
-        "train_dataset_path": str(dataset_dir / "train.npz"),
-        "test_dataset_path": str(dataset_dir / "test.npz"),
-        "dataset_metadata_path": str(dataset_dir / "metadata.json"),
-        "dataset_tag": dataset_dir.name,
+        "dataset_dir": str(dataset_dir.resolve()),
+        "full_dataset_path": str((dataset_dir / "full.npz").resolve()),
+        "train_dataset_path": str((dataset_dir / "train.npz").resolve()),
+        "test_dataset_path": str((dataset_dir / "test.npz").resolve()),
+        "dataset_metadata_path": str((dataset_dir / "metadata.json").resolve()),
+        "dataset_tag": dataset_dir.parent.name,
         "split_level": metadata["split_level"],
         "test_fraction": metadata["test_fraction"],
     }
@@ -307,13 +449,15 @@ def train_algo(
     env_name: str,
     dataset: dict[str, np.ndarray],
     run_dir: Path,
+    eval_dir: Path,
     split_paths: dict,
+    training_schema: dict,
     args: argparse.Namespace,
 ) -> None:
     if algo not in MODEL_FREE_ALGOS and algo not in MODEL_BASED_ALGOS:
         raise ValueError(f"Unsupported algorithm: {algo}")
 
-    prepare_run_dir(run_dir, args.overwrite)
+    run_dir.mkdir(parents=True)
     seed_everything(args.seed)
 
     eval_env = make_env(env_name, split_paths, args)
@@ -410,7 +554,10 @@ def train_algo(
             )
         else:
             trainer.train()
-        save_run_manifest(run_dir, algo, env_name, split_paths, args, dql_config)
+        save_run_manifest(
+            run_dir, eval_dir, algo, env_name, split_paths,
+            training_schema, args, dql_config,
+        )
     finally:
         eval_env.close()
 
@@ -438,21 +585,31 @@ def make_env(env_name: str, split_paths: dict, args: argparse.Namespace):
 
 def save_run_manifest(
     run_dir: Path,
+    eval_dir: Path,
     algo: str,
     env_name: str,
     split_paths: dict,
+    training_schema: dict,
     args: argparse.Namespace,
     dql_config: dict | None,
 ) -> None:
     manifest = {
+        "created_at": datetime.now().astimezone().isoformat(),
         "env_name": env_name,
         "algo": algo,
         "dataset_source": args.dataset_source,
-        "model_dir": str(run_dir / "model"),
+        "run_dir": str(run_dir.resolve()),
+        "model_dir": str((run_dir / "model").resolve()),
+        "eval_dir": str(eval_dir.resolve()),
+        "training_schema": training_schema,
+        "seed": args.seed,
+        "device": args.device,
         "test_fraction": args.test_fraction,
         "split_level": args.split_level,
         "epoch": args.epoch,
         "step_per_epoch": args.step_per_epoch,
+        "batch_size": args.batch_size,
+        "training_eval_episodes": args.eval_episodes,
         "adv_weight": args.adv_weight,
         "adv_batch_size": args.adv_batch_size,
         "rollout_length": args.rollout_length,
@@ -490,14 +647,6 @@ def build_logger(run_dir: Path, args: argparse.Namespace, algo: str, env_name: s
     return logger
 
 
-def prepare_run_dir(run_dir: Path, overwrite: bool) -> None:
-    if run_dir.exists():
-        if not overwrite:
-            raise FileExistsError(f"Run directory already exists. Use --overwrite to replace it: {run_dir}")
-        shutil.rmtree(run_dir)
-    run_dir.mkdir(parents=True)
-
-
 def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -532,11 +681,11 @@ def checkpoint_manifest(run_dir: Path, algo: str, epochs: int, steps_per_epoch: 
         record = {
             **item,
             "step": step,
-            "policy_path": str(checkpoint_dir / "policy.pth"),
+            "policy_path": str((checkpoint_dir / "policy.pth").resolve()),
         }
         if algo in MODEL_BASED_ALGOS:
             dynamics_dir = checkpoint_dir if algo == "rambo" else run_dir / "checkpoint" / "step_0"
-            record["dynamics_path"] = str(dynamics_dir)
+            record["dynamics_path"] = str(dynamics_dir.resolve())
         records.append(record)
     return records
 
@@ -546,10 +695,14 @@ def make_dataset_tag(num_samples: int, noise_scale: float, prop_expert: float, s
 
 
 def resolve_expert_path(expert_arg: str, env_name: str) -> Path:
-    expert_path = Path(expert_arg)
+    expert_path = Path(expert_arg).expanduser()
     if expert_path.suffix == ".zip":
-        return expert_path
-    return expert_path / f"{env_name}.zip"
+        return expert_path.resolve()
+    return (expert_path / f"{env_name}.zip").resolve()
+
+
+def timestamp_name() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S-%f")
 
 
 if __name__ == "__main__":
