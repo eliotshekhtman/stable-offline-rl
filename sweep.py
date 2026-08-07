@@ -29,7 +29,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 DATASET_ROOT = PROJECT_DIR / "datasets"
 TRAINED_ROOT = PROJECT_DIR / "trained"
 EVAL_ROOT = PROJECT_DIR / "evals"
-DATASET_SCHEMA_VERSION = 1
+DATASET_SCHEMA_VERSION = 2
 TRAINING_SCHEMA_VERSION = 1
 
 
@@ -50,13 +50,12 @@ def parse_args() -> argparse.Namespace:
     dataset = parser.add_argument_group("dataset source and split")
     dataset.add_argument("--dataset-source", choices=["generated", "minari", "robomimic"], default="generated", help="Use generated expert/random rollouts, all matching Minari datasets, or low-dimensional robomimic datasets for the environment")
     dataset.add_argument("--test-fraction", type=float, default=0.2, help="Fraction of each dataset held out for post-training evaluation")
-    dataset.add_argument("--split-level", choices=["transition", "episode"], default="transition", help="Split train/test by individual transitions or by whole episodes")
 
     generated = parser.add_argument_group("generated dataset options")
     generated.add_argument("--expert", default="/home/shekhe/stable-offline-rl/experts", help="Expert policy .zip path or directory containing <env>.zip; used only for generated expert data and expert evaluation")
-    generated.add_argument("--num-samples", type=int, nargs="+", default=[10000], help="Generated dataset transition counts to sweep over")
+    generated.add_argument("--num-samples", type=int, nargs="+", default=[10000], help="Minimum generated transition counts to sweep over; collection finishes the episode that reaches each source target")
     generated.add_argument("--noise-scale", type=float, nargs="+", default=[0.0], help="Gaussian action-noise scales applied to expert actions in generated datasets")
-    generated.add_argument("--prop-expert", type=float, nargs="+", default=[1.0], help="Fraction of generated transitions collected from the expert; the rest are random actions")
+    generated.add_argument("--prop-expert", type=float, nargs="+", default=[1.0], help="Target fraction of generated transitions collected from the expert; completing episodes can change the actual fraction")
     generated.add_argument("--max-timesteps", type=int, default=1000, help="Maximum length of each generated rollout trajectory")
 
     training = parser.add_argument_group("policy training")
@@ -72,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     dql = parser.add_argument_group("DQL options")
     dql.add_argument("--dql-eta", type=float, default=None, help="Override the DQL Q-guidance loss weight; defaults to CleanDiffuser's locomotion value of 1")
     dql.add_argument("--dql-weight-temperature", type=float, default=None, help="Override the DQL candidate-action softmax weight; defaults to a CleanDiffuser task value when available")
-    dql.add_argument("--dql-reward-normalization", choices=["auto", "none", "episode-range"], default="auto", help="DQL reward scaling: auto uses CleanDiffuser episode-return-range scaling for episode-split Minari data and no scaling otherwise")
+    dql.add_argument("--dql-reward-normalization", choices=["auto", "none", "episode-range"], default="auto", help="DQL reward scaling: auto uses CleanDiffuser episode-return-range scaling for Minari data and no scaling otherwise")
 
     stability = parser.add_argument_group("stability and conservativity evaluation")
     stability.add_argument("--stability-trajectories", type=int, default=8, help="Evaluation-only number of global trajectories and local perturbed-state pairs")
@@ -124,7 +123,6 @@ def run_sweep(env_name: str, expert_path: Path, args: argparse.Namespace) -> Non
                 "prop_expert": prop_expert,
                 "deterministic": True,
                 "seed": args.seed,
-                "split_level": args.split_level,
                 "test_fraction": args.test_fraction,
             }
             eval_dirs.extend(
@@ -157,7 +155,6 @@ def run_minari_sweep(
             "env_name": env_name,
             "dataset_id": dataset_id,
             "seed": args.seed,
-            "split_level": args.split_level,
             "test_fraction": args.test_fraction,
         }
         eval_dirs.extend(
@@ -184,7 +181,6 @@ def run_robomimic_sweep(
             "version": DATASET_SCHEMA_VERSION,
             **spec,
             "seed": args.seed,
-            "split_level": args.split_level,
             "test_fraction": args.test_fraction,
         }
         eval_dirs.extend(
@@ -257,7 +253,6 @@ def save_dataset_splits(
     metadata = {
         **metadata,
         "dataset_schema": dataset_schema,
-        "split_level": args.split_level,
         "test_fraction": args.test_fraction,
         "full_dataset_path": str(full_path.resolve()),
         "train_dataset_path": str(train_path.resolve()),
@@ -266,7 +261,6 @@ def save_dataset_splits(
     train_dataset, test_dataset = rollout.split_dataset(
         dataset,
         test_fraction=args.test_fraction,
-        split_level=args.split_level,
         seed=args.seed,
     )
     rollout.save_dataset(dataset, full_path)
@@ -439,7 +433,6 @@ def split_paths(dataset_dir: Path) -> dict:
         "test_dataset_path": str((dataset_dir / "test.npz").resolve()),
         "dataset_metadata_path": str((dataset_dir / "metadata.json").resolve()),
         "dataset_tag": dataset_dir.parent.name,
-        "split_level": metadata["split_level"],
         "test_fraction": metadata["test_fraction"],
     }
 
@@ -471,7 +464,6 @@ def train_algo(
             dataset_tag=split_paths["dataset_tag"],
             dataset=dataset,
             dataset_source=args.dataset_source,
-            split_level=split_paths["split_level"],
             eta_override=args.dql_eta,
             weight_temperature_override=args.dql_weight_temperature,
             reward_normalization=args.dql_reward_normalization,
@@ -605,7 +597,6 @@ def save_run_manifest(
         "seed": args.seed,
         "device": args.device,
         "test_fraction": args.test_fraction,
-        "split_level": args.split_level,
         "epoch": args.epoch,
         "step_per_epoch": args.step_per_epoch,
         "batch_size": args.batch_size,

@@ -71,6 +71,11 @@ def collect_traj(
         obs = next_obs
         if terminated or truncated:
             break
+    else:
+        # max_timesteps is a collector-imposed truncation even when it is
+        # shorter than the environment's own TimeLimit.
+        if transitions["timeouts"]:
+            transitions["timeouts"][-1] = True
 
     return {
         "observations": np.asarray(transitions["observations"], dtype=np.float32),
@@ -93,7 +98,7 @@ def collect_expert(
     rng: np.random.Generator | None = None,
     episode_id_start: int = 0,
 ) -> dict[str, np.ndarray]:
-    """Collect transition samples from a clipped, noise-injected expert."""
+    """Collect complete expert episodes until the transition target is reached."""
     rng = np.random.default_rng() if rng is None else rng
 
     def make_action_fn(env: gym.Env) -> Callable[[np.ndarray], np.ndarray]:
@@ -134,7 +139,7 @@ def collect_suboptimal(
     rng: np.random.Generator | None = None,
     episode_id_start: int = 0,
 ) -> dict[str, np.ndarray]:
-    """Collect transition samples from pure random actions."""
+    """Collect complete random-action episodes until the transition target is reached."""
     rng = np.random.default_rng() if rng is None else rng
 
     def make_action_fn(env: gym.Env) -> Callable[[np.ndarray], np.ndarray]:
@@ -165,10 +170,11 @@ def collect_dataset(
     deterministic: bool = True,
     seed: int | None = None,
 ) -> tuple[dict[str, np.ndarray], dict]:
-    """Collect a shuffled offline-RL transition dataset.
+    """Collect an ordered offline-RL dataset containing complete episodes.
 
-    prop_expert controls the fraction of samples drawn from the noise-injected
-    expert. The remainder are collected from uniform random actions.
+    num_samples and prop_expert determine minimum per-source transition targets.
+    Collection finishes the episode that reaches each target, so the returned
+    dataset can contain more transitions and a slightly different source ratio.
     """
     _validate_collection_args(
         max_timesteps=max_timesteps,
@@ -178,15 +184,17 @@ def collect_dataset(
     )
 
     rng = np.random.default_rng(seed)
-    num_expert, num_suboptimal = _split_sample_counts(num_samples, prop_expert)
+    requested_num_expert, requested_num_suboptimal = _split_sample_counts(num_samples, prop_expert)
     datasets = []
     next_episode_id = 0
+    num_expert = 0
+    num_suboptimal = 0
 
-    if num_expert > 0:
+    if requested_num_expert > 0:
         expert_dataset = collect_expert(
             env_name=env_name,
             policy_path=policy_path,
-            num_samples=num_expert,
+            num_samples=requested_num_expert,
             max_timesteps=max_timesteps,
             noise_scale=noise_scale,
             deterministic=deterministic,
@@ -194,12 +202,13 @@ def collect_dataset(
             episode_id_start=next_episode_id,
         )
         datasets.append(expert_dataset)
+        num_expert = len(expert_dataset["rewards"])
         next_episode_id = int(expert_dataset["episode_ids"].max()) + 1
-    if num_suboptimal > 0:
+    if requested_num_suboptimal > 0:
         suboptimal_dataset = collect_suboptimal(
             env_name=env_name,
             policy_path=policy_path,
-            num_samples=num_suboptimal,
+            num_samples=requested_num_suboptimal,
             max_timesteps=max_timesteps,
             noise_scale=noise_scale,
             deterministic=deterministic,
@@ -207,10 +216,9 @@ def collect_dataset(
             episode_id_start=next_episode_id,
         )
         datasets.append(suboptimal_dataset)
+        num_suboptimal = len(suboptimal_dataset["rewards"])
 
     dataset = _concat_datasets(datasets)
-    indices = rng.permutation(len(dataset["rewards"]))
-    dataset = {key: dataset[key][indices] for key in DATASET_KEYS}
     metadata = make_metadata(
         env_name=env_name,
         policy_path=policy_path,
@@ -220,6 +228,8 @@ def collect_dataset(
         prop_expert=prop_expert,
         deterministic=deterministic,
         seed=seed,
+        num_expert=num_expert,
+        num_suboptimal=num_suboptimal,
     )
     return dataset, metadata
 
@@ -233,14 +243,21 @@ def make_metadata(
     prop_expert: float,
     deterministic: bool,
     seed: int | None,
+    num_expert: int,
+    num_suboptimal: int,
 ) -> dict:
-    num_expert, num_suboptimal = _split_sample_counts(num_samples, prop_expert)
+    requested_num_expert, requested_num_suboptimal = _split_sample_counts(num_samples, prop_expert)
     return {
         "env_name": env_name,
         "policy_path": str(policy_path),
         "max_timesteps": max_timesteps,
+        "requested_num_samples": num_samples,
+        "requested_num_expert": requested_num_expert,
+        "requested_num_suboptimal": requested_num_suboptimal,
+        "num_transitions": num_expert + num_suboptimal,
         "num_expert": num_expert,
         "num_suboptimal": num_suboptimal,
+        "actual_prop_expert": num_expert / (num_expert + num_suboptimal),
         "noise_scale": noise_scale,
         "deterministic": deterministic,
         "seed": seed,
@@ -266,25 +283,24 @@ def load_dataset(dataset_path: str | Path) -> dict[str, np.ndarray]:
 def split_dataset(
     dataset: dict[str, np.ndarray],
     test_fraction: float,
-    split_level: str,
     seed: int | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """Split whole episodes while preserving transition order within each split."""
     _validate_dataset(dataset)
     if not 0.0 < test_fraction < 1.0:
         raise ValueError("test_fraction must be between 0 and 1.")
 
     rng = np.random.default_rng(seed)
-    if split_level == "transition":
-        indices = rng.permutation(len(dataset["rewards"]))
-        test_size = max(1, int(round(len(indices) * test_fraction)))
-        train_indices, test_indices = indices[test_size:], indices[:test_size]
-    else:
-        unique_episode_ids = rng.permutation(np.unique(dataset["episode_ids"]))
-        test_size = max(1, int(round(len(unique_episode_ids) * test_fraction)))
-        test_episode_ids = set(unique_episode_ids[:test_size])
-        test_mask = np.asarray([episode_id in test_episode_ids for episode_id in dataset["episode_ids"]])
-        indices = np.arange(len(dataset["episode_ids"]))
-        train_indices, test_indices = indices[~test_mask], indices[test_mask]
+    unique_episode_ids = np.unique(dataset["episode_ids"])
+    if len(unique_episode_ids) < 2:
+        raise ValueError("Episode splitting requires at least two episodes.")
+    unique_episode_ids = rng.permutation(unique_episode_ids)
+    requested_test_size = max(1, int(round(len(unique_episode_ids) * test_fraction)))
+    test_size = min(len(unique_episode_ids) - 1, requested_test_size)
+    test_episode_ids = unique_episode_ids[:test_size]
+    test_mask = np.isin(dataset["episode_ids"], test_episode_ids)
+    indices = np.arange(len(dataset["episode_ids"]))
+    train_indices, test_indices = indices[~test_mask], indices[test_mask]
 
     return (
         {key: dataset[key][train_indices] for key in DATASET_KEYS},
@@ -303,11 +319,10 @@ def _collect_source(
     env = gym.make(env_name)
     try:
         action_fn = make_action_fn(env)
-        target_samples = int(np.ceil(1.5 * num_samples))
         datasets = []
         collected = 0
 
-        while collected < target_samples:
+        while collected < num_samples:
             traj = collect_traj(
                 env,
                 action_fn,
@@ -321,8 +336,7 @@ def _collect_source(
             collected += len(traj["rewards"])
 
         dataset = _concat_datasets(datasets)
-        indices = rng.choice(len(dataset["rewards"]), size=num_samples, replace=False)
-        return {key: dataset[key][indices] for key in DATASET_KEYS}
+        return dataset
     finally:
         env.close()
 

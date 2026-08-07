@@ -29,7 +29,6 @@ def resolve_dql_config(
     dataset_tag: str,
     dataset: dict[str, np.ndarray],
     dataset_source: str,
-    split_level: str,
     eta_override: float | None,
     weight_temperature_override: float | None,
     reward_normalization: str,
@@ -64,7 +63,7 @@ def resolve_dql_config(
         weight_temperature_source = "fallback; no CleanDiffuser task default"
 
     if reward_normalization == "auto":
-        reward_normalization = "episode-range" if dataset_source == "minari" and split_level == "episode" else "none"
+        reward_normalization = "episode-range" if dataset_source == "minari" else "none"
     reward_scale = 1.0
     if reward_normalization == "episode-range":
         _, episode_indices = np.unique(dataset["episode_ids"], return_inverse=True)

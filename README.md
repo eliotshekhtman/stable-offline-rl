@@ -15,6 +15,8 @@ Each training manifest records the dataset identity and all algorithm-relevant t
 
 Dataset splits are reused by the same rule. Paths in new metadata and manifests are absolute. Runs previously written under `/home/shekhe/train_dir` are not searched or modified.
 
+All datasets are split by complete episode. Minari episodes, robomimic demonstrations, and generated rollouts share the same ordered transition schema: every `episode_id` occupies one contiguous block, and consecutive entries within that block are consecutive environment transitions. Generated `--num-samples` values are minimum targets. Collection preserves the complete episode that reaches each expert or random-action target, so the saved dataset can contain more transitions and a slightly different expert fraction than requested. Metadata records both requested targets and actual counts.
+
 `DATASET_SCHEMA_VERSION` and `TRAINING_SCHEMA_VERSION` in `sweep.py` invalidate cached artifacts when dataset conversion or training behavior changes without a corresponding CLI change. Increment the relevant value when making such a change; evaluation-only edits require neither increment.
 
 ## CleanDiffuser DQL
@@ -35,7 +37,7 @@ The integration supports flat continuous-control environments, including Gymnasi
 
 Published CleanDiffuser defaults are used when available: Q-selection weight temperature 50 for HalfCheetah, 300 for Walker2d, 100 for Hopper medium/replay, and 8 for Hopper medium-expert, with `eta=1`. Other environments use 50 and record that it is a fallback. `--dql-weight-temperature` and `--dql-eta` override these choices.
 
-`--dql-reward-normalization auto` applies CleanDiffuser-style episodic return-range scaling to the training episodes of Minari datasets split by episode. It leaves rewards unchanged for generated datasets and transition-level splits, which do not necessarily retain complete episodes. Every resolved DQL setting and its source are saved in `run_manifest.json`.
+`--dql-reward-normalization auto` applies CleanDiffuser-style episodic return-range scaling to Minari training episodes. It leaves rewards unchanged for generated and robomimic datasets. Every resolved DQL setting and its source is saved in `run_manifest.json`.
 
 ```bash
 cd /home/shekhe/stable-offline-rl
@@ -47,7 +49,6 @@ python sweep.py \
   --epoch 2000 \
   --step-per-epoch 1000 \
   --batch-size 256 \
-  --split-level episode \
   --eval
 ```
 
