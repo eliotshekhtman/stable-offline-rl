@@ -2,6 +2,7 @@
 # - Parse the experiment CLI and keep one run focused on one Gymnasium environment.
 # - Choose the dataset source: generated rollouts, converted Minari datasets, or robomimic datasets.
 # - Cache/load datasets, build OfflineRL-Kit replay buffers, and launch trainers.
+# - Sweep algorithms and action chunk lengths over the same primitive dataset splits.
 # - Own experiment directories, milestone checkpoints, logging, seeding, and run naming.
 
 import argparse
@@ -16,6 +17,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 
+import chunking
 import load_offline
 import rollout
 from offlinerlkit.buffer import ReplayBuffer
@@ -29,8 +31,9 @@ PROJECT_DIR = Path(__file__).resolve().parent
 DATASET_ROOT = PROJECT_DIR / "datasets"
 TRAINED_ROOT = PROJECT_DIR / "trained"
 EVAL_ROOT = PROJECT_DIR / "evals"
-DATASET_SCHEMA_VERSION = 2
-TRAINING_SCHEMA_VERSION = 1
+DATASET_SCHEMA_VERSION = 4
+TRAINING_SCHEMA_VERSION = 3
+BASE_DISCOUNT = 0.99
 
 
 def main() -> None:
@@ -49,6 +52,7 @@ def parse_args() -> argparse.Namespace:
 
     dataset = parser.add_argument_group("dataset source and split")
     dataset.add_argument("--dataset-source", choices=["generated", "minari", "robomimic"], default="generated", help="Use generated expert/random rollouts, all matching Minari datasets, or low-dimensional robomimic datasets for the environment")
+    dataset.add_argument("--dataset", default=None, help="Limit a premade-data sweep to one Robomimic type (e.g. mh) or Minari leaf/full id (e.g. medium-v0); omit to use all matching datasets")
     dataset.add_argument("--test-fraction", type=float, default=0.2, help="Fraction of each dataset held out for post-training evaluation")
 
     generated = parser.add_argument_group("generated dataset options")
@@ -59,7 +63,14 @@ def parse_args() -> argparse.Namespace:
     generated.add_argument("--max-timesteps", type=int, default=1000, help="Maximum length of each generated rollout trajectory")
 
     training = parser.add_argument_group("policy training")
-    training.add_argument("--algos", nargs="+", default=["cql"], help="Algorithms to train: none, bc, cql, iql, td3bc, edac, dql, mopo, combo, mobile, rambo")
+    training.add_argument(
+        "--algos", nargs="+", choices=("none", *MODEL_FREE_ALGOS, *MODEL_BASED_ALGOS),
+        default=["cql"], help="Algorithms to train, or none to collect the dataset without training",
+    )
+    training.add_argument(
+        "--chunk-lengths", type=int, nargs="+", default=[1],
+        help="Action chunk lengths to sweep over; each policy emits this many primitive actions",
+    )
     training.add_argument("--epoch", type=int, default=1000, help="Number of policy-training epochs")
     training.add_argument("--step-per-epoch", type=int, default=1000, help="Gradient-update steps per policy-training epoch")
     training.add_argument("--batch-size", type=int, default=256, help="Policy-training batch size")
@@ -75,16 +86,16 @@ def parse_args() -> argparse.Namespace:
 
     stability = parser.add_argument_group("stability and conservativity evaluation")
     stability.add_argument("--stability-trajectories", type=int, default=8, help="Evaluation-only number of global trajectories and local perturbed-state pairs")
-    stability.add_argument("--stability-horizon", type=int, default=300, help="Evaluation-only maximum rollout steps for global and local stability trajectories")
-    stability.add_argument("--global-max-offset", type=int, default=30, help="Evaluation-only maximum timestep offset for global trajectory phase alignment")
+    stability.add_argument("--stability-horizon", type=int, default=300, help="Evaluation-only maximum primitive steps for global and local stability trajectories")
+    stability.add_argument("--global-max-offset", type=int, default=30, help="Evaluation-only maximum primitive-step offset for global trajectory phase alignment")
     stability.add_argument("--local-perturbation-scale", type=float, default=0.01, help="Evaluation-only local perturbation norm in standardized physical-state coordinates")
-    stability.add_argument("--ood-samples", type=int, default=10000, help="Evaluation-only maximum held-out and rollout samples used for OOD metrics")
+    stability.add_argument("--ood-samples", type=int, default=10000, help="Evaluation-only maximum held-out and policy decision-boundary samples used for OOD metrics")
 
     model_based = parser.add_argument_group("model-based algorithm options")
     model_based.add_argument("--dynamics-max-epochs", type=int, default=5, help="Maximum epochs for fitting the learned dynamics model before policy training")
     model_based.add_argument("--rollout-freq", type=int, default=1000, help="Policy-training step interval between learned-dynamics rollout generation")
     model_based.add_argument("--rollout-batch-size", type=int, default=10000, help="Number of initial real states used when generating model rollouts")
-    model_based.add_argument("--rollout-length", type=int, default=1, help="Number of learned-dynamics steps per synthetic rollout")
+    model_based.add_argument("--rollout-length", type=int, default=1, help="Number of learned macro-transitions per synthetic rollout")
     model_based.add_argument("--model-retain-epochs", type=int, default=5, help="How many epochs of synthetic model rollouts to retain in the fake replay buffer")
     model_based.add_argument("--real-ratio", type=float, default=0.05, help="Fraction of each model-based training batch sampled from the real offline dataset rather than the synthetic rollout buffer")
     model_based.add_argument("--dynamics-update-freq", type=int, default=1000, help="RAMBO dynamics-adversary update interval; ignored by other model-based algorithms")
@@ -92,7 +103,16 @@ def parse_args() -> argparse.Namespace:
     model_based.add_argument("--adv-weight", type=float, default=3e-4, help="RAMBO adversarial dynamics loss weight")
     model_based.add_argument("--bc-epoch", type=int, default=5, help="RAMBO behavior-cloning pretraining epochs")
     model_based.add_argument("--bc-batch-size", type=int, default=256, help="RAMBO behavior-cloning pretraining batch size")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if any(chunk_length <= 0 for chunk_length in args.chunk_lengths):
+        parser.error("--chunk-lengths values must be positive")
+    args.chunk_lengths = list(dict.fromkeys(args.chunk_lengths))
+    args.algos = list(dict.fromkeys(args.algos))
+    if "none" in args.algos and args.algos != ["none"]:
+        parser.error("--algos none cannot be combined with training algorithms")
+    if args.dataset is not None and args.dataset_source == "generated":
+        parser.error("--dataset applies only to minari and robomimic dataset sources")
+    return args
 
 
 def run_sweep(env_name: str, expert_path: Path, args: argparse.Namespace) -> None:
@@ -146,7 +166,7 @@ def run_minari_sweep(
     args: argparse.Namespace,
 ) -> list[Path]:
     eval_dirs = []
-    dataset_ids = load_offline.list_minari_dataset_ids(env_name)
+    dataset_ids = load_offline.list_minari_dataset_ids(env_name, args.dataset)
     for dataset_id in dataset_ids:
         dataset_tag = load_offline.make_minari_dataset_tag(dataset_id)
         dataset_schema = {
@@ -175,7 +195,7 @@ def run_robomimic_sweep(
     args: argparse.Namespace,
 ) -> list[Path]:
     eval_dirs = []
-    for spec in load_offline.list_robomimic_dataset_specs(env_name):
+    for spec in load_offline.list_robomimic_dataset_specs(env_name, args.dataset):
         dataset_tag = load_offline.make_robomimic_dataset_tag(spec)
         dataset_schema = {
             "version": DATASET_SCHEMA_VERSION,
@@ -283,41 +303,54 @@ def train_algos(
 ) -> list[Path]:
     eval_dirs = []
     dataset_and_paths = None
+    test_dataset = None
     if args.algos == ["none"]:
         get_or_create_dataset(dataset_parent, dataset_schema, create_dataset, args)
         return eval_dirs
 
-    for algo in args.algos:
-        if algo == "none":
-            continue
-
-        run_name = f"{algo}_{dataset_tag}"
-        schema = make_training_schema(algo, env_name, dataset_schema, args)
-        run_dir = find_trained_run(trained_root / run_name, schema)
-        if run_dir is None:
-            if dataset_and_paths is None:
-                dataset_and_paths = get_or_create_dataset(
-                    dataset_parent, dataset_schema, create_dataset, args
+    for chunk_length in args.chunk_lengths:
+        chunk_dataset = None
+        for algo in args.algos:
+            run_name = f"{algo}_chunk{chunk_length}_{dataset_tag}"
+            schema = make_training_schema(algo, env_name, dataset_schema, chunk_length, args)
+            run_dir = find_trained_run(trained_root / run_name, schema)
+            if run_dir is None:
+                if dataset_and_paths is None:
+                    dataset_and_paths = get_or_create_dataset(
+                        dataset_parent, dataset_schema, create_dataset, args
+                    )
+                primitive_dataset, paths = dataset_and_paths
+                if chunk_dataset is None:
+                    chunk_dataset = chunking.make_action_chunk_dataset(
+                        primitive_dataset, chunk_length, BASE_DISCOUNT
+                    )
+                    if test_dataset is None:
+                        test_dataset = rollout.load_dataset(paths["test_dataset_path"])
+                    # Fail before training if this length cannot be evaluated
+                    # on any complete episode in the held-out split.
+                    chunking.make_action_chunk_dataset(
+                        test_dataset, chunk_length, BASE_DISCOUNT
+                    )
+                variant = timestamp_name()
+                run_dir = trained_root / run_name / variant
+                train_algo(
+                    algo=algo,
+                    env_name=env_name,
+                    primitive_dataset=primitive_dataset,
+                    chunk_dataset=chunk_dataset,
+                    chunk_length=chunk_length,
+                    run_dir=run_dir,
+                    eval_dir=eval_root / run_name / variant,
+                    split_paths=paths,
+                    training_schema=schema,
+                    args=args,
                 )
-            train_dataset, paths = dataset_and_paths
-            variant = timestamp_name()
-            run_dir = trained_root / run_name / variant
-            train_algo(
-                algo=algo,
-                env_name=env_name,
-                dataset=train_dataset,
-                run_dir=run_dir,
-                eval_dir=eval_root / run_name / variant,
-                split_paths=paths,
-                training_schema=schema,
-                args=args,
-            )
-        else:
-            print(f"Reusing trained run: {run_dir}")
+            else:
+                print(f"Reusing trained run: {run_dir}")
 
-        eval_dir = maybe_evaluate(run_dir, args)
-        if eval_dir is not None:
-            eval_dirs.append(eval_dir)
+            eval_dir = maybe_evaluate(run_dir, args)
+            if eval_dir is not None:
+                eval_dirs.append(eval_dir)
     return eval_dirs
 
 
@@ -325,13 +358,19 @@ def make_training_schema(
     algo: str,
     env_name: str,
     dataset_schema: dict,
+    chunk_length: int,
     args: argparse.Namespace,
 ) -> dict:
+    macro_discount = BASE_DISCOUNT**chunk_length
     schema = {
         "version": TRAINING_SCHEMA_VERSION,
         "env_name": env_name,
         "algo": algo,
         "dataset": dataset_schema,
+        "chunk_length": chunk_length,
+        "base_discount": BASE_DISCOUNT,
+        "macro_discount": macro_discount,
+        "chunk_reward": "discounted_sum",
         "seed": args.seed,
         "epoch": args.epoch,
         "step_per_epoch": args.step_per_epoch,
@@ -440,7 +479,9 @@ def split_paths(dataset_dir: Path) -> dict:
 def train_algo(
     algo: str,
     env_name: str,
-    dataset: dict[str, np.ndarray],
+    primitive_dataset: dict[str, np.ndarray],
+    chunk_dataset: dict[str, np.ndarray],
+    chunk_length: int,
     run_dir: Path,
     eval_dir: Path,
     split_paths: dict,
@@ -453,27 +494,33 @@ def train_algo(
     run_dir.mkdir(parents=True)
     seed_everything(args.seed)
 
-    eval_env = make_env(env_name, split_paths, args)
-    eval_env.reset(seed=args.seed)
-    eval_env.action_space.seed(args.seed)
-
     dql_config = None
     if algo == "dql":
         dql_config = resolve_dql_config(
             env_name=env_name,
             dataset_tag=split_paths["dataset_tag"],
-            dataset=dataset,
+            dataset=primitive_dataset,
             dataset_source=args.dataset_source,
             eta_override=args.dql_eta,
             weight_temperature_override=args.dql_weight_temperature,
             reward_normalization=args.dql_reward_normalization,
         )
-    logger = build_logger(run_dir, args, algo, env_name, dql_config)
+    macro_discount = training_schema["macro_discount"]
+    eval_env = chunking.ActionChunkWrapper(make_env(env_name, split_paths, args), chunk_length)
+    eval_env.reset(seed=args.seed)
+    eval_env.action_space.seed(args.seed)
+    logger = build_logger(
+        run_dir, args, algo, env_name, chunk_length, macro_discount, dql_config
+    )
 
     try:
         if algo in MODEL_FREE_ALGOS:
-            buffer = build_buffer(dataset, eval_env, args.device)
-            policy, lr_scheduler = build_model_free_policy(algo, eval_env, buffer, args, dql_config)
+            buffer = build_buffer(chunk_dataset, eval_env, args.device)
+            policy, lr_scheduler = build_model_free_policy(
+                algo, eval_env, buffer, args,
+                discount=macro_discount,
+                dql_config=dql_config,
+            )
             if algo != "dql":
                 trainer = MFPolicyTrainer(
                     policy=policy,
@@ -488,7 +535,7 @@ def train_algo(
                     checkpoint_epochs=checkpoint_epochs(args.epoch),
                 )
         else:
-            real_buffer = build_buffer(dataset, eval_env, args.device)
+            real_buffer = build_buffer(chunk_dataset, eval_env, args.device)
             obs_mean = obs_std = None
             if algo == "rambo":
                 obs_mean, obs_std = real_buffer.normalize_obs()
@@ -501,7 +548,10 @@ def train_algo(
                 device=args.device,
             )
             policy, dynamics, lr_scheduler = build_model_based_policy(
-                algo, eval_env, args, obs_mean=obs_mean, obs_std=obs_std
+                algo, eval_env, args,
+                discount=macro_discount,
+                obs_mean=obs_mean,
+                obs_std=obs_std,
             )
 
             print(f"Training dynamics for {algo}: {run_dir}")
@@ -510,7 +560,7 @@ def train_algo(
                 policy.pretrain(
                     real_buffer.sample_all(),
                     args.bc_epoch,
-                    min(args.bc_batch_size, len(dataset["observations"])),
+                    min(args.bc_batch_size, len(chunk_dataset["observations"])),
                     1e-4,
                     logger,
                 )
@@ -548,7 +598,7 @@ def train_algo(
             trainer.train()
         save_run_manifest(
             run_dir, eval_dir, algo, env_name, split_paths,
-            training_schema, args, dql_config,
+            training_schema, chunk_length, macro_discount, args, dql_config,
         )
     finally:
         eval_env.close()
@@ -582,6 +632,8 @@ def save_run_manifest(
     env_name: str,
     split_paths: dict,
     training_schema: dict,
+    chunk_length: int,
+    macro_discount: float,
     args: argparse.Namespace,
     dql_config: dict | None,
 ) -> None:
@@ -589,6 +641,10 @@ def save_run_manifest(
         "created_at": datetime.now().astimezone().isoformat(),
         "env_name": env_name,
         "algo": algo,
+        "chunk_length": chunk_length,
+        "base_discount": BASE_DISCOUNT,
+        "macro_discount": macro_discount,
+        "chunk_reward": "discounted_sum",
         "dataset_source": args.dataset_source,
         "run_dir": str(run_dir.resolve()),
         "model_dir": str((run_dir / "model").resolve()),
@@ -615,7 +671,15 @@ def save_run_manifest(
         json.dump(manifest, file, indent=2, sort_keys=True)
 
 
-def build_logger(run_dir: Path, args: argparse.Namespace, algo: str, env_name: str, dql_config: dict | None) -> Logger:
+def build_logger(
+    run_dir: Path,
+    args: argparse.Namespace,
+    algo: str,
+    env_name: str,
+    chunk_length: int,
+    macro_discount: float,
+    dql_config: dict | None,
+) -> Logger:
     output_config = {
         "consoleout_backup": "stdout",
         "policy_training_progress": "csv",
@@ -625,6 +689,9 @@ def build_logger(run_dir: Path, args: argparse.Namespace, algo: str, env_name: s
     hyperparameters = {
         "algo": algo,
         "env": env_name,
+        "chunk_length": chunk_length,
+        "base_discount": BASE_DISCOUNT,
+        "macro_discount": macro_discount,
         "seed": args.seed,
         "device": args.device,
         "epoch": args.epoch,

@@ -6,8 +6,8 @@ Runs are independent of the working directory and are saved inside this reposito
 
 ```text
 datasets/<environment>/<dataset-name>/<dataset-timestamp>/
-trained/<environment>/<algorithm>_<dataset-name>/<training-timestamp>/
-evals/<environment>/<algorithm>_<dataset-name>/<training-timestamp>/
+trained/<environment>/<algorithm>_chunk<length>_<dataset-name>/<training-timestamp>/
+evals/<environment>/<algorithm>_chunk<length>_<dataset-name>/<training-timestamp>/
 evals/<environment>/plots/
 ```
 
@@ -15,9 +15,34 @@ Each training manifest records the dataset identity and all algorithm-relevant t
 
 Dataset splits are reused by the same rule. Paths in new metadata and manifests are absolute. Runs previously written under `/home/shekhe/train_dir` are not searched or modified.
 
+Premade-data sweeps use every matching dataset by default. Pass `--dataset mh` for one Robomimic dataset type, or `--dataset medium-v0` (equivalently its full ID, such as `mujoco/halfcheetah/medium-v0`) for one Minari dataset.
+
 All datasets are split by complete episode. Minari episodes, robomimic demonstrations, and generated rollouts share the same ordered transition schema: every `episode_id` occupies one contiguous block, and consecutive entries within that block are consecutive environment transitions. Generated `--num-samples` values are minimum targets. Collection preserves the complete episode that reaches each expert or random-action target, so the saved dataset can contain more transitions and a slightly different expert fraction than requested. Metadata records both requested targets and actual counts.
 
 `DATASET_SCHEMA_VERSION` and `TRAINING_SCHEMA_VERSION` in `sweep.py` invalidate cached artifacts when dataset conversion or training behavior changes without a corresponding CLI change. Increment the relevant value when making such a change; evaluation-only edits require neither increment.
+
+## Action chunks
+
+Pass one or more values to `--chunk-lengths` to train the Cartesian product of algorithms and chunk lengths. For example, `--algos bc cql --chunk-lengths 1 4 8` trains six policies. Length one is the ordinary one-action baseline. Every length has a separate run directory, manifest, evaluation, and plot label.
+
+The saved datasets remain primitive one-step transitions and are reused across all chunk lengths. After the episode-level train/test split, both training and evaluation derive chunks identically from every source. For an episode with transitions indexed `0, ..., T - 1`, a length-`l` dataset contains the stride-one windows starting at `0, ..., T - l`. A window maps the starting observation to the flattened, time-major action vector `[a_t, ..., a_(t+l-1)]`, the observation after the last action, and the reward
+
+```text
+r_t + 0.99 r_(t+1) + ... + 0.99^(l-1) r_(t+l-1).
+```
+
+Windows never cross episode boundaries. Following robomimic's n-step convention, a chunk's terminal and timeout flags are the corresponding `any` over its window; those signals do not redefine the stored episode boundary. The policy backup discount is `0.99^l`. Episodes shorter than `l` contribute no windows; conversion fails clearly if an entire split has no valid window.
+
+At execution time, all `l` predicted actions are applied open-loop. Execution stops early if the environment terminates or truncates, and reported episode returns remain the ordinary undiscounted sum of primitive rewards. Post-training stability horizons and saved rollout timesteps are measured in primitive environment steps; OfflineRL-Kit's training-time `eval/episode_length` log still counts policy decisions. Learned-dynamics `--rollout-length`, dynamics mismatch, Jacobian mismatch, and OOD state-action samples operate at chunk decision boundaries, so one learned-dynamics step represents up to `l` primitive steps.
+
+```bash
+python sweep.py \
+  --env HalfCheetah-v5 \
+  --dataset-source minari \
+  --algos bc cql \
+  --chunk-lengths 1 4 8 \
+  --eval
+```
 
 ## CleanDiffuser DQL
 

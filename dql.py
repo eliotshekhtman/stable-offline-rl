@@ -68,7 +68,15 @@ def resolve_dql_config(
     if reward_normalization == "episode-range":
         _, episode_indices = np.unique(dataset["episode_ids"], return_inverse=True)
         episode_returns = np.bincount(episode_indices, weights=dataset["rewards"])
-        reward_scale = 1000.0 / float(episode_returns.max() - episode_returns.min())
+        if episode_returns.size == 0:
+            raise ValueError("DQL episode-range reward normalization requires a nonempty dataset.")
+        return_range = float(np.ptp(episode_returns))
+        if not np.isfinite(return_range) or return_range <= 0.0:
+            raise ValueError(
+                "DQL episode-range reward normalization requires finite episode "
+                "returns with a nonzero range."
+            )
+        reward_scale = 1000.0 / return_range
 
     return {
         "eta": eta,
@@ -91,25 +99,37 @@ class DQLPolicy(BasePolicy):
         obs_std: np.ndarray,
         total_steps: int,
         device: str,
+        discount: float,
         eta: float,
         weight_temperature: float,
         reward_scale: float,
     ) -> None:
         super().__init__()
+        action_low = np.asarray(action_low, dtype=np.float32).reshape(-1)
+        action_high = np.asarray(action_high, dtype=np.float32).reshape(-1)
+        if action_low.shape != action_high.shape or action_low.size == 0:
+            raise ValueError("DQL action bounds must be nonempty arrays with matching shapes.")
+        if not np.all(np.isfinite(action_low)) or not np.all(np.isfinite(action_high)):
+            raise ValueError("DQL action bounds must be finite.")
+        if np.any(action_high <= action_low):
+            raise ValueError("Every DQL action upper bound must exceed its lower bound.")
+
         self.device = torch.device(device)
-        self.action_dim = len(action_low)
-        self.discount = 0.99
+        self.action_dim = action_low.size
+        self.discount = float(discount)
         self.eta = eta
         self.diffusion_steps = 5
         self.num_candidates = 50
         self.weight_temperature = weight_temperature
         self.inference_temperature = 0.5
         self.reward_scale = reward_scale
-        self.action_bias = torch.as_tensor(
-            (action_high + action_low) / 2.0, dtype=torch.float32, device=self.device
+        self.register_buffer(
+            "action_bias",
+            torch.as_tensor((action_high + action_low) / 2.0, device=self.device),
         )
-        self.action_scale = torch.as_tensor(
-            (action_high - action_low) / 2.0, dtype=torch.float32, device=self.device
+        self.register_buffer(
+            "action_scale",
+            torch.as_tensor((action_high - action_low) / 2.0, device=self.device),
         )
 
         diffusion_model = DQLMlp(obs_dim, self.action_dim, emb_dim=64, timestep_emb_type="positional")
@@ -199,10 +219,34 @@ class DQLPolicy(BasePolicy):
 
     @torch.no_grad()
     def select_action(self, obs: np.ndarray, deterministic: bool = False) -> np.ndarray:
-        del deterministic  # CleanDiffuser DQL inference is stochastic by design.
         observations = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
         observations = self._normalize(observations)
         batch_size = len(observations)
+        if deterministic:
+            rng_devices = []
+            if self.device.type == "cuda":
+                device_index = self.device.index
+                rng_devices = [device_index if device_index is not None else torch.cuda.current_device()]
+            actions = []
+            for observation in observations:
+                candidates_obs = observation.repeat(self.num_candidates, 1)
+                # Reuse one noise bank so deterministic evaluation is repeatable.
+                with torch.random.fork_rng(devices=rng_devices):
+                    torch.random.default_generator.manual_seed(0)
+                    if self.device.type == "cuda":
+                        with torch.cuda.device(self.device):
+                            torch.cuda.manual_seed(0)
+                    candidates = self._sample(
+                        candidates_obs,
+                        self.num_candidates,
+                        use_ema=True,
+                        temperature=self.inference_temperature,
+                    )
+                q_values = self.critic_target.q_min(candidates_obs, candidates)
+                actions.append(candidates[q_values.argmax()])
+            actions = torch.stack(actions)
+            return self._denormalize_action(actions).cpu().numpy()
+
         candidates_obs = observations.repeat_interleave(self.num_candidates, dim=0)
         candidates = self._sample(
             candidates_obs,
@@ -255,6 +299,7 @@ def build_dql_policy(
     action_high: np.ndarray,
     total_steps: int,
     device: str,
+    discount: float,
     config: dict,
 ) -> DQLPolicy:
     obs_mean = buffer.observations.mean(axis=0, keepdims=True)
@@ -268,6 +313,7 @@ def build_dql_policy(
         obs_std=obs_std,
         total_steps=total_steps,
         device=device,
+        discount=discount,
         eta=config["eta"],
         weight_temperature=config["weight_temperature"],
         reward_scale=config["reward_scale"],

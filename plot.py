@@ -3,6 +3,7 @@
 # - Plot generated-dataset reward ablations when exactly one generated axis varies.
 # - Plot Minari reward bars without implying a numeric ablation.
 # - Plot run-level dynamics mismatch ratios against learned policy reward.
+# - Keep algorithms with different action chunk lengths visually distinct.
 # - Plot stability and conservativity over policy-training checkpoints.
 
 import argparse
@@ -56,6 +57,7 @@ def plot_root(root: Path, out: Path | None = None, eval_dirs: list[Path] | None 
         dataset_out.mkdir(exist_ok=True)
         dataset_rows = [row for row in rows if row["dataset_tag"] == dataset_tag]
         dataset_histories = [history for history in histories if history["dataset_tag"] == dataset_tag]
+        plot_final_policy_returns(dataset_rows, dataset_out)
         plot_stability_distances(dataset_rows, dataset_out)
         plot_mismatch_ratios(dataset_rows, dataset_out)
         plot_history_relationships(dataset_histories, dataset_out)
@@ -81,6 +83,7 @@ def load_rows(eval_dirs: list[Path]) -> list[dict]:
             "run_dir": str(manifest_path.parent),
             "eval_dir": str(eval_dir.resolve()),
         }
+        row["label"] = policy_label(row)
         rows.append(row)
     return rows
 
@@ -98,14 +101,12 @@ def dataset_fields(metadata: dict) -> dict:
             "robomimic_dataset": metadata["dataset_type"],
         }
 
-    num_expert = metadata["num_expert"]
-    num_suboptimal = metadata["num_suboptimal"]
-    num_samples = num_expert + num_suboptimal
+    dataset_schema = metadata["dataset_schema"]
     return {
         "dataset_source": "generated",
-        "num_samples": num_samples,
-        "noise_scale": metadata["noise_scale"],
-        "prop_expert": num_expert / num_samples,
+        "num_samples": dataset_schema["num_samples"],
+        "noise_scale": dataset_schema["noise_scale"],
+        "prop_expert": dataset_schema["prop_expert"],
     }
 
 
@@ -116,9 +117,39 @@ def load_histories(eval_dirs: list[Path]) -> list[dict]:
         if not history_path.exists():
             continue
         history = load_json(history_path)
-        history["label"] = history["algo"]
+        history["label"] = policy_label(history)
         histories.append(history)
     return histories
+
+
+def policy_label(record: dict) -> str:
+    return f"{record['algo']} (l={record['chunk_length']})"
+
+
+def plot_final_policy_returns(rows: list[dict], out: Path) -> None:
+    if not rows:
+        return
+
+    labels = sorted({row["label"] for row in rows})
+    returns = [
+        np.mean([row["policy_return_mean"] for row in rows if row["label"] == label])
+        for label in labels
+    ]
+    fig, ax = plt.subplots(figsize=(max(7, 1.2 * len(labels)), 5))
+    ax.bar(labels, returns)
+    ax.axhline(
+        np.mean([row["expert_return_mean"] for row in rows]),
+        color="black",
+        linestyle=":",
+        label="expert",
+    )
+    ax.set_ylabel("policy return")
+    ax.set_title("Final policy return by algorithm and chunk length")
+    ax.tick_params(axis="x", rotation=30)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out / "final_policy_returns.png", dpi=200)
+    plt.close(fig)
 
 
 def plot_generated_reward_ablation(rows: list[dict], out: Path) -> None:
@@ -134,9 +165,17 @@ def plot_generated_reward_ablation(rows: list[dict], out: Path) -> None:
 
     axis = varying[0]
     fig, ax = plt.subplots(figsize=(8, 5))
-    for algo in sorted({row["algo"] for row in generated}):
-        algo_rows = sorted((row for row in generated if row["algo"] == algo), key=lambda row: row[axis])
-        ax.plot([row[axis] for row in algo_rows], [row["policy_return_mean"] for row in algo_rows], marker="o", label=algo)
+    for label in sorted({row["label"] for row in generated}):
+        policy_rows = sorted(
+            (row for row in generated if row["label"] == label),
+            key=lambda row: row[axis],
+        )
+        ax.plot(
+            [row[axis] for row in policy_rows],
+            [row["policy_return_mean"] for row in policy_rows],
+            marker="o",
+            label=label,
+        )
 
     ax.axhline(np.mean([row["expert_return_mean"] for row in generated]), color="black", linestyle=":", label="expert")
     ax.set_xlabel(axis.replace("_", " "))
@@ -154,17 +193,25 @@ def plot_minari_reward_bars(rows: list[dict], out: Path) -> None:
         return
 
     datasets = [name for name in DATASET_ORDER if any(row["minari_dataset"] == name for row in minari)]
-    algos = sorted({row["algo"] for row in minari})
-    width = 0.8 / max(len(algos), 1)
+    labels = sorted({row["label"] for row in minari})
+    width = 0.8 / len(labels)
     x = np.arange(len(datasets))
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    for algo_index, algo in enumerate(algos):
+    for label_index, label in enumerate(labels):
         values = []
         for dataset in datasets:
-            matching = [row["policy_return_mean"] for row in minari if row["algo"] == algo and row["minari_dataset"] == dataset]
+            matching = [
+                row["policy_return_mean"] for row in minari
+                if row["label"] == label and row["minari_dataset"] == dataset
+            ]
             values.append(np.mean(matching) if matching else np.nan)
-        ax.bar(x + (algo_index - (len(algos) - 1) / 2) * width, values, width=width, label=algo)
+        ax.bar(
+            x + (label_index - (len(labels) - 1) / 2) * width,
+            values,
+            width=width,
+            label=label,
+        )
 
     ax.axhline(np.mean([row["expert_return_mean"] for row in minari]), color="black", linestyle=":", label="expert")
     ax.set_xticks(x)
@@ -184,17 +231,25 @@ def plot_robomimic_reward_bars(rows: list[dict], out: Path) -> None:
         return
 
     datasets = [name for name in ROBOMIMIC_DATASET_ORDER if any(row["robomimic_dataset"] == name for row in robomimic)]
-    algos = sorted({row["algo"] for row in robomimic})
-    width = 0.8 / max(len(algos), 1)
+    labels = sorted({row["label"] for row in robomimic})
+    width = 0.8 / len(labels)
     x = np.arange(len(datasets))
 
     fig, ax = plt.subplots(figsize=(9, 5))
-    for algo_index, algo in enumerate(algos):
+    for label_index, label in enumerate(labels):
         values = []
         for dataset in datasets:
-            matching = [row["policy_return_mean"] for row in robomimic if row["algo"] == algo and row["robomimic_dataset"] == dataset]
+            matching = [
+                row["policy_return_mean"] for row in robomimic
+                if row["label"] == label and row["robomimic_dataset"] == dataset
+            ]
             values.append(np.mean(matching) if matching else np.nan)
-        ax.bar(x + (algo_index - (len(algos) - 1) / 2) * width, values, width=width, label=algo)
+        ax.bar(
+            x + (label_index - (len(labels) - 1) / 2) * width,
+            values,
+            width=width,
+            label=label,
+        )
 
     ax.axhline(np.mean([row["expert_return_mean"] for row in robomimic]), color="black", linestyle=":", label="PH return")
     ax.set_xticks(x)
@@ -219,7 +274,7 @@ def stability_distance_plot(rows: list[dict], out: Path, stability_type: str) ->
     if not available:
         return
 
-    available.sort(key=lambda row: row["algo"])
+    available.sort(key=lambda row: row["label"])
     fig, axes = plt.subplots(
         2, len(available), figsize=(4 * len(available), 7),
         squeeze=False, sharex="col",
@@ -245,7 +300,7 @@ def stability_distance_plot(rows: list[dict], out: Path, stability_type: str) ->
         distance_axis.plot(bound, color="black", linestyle="--", linewidth=1.5, label=r"tight $C\rho^t$ upper bound")
         distance_axis.axhline(1.0, color="gray", linestyle=":", label="initial distance")
         distance_axis.set_yscale("log")
-        distance_axis.set_title(f"{row['algo'].upper()}\nC={c:.3g}, rho={rho:.6g}")
+        distance_axis.set_title(f"{row['label']}\nC={c:.3g}, rho={rho:.6g}")
 
         support_axis = axes[1, column]
         support_axis.plot(support / support[0], color="tab:purple", linewidth=2)
@@ -275,7 +330,7 @@ def plot_mismatch_ratios(rows: list[dict], out: Path) -> None:
             x_key="next_obs_ratio",
             y_key="policy_return_mean",
             color_key="expert_return_mean",
-            xlabel="dataset next-state MSE / rollout next-state MSE",
+            xlabel="dataset macro next-state MSE / rollout macro next-state MSE",
             ylabel="policy return",
             color_label="expert return",
             path=out / "reward_vs_next_obs_ratio.png",
@@ -290,14 +345,13 @@ def plot_mismatch_ratios(rows: list[dict], out: Path) -> None:
 
     for row in jacobian_rows:
         row["jacobian_ratio"] = row["dataset_closed_loop_jacobian_mse"] / (row["rollout_closed_loop_jacobian_mse"] + EPS)
-        row["normalized_return"] = row["policy_return_mean"] / (row["expert_return_mean"] + EPS)
 
     scatter(
         jacobian_rows,
         x_key="next_obs_ratio",
         y_key="jacobian_ratio",
         color_key="policy_return_mean",
-        xlabel="dataset next-state MSE / rollout next-state MSE",
+        xlabel="dataset macro next-state MSE / rollout macro next-state MSE",
         ylabel="dataset Jacobian MSE / rollout Jacobian MSE",
         color_label="policy return",
         path=out / "mismatch_ratio_reward_scatter.png",
@@ -431,7 +485,7 @@ def scatter(rows: list[dict], x_key: str, y_key: str, color_key: str, xlabel: st
         cmap="viridis",
     )
     for row in rows:
-        ax.annotate(row["algo"], (row[x_key], row[y_key]), fontsize=8, xytext=(4, 4), textcoords="offset points")
+        ax.annotate(row["label"], (row[x_key], row[y_key]), fontsize=8, xytext=(4, 4), textcoords="offset points")
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     fig.colorbar(points, ax=ax, label=color_label)

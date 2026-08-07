@@ -268,7 +268,7 @@ def save_dataset(dataset: dict[str, np.ndarray], dataset_path: str | Path) -> No
     """Save dataset arrays as compressed NumPy data."""
     dataset_path = Path(dataset_path)
     dataset_path.parent.mkdir(parents=True, exist_ok=True)
-    _validate_dataset(dataset)
+    validate_dataset(dataset)
     np.savez_compressed(dataset_path, **dataset)
 
 
@@ -276,7 +276,7 @@ def load_dataset(dataset_path: str | Path) -> dict[str, np.ndarray]:
     """Load the transition arrays saved by save_dataset."""
     with np.load(dataset_path) as data:
         dataset = {key: data[key] for key in DATASET_KEYS}
-    _validate_dataset(dataset)
+    validate_dataset(dataset)
     return dataset
 
 
@@ -286,7 +286,7 @@ def split_dataset(
     seed: int | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
     """Split whole episodes while preserving transition order within each split."""
-    _validate_dataset(dataset)
+    validate_dataset(dataset)
     if not 0.0 < test_fraction < 1.0:
         raise ValueError("test_fraction must be between 0 and 1.")
 
@@ -347,7 +347,7 @@ def _concat_datasets(datasets: list[dict[str, np.ndarray]]) -> dict[str, np.ndar
     return {key: np.concatenate([dataset[key] for dataset in datasets], axis=0) for key in DATASET_KEYS}
 
 
-def _validate_dataset(dataset: dict[str, np.ndarray]) -> None:
+def validate_dataset(dataset: dict[str, np.ndarray]) -> None:
     extra = [key for key in dataset if key not in DATASET_KEYS]
     if extra:
         raise ValueError(f"Dataset has unexpected keys: {extra}")

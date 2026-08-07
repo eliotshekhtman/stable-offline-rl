@@ -62,8 +62,8 @@ ROBOMIMIC_LOW_DIM_DATASETS = {
 }
 
 
-def list_minari_dataset_ids(env_name: str) -> list[str]:
-    """Return all remote Minari datasets that belong to the requested env."""
+def list_minari_dataset_ids(env_name: str, dataset_name: str | None = None) -> list[str]:
+    """Return all matching Minari datasets, or one requested dataset."""
     import minari
 
     prefix = MINARI_PREFIXES[env_name]
@@ -71,6 +71,17 @@ def list_minari_dataset_ids(env_name: str) -> list[str]:
     dataset_ids = sorted(dataset_id for dataset_id in datasets if dataset_id.startswith(prefix + "/"))
     if not dataset_ids:
         raise ValueError(f"No Minari datasets found for env {env_name!r} with prefix {prefix!r}.")
+    if dataset_name is not None:
+        matches = [
+            dataset_id for dataset_id in dataset_ids
+            if dataset_id == dataset_name or dataset_id.rsplit("/", 1)[-1] == dataset_name
+        ]
+        if not matches:
+            available = ", ".join(dataset_id.rsplit("/", 1)[-1] for dataset_id in dataset_ids)
+            raise ValueError(
+                f"Unknown Minari dataset {dataset_name!r} for {env_name!r}; available: {available}"
+            )
+        return matches
     return dataset_ids
 
 
@@ -134,9 +145,20 @@ def make_minari_dataset_tag(dataset_id: str) -> str:
     return "minari_" + dataset_id.replace("/", "_")
 
 
-def list_robomimic_dataset_specs(env_name: str) -> list[dict[str, Any]]:
-    """Return all low-dimensional robomimic dataset specs for one robosuite task."""
+def list_robomimic_dataset_specs(
+    env_name: str,
+    dataset_name: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return all low-dimensional dataset specs, or one requested type."""
     specs = ROBOMIMIC_LOW_DIM_DATASETS[env_name]
+    if dataset_name is not None:
+        matches = [spec for spec in specs if spec[0] == dataset_name]
+        if not matches:
+            available = ", ".join(spec[0] for spec in specs)
+            raise ValueError(
+                f"Unknown robomimic dataset {dataset_name!r} for {env_name!r}; available: {available}"
+            )
+        specs = matches
     return [
         {
             "source": "robomimic",
@@ -155,15 +177,13 @@ def load_robomimic_dataset(spec: dict[str, Any], seed: int | None = None) -> tup
 
     dataset_path = hf_hub_download(repo_id=ROBOMIMIC_HF_REPO_ID, filename=spec["repo_path"], repo_type="dataset")
     with h5py.File(dataset_path, "r") as file:
-        dataset = concat_datasets([
+        demos = [
             robomimic_demo_to_transitions(file["data"][demo_key], episode_id)
             for episode_id, demo_key in enumerate(sorted(file["data"].keys()))
-        ])
-        env_args = json.loads(file["data"].attrs["env_args"])
-        episode_returns = [
-            float(np.asarray(file["data"][demo_key]["rewards"], dtype=np.float32).sum())
-            for demo_key in sorted(file["data"].keys())
         ]
+        dataset = concat_datasets(demos)
+        env_args = json.loads(file["data"].attrs["env_args"])
+        episode_returns = [float(demo["rewards"].sum()) for demo in demos]
 
     return dataset, {
         **spec,

@@ -38,6 +38,7 @@ def build_model_free_policy(
     env: gym.Env,
     buffer: ReplayBuffer,
     args: argparse.Namespace,
+    discount: float,
     dql_config: dict | None = None,
 ):
     obs_dim = int(np.prod(env.observation_space.shape))
@@ -51,6 +52,7 @@ def build_model_free_policy(
             action_high=env.action_space.high,
             total_steps=args.epoch * args.step_per_epoch,
             device=args.device,
+            discount=discount,
             config=dql_config,
         ), None
 
@@ -82,7 +84,7 @@ def build_model_free_policy(
             critic2_optim,
             action_space=env.action_space,
             tau=0.005,
-            gamma=0.99,
+            gamma=discount,
             alpha=alpha,
             cql_weight=1.0 if is_robomimic else 5.0,
             temperature=1.0,
@@ -123,7 +125,7 @@ def build_model_free_policy(
             critic_v_optim,
             action_space=env.action_space,
             tau=0.005,
-            gamma=0.99,
+            gamma=discount,
             expectile=0.7,
             temperature=3.0,
         )
@@ -145,7 +147,7 @@ def build_model_free_policy(
             critic1_optim,
             critic2_optim,
             tau=0.005,
-            gamma=0.99,
+            gamma=discount,
             max_action=max_action,
             exploration_noise=GaussianNoise(sigma=0.1),
             policy_noise=0.2,
@@ -171,7 +173,7 @@ def build_model_free_policy(
             actor_optim,
             critics_optim,
             tau=0.005,
-            gamma=0.99,
+            gamma=discount,
             alpha=alpha,
             max_q_backup=False,
             deterministic_backup=False,
@@ -185,6 +187,7 @@ def build_model_based_policy(
     algo: str,
     env: gym.Env,
     args: argparse.Namespace,
+    discount: float,
     obs_mean: np.ndarray | None = None,
     obs_std: np.ndarray | None = None,
 ):
@@ -217,7 +220,7 @@ def build_model_based_policy(
             actor_optim,
             critics_optim,
             tau=0.005,
-            gamma=0.99,
+            gamma=discount,
             alpha=alpha,
             penalty_coef=defaults["policy_penalty_coef"],
             num_samples=10,
@@ -242,7 +245,7 @@ def build_model_based_policy(
             critic1_optim,
             critic2_optim,
             tau=0.005,
-            gamma=0.99,
+            gamma=discount,
             alpha=alpha,
         )
         return policy, dynamics, lr_scheduler
@@ -258,7 +261,7 @@ def build_model_based_policy(
             critic2_optim,
             action_space=env.action_space,
             tau=0.005,
-            gamma=0.99,
+            gamma=discount,
             alpha=alpha,
             cql_weight=defaults["cql_weight"],
             temperature=1.0,
@@ -287,7 +290,7 @@ def build_model_based_policy(
             critic2_optim,
             dynamics_adv_optim,
             tau=0.005,
-            gamma=0.99,
+            gamma=discount,
             alpha=alpha,
             adv_weight=args.adv_weight,
             adv_rollout_length=args.rollout_length,
@@ -320,8 +323,11 @@ def build_dynamics(
         device=args.device,
     )
     dynamics_optim = torch.optim.Adam(dynamics_model.parameters(), lr=1e-3)
-    if task.lower() in ROBOMIMIC_TASKS:
+    task = task.lower()
+    if task in ROBOMIMIC_TASKS or task == "reacher-v5":
         termination_fn = termination_fn_never
+    elif task == "inverteddoublependulum-v5":
+        termination_fn = termination_fn_inverted_double_pendulum
     else:
         termination_fn = get_termination_fn(task)
     if obs_mean is not None and obs_std is not None:
@@ -337,6 +343,16 @@ def build_dynamics(
 
 def termination_fn_never(obs, act, next_obs):
     return np.zeros((len(obs), 1), dtype=bool)
+
+
+def termination_fn_inverted_double_pendulum(obs, act, next_obs):
+    sin_first, sin_second = next_obs[:, 1], next_obs[:, 2]
+    cos_first, cos_second = next_obs[:, 3], next_obs[:, 4]
+    # Gymnasium terminates at tip height <= 1; recover that height from the observed angles.
+    tip_height = 0.6 * (
+        cos_first + cos_first * cos_second - sin_first * sin_second
+    )
+    return (tip_height <= 1.0)[:, None]
 
 
 def build_prob_actor(obs_dim: int, action_dim: int, max_action: float, hidden_dims: list[int], device: str, lr: float):

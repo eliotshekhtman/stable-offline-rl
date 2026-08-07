@@ -1,8 +1,9 @@
 # Tasks:
 # - Reload trained OfflineRL-Kit runs from their run_manifest.json files.
 # - Evaluate learned policies and configured expert policies in the true environment.
-# - For model-based runs, evaluate learned next-state prediction MSE on held-out data.
-# - For model-based runs, evaluate learned next-state prediction MSE along policy rollouts.
+# - Execute learned action chunks open-loop while retaining primitive-step metrics.
+# - For model-based runs, evaluate learned macro next-state prediction MSE on held-out data.
+# - For model-based runs, evaluate learned macro next-state prediction MSE along policy rollouts.
 # - Measure empirical global/local trajectory convergence and dataset conservativity.
 
 import argparse
@@ -15,6 +16,7 @@ import mujoco
 import numpy as np
 import torch
 
+import chunking
 import metrics
 import load_offline
 import rollout
@@ -45,10 +47,10 @@ def parse_args() -> argparse.Namespace:
 
     stability = parser.add_argument_group("stability and conservativity evaluation")
     stability.add_argument("--stability-trajectories", type=int, default=8, help="Number of global trajectories and local perturbed-state pairs used for stability metrics")
-    stability.add_argument("--stability-horizon", type=int, default=300, help="Maximum rollout steps used for each global and local stability trajectory")
-    stability.add_argument("--global-max-offset", type=int, default=30, help="Largest positive or negative timestep offset considered when phase-aligning global trajectories")
+    stability.add_argument("--stability-horizon", type=int, default=300, help="Maximum primitive environment steps used for each global and local stability trajectory")
+    stability.add_argument("--global-max-offset", type=int, default=30, help="Largest primitive-step offset considered when phase-aligning global trajectories")
     stability.add_argument("--local-perturbation-scale", type=float, default=0.01, help="Initial local-state perturbation norm in training-standardized physical-state coordinates")
-    stability.add_argument("--ood-samples", type=int, default=10000, help="Maximum held-out and policy-rollout samples used for state and state-action OOD metrics")
+    stability.add_argument("--ood-samples", type=int, default=10000, help="Maximum held-out and policy decision-boundary samples used for state and state-action OOD metrics")
     return parser.parse_args()
 
 
@@ -64,8 +66,16 @@ def evaluate_run(run_dir: Path, args: argparse.Namespace) -> Path:
         if expert_path.suffix != ".zip":
             expert_path = expert_path / f"{manifest['env_name']}.zip"
         manifest["expert"] = str(expert_path.resolve())
-    train_dataset = rollout.load_dataset(manifest["train_dataset_path"])
-    test_dataset = rollout.load_dataset(manifest["test_dataset_path"])
+    train_dataset = chunking.make_action_chunk_dataset(
+        rollout.load_dataset(manifest["train_dataset_path"]),
+        manifest["chunk_length"],
+        manifest["base_discount"],
+    )
+    test_dataset = chunking.make_action_chunk_dataset(
+        rollout.load_dataset(manifest["test_dataset_path"]),
+        manifest["chunk_length"],
+        manifest["base_discount"],
+    )
     policy, dynamics, obs_mean, obs_std = load_policy_and_dynamics(
         manifest,
         args.device,
@@ -79,7 +89,7 @@ def evaluate_run(run_dir: Path, args: argparse.Namespace) -> Path:
     )
     expert_info = evaluate_expert(manifest, args.eval_episodes, args.seed)
 
-    eval_dir = Path(manifest.get("eval_dir", run_dir / "eval"))
+    eval_dir = Path(manifest["eval_dir"])
     if eval_dir.exists():
         shutil.rmtree(eval_dir)
     eval_dir.mkdir(parents=True)
@@ -93,14 +103,19 @@ def evaluate_run(run_dir: Path, args: argparse.Namespace) -> Path:
             "jacobian_samples": args.jacobian_samples,
             "fd_eps": args.fd_eps,
             "stability_trajectories": args.stability_trajectories,
-            "stability_horizon": args.stability_horizon,
-            "global_max_offset": args.global_max_offset,
+            "stability_horizon_primitive_steps": args.stability_horizon,
+            "global_max_offset_primitive_steps": args.global_max_offset,
             "local_perturbation_scale": args.local_perturbation_scale,
             "ood_samples": args.ood_samples,
         },
         "env_name": manifest["env_name"],
         "algo": manifest["algo"],
         "dataset_tag": manifest["dataset_tag"],
+        "chunk_length": manifest["chunk_length"],
+        "base_discount": manifest["base_discount"],
+        "macro_discount": manifest["macro_discount"],
+        "rollout_timestep_unit": "primitive_step",
+        "stability_timestep_unit": "primitive_step",
         "policy_return_mean": float(np.mean(rollout_info["returns"])),
         "policy_return_std": float(np.std(rollout_info["returns"])),
         "expert_return_mean": expert_info["return_mean"],
@@ -134,16 +149,17 @@ def evaluate_run(run_dir: Path, args: argparse.Namespace) -> Path:
             obs_mean=obs_mean,
             obs_std=obs_std,
         )
-        np.savez_compressed(eval_dir / "dynamics_dataset.npz", next_obs_sq_error=dataset_errors)
+        np.savez_compressed(eval_dir / "dynamics_dataset.npz", next_obs_mse=dataset_errors)
         np.savez_compressed(
             eval_dir / "dynamics_rollout.npz",
-            next_obs_sq_error=rollout_info["next_obs_sq_error"],
+            next_obs_mse=rollout_info["next_obs_mse"],
             episode_ids=rollout_info["dynamics_episode_ids"],
-            timesteps=rollout_info["dynamics_timesteps"],
+            primitive_timesteps=rollout_info["dynamics_primitive_timesteps"],
         )
+        results["dynamics_horizon_primitive_steps"] = manifest["chunk_length"]
         results["dataset_next_obs_mse"] = float(np.mean(dataset_errors))
-        results["rollout_next_obs_mse"] = float(np.mean(rollout_info["next_obs_sq_error"]))
-        if manifest.get("dataset_source") != "robomimic":
+        results["rollout_next_obs_mse"] = float(np.mean(rollout_info["next_obs_mse"]))
+        if manifest["dataset_source"] != "robomimic":
             dataset_jacobians = evaluate_jacobians_on_observations(
                 policy=policy,
                 dynamics=dynamics,
@@ -152,6 +168,7 @@ def evaluate_run(run_dir: Path, args: argparse.Namespace) -> Path:
                 sample_count=args.jacobian_samples,
                 seed=args.seed,
                 fd_eps=args.fd_eps,
+                chunk_length=manifest["chunk_length"],
                 obs_mean=obs_mean,
                 obs_std=obs_std,
             )
@@ -163,13 +180,14 @@ def evaluate_run(run_dir: Path, args: argparse.Namespace) -> Path:
                 sample_count=args.jacobian_samples,
                 seed=args.seed,
                 fd_eps=args.fd_eps,
+                chunk_length=manifest["chunk_length"],
                 obs_mean=obs_mean,
                 obs_std=obs_std,
             )
             np.savez_compressed(eval_dir / "jacobian_dataset.npz", **dataset_jacobians)
             np.savez_compressed(eval_dir / "jacobian_rollout.npz", **rollout_jacobians)
-            results["dataset_closed_loop_jacobian_mse"] = float(np.mean(dataset_jacobians["closed_loop_jacobian_sq_error"]))
-            results["rollout_closed_loop_jacobian_mse"] = float(np.mean(rollout_jacobians["closed_loop_jacobian_sq_error"]))
+            results["dataset_closed_loop_jacobian_mse"] = float(np.mean(dataset_jacobians["closed_loop_jacobian_mse"]))
+            results["rollout_closed_loop_jacobian_mse"] = float(np.mean(rollout_jacobians["closed_loop_jacobian_mse"]))
 
     with (eval_dir / "results.json").open("w", encoding="utf-8") as file:
         json.dump(results, file, indent=2, sort_keys=True)
@@ -185,12 +203,12 @@ def load_policy_and_dynamics(
     dynamics_path: Path | None,
     train_dataset: dict[str, np.ndarray],
 ):
-    env = make_eval_env(manifest)
+    env = chunking.ActionChunkWrapper(make_eval_env(manifest), manifest["chunk_length"])
     buffer = build_buffer(train_dataset, env, device)
     build_args = argparse.Namespace(
         device=device,
         epoch=manifest["epoch"],
-        step_per_epoch=manifest.get("step_per_epoch", 1),
+        step_per_epoch=manifest["step_per_epoch"],
         adv_weight=manifest["adv_weight"],
         rollout_length=manifest["rollout_length"],
         adv_batch_size=manifest["adv_batch_size"],
@@ -201,16 +219,16 @@ def load_policy_and_dynamics(
         if manifest["algo"] == "rambo":
             obs_mean, obs_std = buffer.normalize_obs()
         policy, dynamics, _ = build_model_based_policy(
-            manifest["algo"], env, build_args, obs_mean=obs_mean, obs_std=obs_std
+            manifest["algo"], env, build_args, discount=manifest["macro_discount"],
+            obs_mean=obs_mean, obs_std=obs_std,
         )
         dynamics.load(str(dynamics_path))
     else:
-        dql_config = manifest.get("dql_config", {
-            "eta": 1.0,
-            "weight_temperature": 50.0,
-            "reward_scale": 1.0,
-        })
-        policy, _ = build_model_free_policy(manifest["algo"], env, buffer, build_args, dql_config)
+        dql_config = manifest["dql_config"] if manifest["algo"] == "dql" else None
+        policy, _ = build_model_free_policy(
+            manifest["algo"], env, buffer, build_args,
+            discount=manifest["macro_discount"], dql_config=dql_config,
+        )
         dynamics = None
 
     policy.load_state_dict(torch.load(policy_path, map_location=device, weights_only=True))
@@ -238,21 +256,21 @@ def evaluate_policy_behavior(
         args.stability_horizon, args.global_max_offset, args.seed,
     )
     local_stability = None
-    if manifest.get("dataset_source") != "robomimic":
+    if manifest["dataset_source"] != "robomimic":
         local_stability = evaluate_local_stability(
             policy, manifest["env_name"], train_dataset, test_dataset,
             args.stability_trajectories, args.stability_horizon,
-            args.local_perturbation_scale, args.seed,
+            args.local_perturbation_scale, args.seed, manifest["chunk_length"],
         )
     conservativity = evaluate_conservativity(
-        train_dataset, test_dataset, rollout_info["observations"],
-        rollout_info["actions"], args.ood_samples, args.seed,
+        train_dataset, test_dataset, rollout_info["decision_observations"],
+        rollout_info["action_chunks"], args.ood_samples, args.seed,
     )
     return rollout_info, global_stability, local_stability, conservativity
 
 
 def make_eval_env(manifest: dict):
-    if manifest.get("dataset_source") == "robomimic":
+    if manifest["dataset_source"] == "robomimic":
         metadata = load_offline.load_metadata(manifest["dataset_metadata_path"])
         return load_offline.make_robomimic_env(metadata)
     return gym.make(manifest["env_name"])
@@ -264,8 +282,12 @@ def robomimic_expert_metadata(manifest: dict) -> dict:
     if metadata["dataset_type"] == "ph":
         return metadata
     ph_dataset_dir = metadata_path.parents[2] / f"robomimic_{metadata['task'].lower()}_ph"
-    ph_metadata_path = sorted(ph_dataset_dir.glob("*/metadata.json"), reverse=True)[0]
-    return load_offline.load_metadata(ph_metadata_path)
+    ph_metadata_paths = sorted(ph_dataset_dir.glob("*/metadata.json"), reverse=True)
+    if ph_metadata_paths:
+        return load_offline.load_metadata(ph_metadata_paths[0])
+    ph_spec = load_offline.list_robomimic_dataset_specs(metadata["task"], "ph")[0]
+    _, ph_metadata = load_offline.load_robomimic_dataset(ph_spec)
+    return ph_metadata
 
 
 def evaluate_history(
@@ -319,6 +341,10 @@ def evaluate_history(
         "env_name": manifest["env_name"],
         "algo": manifest["algo"],
         "dataset_tag": manifest["dataset_tag"],
+        "chunk_length": manifest["chunk_length"],
+        "base_discount": manifest["base_discount"],
+        "macro_discount": manifest["macro_discount"],
+        "stability_timestep_unit": "primitive_step",
         "expert_return_mean": expert_info["return_mean"],
         "records": records,
     }
@@ -340,37 +366,42 @@ def evaluate_policy_rollouts(
     obs_std: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     env = make_eval_env(manifest)
+    chunk_length = manifest["chunk_length"]
     returns = []
-    observations, actions = [], []
-    next_obs_errors, error_observations, error_episode_ids, error_timesteps = [], [], [], []
+    decision_observations, action_chunks = [], []
+    next_obs_errors, error_observations = [], []
+    error_episode_ids, error_primitive_timesteps = [], []
 
     try:
         for episode in range(episodes):
             obs, _ = env.reset(seed=seed + episode)
             episode_return = 0.0
-            episode_length = 0
+            episode_primitive_steps = 0
             terminated = truncated = False
 
             while not (terminated or truncated):
-                action = policy.select_action(obs.reshape(1, -1), deterministic=True).reshape(-1)
-                observations.append(np.asarray(obs, dtype=np.float32).copy())
-                actions.append(np.asarray(action, dtype=np.float32).copy())
-                next_obs, reward, terminated, truncated, _ = env.step(action)
-                if dynamics is not None:
+                action_chunk = policy.select_action(obs.reshape(1, -1), deterministic=True).reshape(-1)
+                decision_observations.append(np.asarray(obs, dtype=np.float32).copy())
+                action_chunks.append(np.asarray(action_chunk, dtype=np.float32).copy())
+                next_obs, reward, terminated, truncated, chunk_info = chunking.execute_action_chunk(
+                    env, action_chunk, chunk_length
+                )
+                primitive_steps = chunk_info["primitive_steps"]
+                if dynamics is not None and primitive_steps == chunk_length:
                     error_observations.append(np.asarray(obs, dtype=np.float32).copy())
                     pred_next_obs = predict_next_obs(
                         dynamics,
                         obs.reshape(1, -1),
-                        action.reshape(1, -1),
+                        action_chunk.reshape(1, -1),
                         obs_mean=obs_mean,
                         obs_std=obs_std,
                     )[0]
-                    next_obs_errors.append(float(np.sum((pred_next_obs - next_obs) ** 2)))
+                    next_obs_errors.append(float(np.mean((pred_next_obs - next_obs) ** 2)))
                     error_episode_ids.append(episode)
-                    error_timesteps.append(episode_length)
+                    error_primitive_timesteps.append(episode_primitive_steps)
 
                 episode_return += float(reward)
-                episode_length += 1
+                episode_primitive_steps += primitive_steps
                 obs = next_obs
 
             returns.append(episode_return)
@@ -379,17 +410,17 @@ def evaluate_policy_rollouts(
 
     return {
         "returns": np.asarray(returns, dtype=np.float32),
-        "observations": np.asarray(observations, dtype=np.float32),
-        "actions": np.asarray(actions, dtype=np.float32),
-        "next_obs_sq_error": np.asarray(next_obs_errors, dtype=np.float32),
+        "decision_observations": np.asarray(decision_observations, dtype=np.float32),
+        "action_chunks": np.asarray(action_chunks, dtype=np.float32),
+        "next_obs_mse": np.asarray(next_obs_errors, dtype=np.float32),
         "dynamics_observations": np.asarray(error_observations, dtype=np.float32),
         "dynamics_episode_ids": np.asarray(error_episode_ids, dtype=np.int64),
-        "dynamics_timesteps": np.asarray(error_timesteps, dtype=np.int64),
+        "dynamics_primitive_timesteps": np.asarray(error_primitive_timesteps, dtype=np.int64),
     }
 
 
 def evaluate_expert(manifest: dict, episodes: int, seed: int) -> dict[str, np.ndarray]:
-    if manifest.get("dataset_source") == "robomimic":
+    if manifest["dataset_source"] == "robomimic":
         metadata = robomimic_expert_metadata(manifest)
         return {
             "returns": np.asarray([metadata["episode_return_mean"]], dtype=np.float32),
@@ -435,6 +466,7 @@ def evaluate_global_stability(
     seed: int,
 ) -> dict[str, np.ndarray]:
     env = make_eval_env(manifest)
+    chunk_length = manifest["chunk_length"]
     columns = observation_columns(env, manifest)
     state_std = train_dataset["observations"][:, columns].std(axis=0)
     state_std[state_std == 0.0] = 1.0
@@ -443,10 +475,18 @@ def evaluate_global_stability(
         for index in range(trajectory_count):
             obs, _ = env.reset(seed=seed + index)
             seed_policy_randomness(seed + 100000)
-            if manifest.get("dataset_source") == "robomimic":
-                trajectories.append(rollout_current_env_trajectory(env, policy, obs, columns, state_std, horizon))
+            if manifest["dataset_source"] == "robomimic":
+                trajectories.append(
+                    rollout_current_env_trajectory(
+                        env, policy, obs, columns, state_std, horizon, chunk_length
+                    )
+                )
             else:
-                trajectories.append(rollout_state_trajectory(env, policy, obs, columns, state_std, horizon))
+                trajectories.append(
+                    rollout_state_trajectory(
+                        env, policy, obs, columns, state_std, horizon, chunk_length
+                    )
+                )
     finally:
         env.close()
 
@@ -481,6 +521,7 @@ def evaluate_local_stability(
     horizon: int,
     perturbation_scale: float,
     seed: int,
+    chunk_length: int,
 ) -> dict[str, np.ndarray]:
     env = gym.make(env_name)
     columns = reconstructible_observation_columns(env)
@@ -502,9 +543,13 @@ def evaluate_local_stability(
             perturbed_obs[columns] += perturbation_scale * state_std * direction
 
             seed_policy_randomness(seed + 100000 + pair_index)
-            base = rollout_state_trajectory(env, policy, base_obs, columns, state_std, horizon)
+            base = rollout_state_trajectory(
+                env, policy, base_obs, columns, state_std, horizon, chunk_length
+            )
             seed_policy_randomness(seed + 100000 + pair_index)
-            perturbed = rollout_state_trajectory(env, policy, perturbed_obs, columns, state_std, horizon)
+            perturbed = rollout_state_trajectory(
+                env, policy, perturbed_obs, columns, state_std, horizon, chunk_length
+            )
             overlap = min(len(base), len(perturbed))
             curves.append(np.linalg.norm(base[:overlap] - perturbed[:overlap], axis=1).astype(np.float32))
             base_lengths.append(len(base))
@@ -533,18 +578,14 @@ def rollout_state_trajectory(
     columns: np.ndarray,
     state_std: np.ndarray,
     horizon: int,
+    chunk_length: int,
 ) -> np.ndarray:
     env.reset()
     set_env_from_obs(env, initial_obs)
     obs = env.unwrapped._get_obs().astype(np.float32)
-    states = [obs[columns] / state_std]
-    for _ in range(horizon):
-        action = policy.select_action(obs.reshape(1, -1), deterministic=True).reshape(-1)
-        obs, _, terminated, truncated, _ = env.step(action)
-        states.append(np.asarray(obs, dtype=np.float32)[columns] / state_std)
-        if terminated or truncated:
-            break
-    return np.asarray(states, dtype=np.float32)
+    return rollout_current_env_trajectory(
+        env, policy, obs, columns, state_std, horizon, chunk_length
+    )
 
 
 def rollout_current_env_trajectory(
@@ -554,29 +595,41 @@ def rollout_current_env_trajectory(
     columns: np.ndarray,
     state_std: np.ndarray,
     horizon: int,
+    chunk_length: int,
 ) -> np.ndarray:
     states = [np.asarray(obs, dtype=np.float32)[columns] / state_std]
-    for _ in range(horizon):
-        action = policy.select_action(obs.reshape(1, -1), deterministic=True).reshape(-1)
-        obs, _, terminated, truncated, _ = env.step(action)
-        states.append(np.asarray(obs, dtype=np.float32)[columns] / state_std)
-        if terminated or truncated:
-            break
+    primitive_steps = 0
+    terminated = truncated = False
+    while primitive_steps < horizon and not (terminated or truncated):
+        action_chunk = policy.select_action(obs.reshape(1, -1), deterministic=True).reshape(-1)
+        obs, _, terminated, truncated, chunk_info = chunking.execute_action_chunk(
+            env,
+            action_chunk,
+            chunk_length,
+            max_primitive_steps=horizon - primitive_steps,
+        )
+        primitive_next_observations = chunk_info["primitive_next_observations"]
+        states.extend(primitive_next_observations[:, columns] / state_std)
+        primitive_steps += chunk_info["primitive_steps"]
     return np.asarray(states, dtype=np.float32)
 
 
 def evaluate_conservativity(
     train_dataset: dict[str, np.ndarray],
     test_dataset: dict[str, np.ndarray],
-    rollout_observations: np.ndarray,
-    rollout_actions: np.ndarray,
+    rollout_decision_observations: np.ndarray,
+    rollout_action_chunks: np.ndarray,
     sample_count: int,
     seed: int,
 ) -> dict[str, np.ndarray]:
     rng = np.random.default_rng(seed)
     train_indices = rng.choice(len(train_dataset["observations"]), size=min(50000, len(train_dataset["observations"])), replace=False)
     test_indices = rng.choice(len(test_dataset["observations"]), size=min(sample_count, len(test_dataset["observations"])), replace=False)
-    rollout_indices = rng.choice(len(rollout_observations), size=min(sample_count, len(rollout_observations)), replace=False)
+    rollout_indices = rng.choice(
+        len(rollout_decision_observations),
+        size=min(sample_count, len(rollout_decision_observations)),
+        replace=False,
+    )
 
     train_states = train_dataset["observations"][train_indices]
     state_mean = train_dataset["observations"].mean(axis=0)
@@ -587,7 +640,7 @@ def evaluate_conservativity(
         state_reference, (test_dataset["observations"][test_indices] - state_mean) / state_std
     )
     rollout_state_distances = metrics.knn_distances(
-        state_reference, (rollout_observations[rollout_indices] - state_mean) / state_std
+        state_reference, (rollout_decision_observations[rollout_indices] - state_mean) / state_std
     )
 
     train_state_actions = np.concatenate([train_states, train_dataset["actions"][train_indices]], axis=1)
@@ -603,7 +656,7 @@ def evaluate_conservativity(
         [test_dataset["observations"][test_indices], test_dataset["actions"][test_indices]], axis=1
     )
     rollout_state_actions = np.concatenate(
-        [rollout_observations[rollout_indices], rollout_actions[rollout_indices]], axis=1
+        [rollout_decision_observations[rollout_indices], rollout_action_chunks[rollout_indices]], axis=1
     )
     test_state_action_distances = metrics.knn_distances(
         state_action_reference, (test_state_actions - state_action_mean) / state_action_std
@@ -648,21 +701,23 @@ def evaluate_dynamics_on_dataset(
     for start in range(0, len(dataset["observations"]), 8192):
         end = start + 8192
         obs = dataset["observations"][start:end]
-        actions = dataset["actions"][start:end]
-        pred_next_obs = predict_next_obs(dynamics, obs, actions, obs_mean=obs_mean, obs_std=obs_std)
-        errors.append(np.sum((pred_next_obs - dataset["next_observations"][start:end]) ** 2, axis=1))
+        action_chunks = dataset["actions"][start:end]
+        pred_next_obs = predict_next_obs(
+            dynamics, obs, action_chunks, obs_mean=obs_mean, obs_std=obs_std
+        )
+        errors.append(np.mean((pred_next_obs - dataset["next_observations"][start:end]) ** 2, axis=1))
     return np.concatenate(errors, axis=0).astype(np.float32)
 
 
 def predict_next_obs(
     dynamics,
     obs: np.ndarray,
-    actions: np.ndarray,
+    action_chunks: np.ndarray,
     obs_mean: np.ndarray | None = None,
     obs_std: np.ndarray | None = None,
 ) -> np.ndarray:
     model_obs = obs if obs_mean is None else (obs - obs_mean) / obs_std
-    model_input = dynamics.scaler.transform(np.concatenate([model_obs, actions], axis=-1))
+    model_input = dynamics.scaler.transform(np.concatenate([model_obs, action_chunks], axis=-1))
     with torch.no_grad():
         mean, _ = dynamics.model(model_input)
     elite_indices = dynamics.model.elites.detach().cpu().numpy()
@@ -681,6 +736,7 @@ def evaluate_jacobians_on_observations(
     sample_count: int,
     seed: int,
     fd_eps: float,
+    chunk_length: int,
     obs_mean: np.ndarray | None = None,
     obs_std: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
@@ -692,13 +748,15 @@ def evaluate_jacobians_on_observations(
     errors = []
 
     try:
-        for index in indices:
+        for sample_index, index in enumerate(indices):
+            finite_difference_seed = seed + sample_index * len(columns)
             true_jacobian = closed_loop_jacobian(
-                lambda obs: true_next_obs(env, policy, obs),
+                lambda obs: true_next_obs(env, policy, obs, chunk_length),
                 env,
                 observations[index],
                 columns,
                 fd_eps,
+                finite_difference_seed,
             )
             learned_jacobian = closed_loop_jacobian(
                 lambda obs: learned_next_obs(policy, dynamics, obs, obs_mean, obs_std),
@@ -706,19 +764,27 @@ def evaluate_jacobians_on_observations(
                 observations[index],
                 columns,
                 fd_eps,
+                finite_difference_seed,
             )
-            errors.append(float(np.sum((learned_jacobian - true_jacobian) ** 2)))
+            errors.append(float(np.mean((learned_jacobian - true_jacobian) ** 2)))
     finally:
         env.close()
 
     return {
-        "closed_loop_jacobian_sq_error": np.asarray(errors, dtype=np.float32),
+        "closed_loop_jacobian_mse": np.asarray(errors, dtype=np.float32),
         "sample_indices": indices.astype(np.int64),
         "columns": columns.astype(np.int64),
     }
 
 
-def closed_loop_jacobian(next_obs_fn, env: gym.Env, obs: np.ndarray, columns: np.ndarray, fd_eps: float) -> np.ndarray:
+def closed_loop_jacobian(
+    next_obs_fn,
+    env: gym.Env,
+    obs: np.ndarray,
+    columns: np.ndarray,
+    fd_eps: float,
+    seed: int,
+) -> np.ndarray:
     jacobian = np.empty((len(obs), len(columns)), dtype=np.float32)
     for column_index, obs_index in enumerate(columns):
         obs_plus = np.asarray(obs, dtype=np.float32).copy()
@@ -729,14 +795,18 @@ def closed_loop_jacobian(next_obs_fn, env: gym.Env, obs: np.ndarray, columns: np
         physical_obs_plus = env.unwrapped._get_obs().astype(np.float32)
         set_env_from_obs(env, obs_minus)
         physical_obs_minus = env.unwrapped._get_obs().astype(np.float32)
-        jacobian[:, column_index] = (next_obs_fn(physical_obs_plus) - next_obs_fn(physical_obs_minus)) / (2.0 * fd_eps)
+        seed_policy_randomness(seed + column_index)
+        next_obs_plus = next_obs_fn(physical_obs_plus)
+        seed_policy_randomness(seed + column_index)
+        next_obs_minus = next_obs_fn(physical_obs_minus)
+        jacobian[:, column_index] = (next_obs_plus - next_obs_minus) / (2.0 * fd_eps)
     return jacobian
 
 
-def true_next_obs(env: gym.Env, policy, obs: np.ndarray) -> np.ndarray:
+def true_next_obs(env: gym.Env, policy, obs: np.ndarray, chunk_length: int) -> np.ndarray:
     set_env_from_obs(env, obs)
-    action = policy.select_action(obs.reshape(1, -1), deterministic=True).reshape(-1)
-    next_obs, *_ = env.unwrapped.step(action)
+    action_chunk = policy.select_action(obs.reshape(1, -1), deterministic=True).reshape(-1)
+    next_obs, *_ = chunking.execute_action_chunk(env.unwrapped, action_chunk, chunk_length)
     return np.asarray(next_obs, dtype=np.float32)
 
 
@@ -747,8 +817,11 @@ def learned_next_obs(
     obs_mean: np.ndarray | None,
     obs_std: np.ndarray | None,
 ) -> np.ndarray:
-    action = policy.select_action(obs.reshape(1, -1), deterministic=True).reshape(1, -1)
-    return predict_next_obs(dynamics, obs.reshape(1, -1), action, obs_mean=obs_mean, obs_std=obs_std)[0]
+    action_chunk = policy.select_action(obs.reshape(1, -1), deterministic=True).reshape(1, -1)
+    return predict_next_obs(
+        dynamics, obs.reshape(1, -1), action_chunk,
+        obs_mean=obs_mean, obs_std=obs_std,
+    )[0]
 
 
 def reconstructible_observation_columns(env: gym.Env) -> np.ndarray:
@@ -757,7 +830,7 @@ def reconstructible_observation_columns(env: gym.Env) -> np.ndarray:
 
 
 def observation_columns(env: gym.Env, manifest: dict) -> np.ndarray:
-    if manifest.get("dataset_source") == "robomimic":
+    if manifest["dataset_source"] == "robomimic":
         return np.arange(env.observation_space.shape[0], dtype=np.int64)
     return reconstructible_observation_columns(env)
 
