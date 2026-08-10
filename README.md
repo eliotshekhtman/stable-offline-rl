@@ -17,7 +17,9 @@ Dataset splits are reused by the same rule. Paths in new metadata and manifests 
 
 Premade-data sweeps use every matching dataset by default. Pass `--dataset mh` for one Robomimic dataset type, or `--dataset medium-v0` (equivalently its full ID, such as `mujoco/halfcheetah/medium-v0`) for one Minari dataset.
 
-All datasets are split by complete episode. Minari episodes, robomimic demonstrations, and generated rollouts share the same ordered transition schema: every `episode_id` occupies one contiguous block, and consecutive entries within that block are consecutive environment transitions. Generated `--num-samples` values are minimum targets. Collection preserves the complete episode that reaches each expert or random-action target, so the saved dataset can contain more transitions and a slightly different expert fraction than requested. Metadata records both requested targets and actual counts.
+All datasets are split by complete episode. Minari episodes, robomimic demonstrations, and generated rollouts share the same ordered transition schema: every `episode_id` occupies one contiguous block, and consecutive entries within that block are consecutive environment transitions. Generated `--num-samples` values are minimum targets. Collection preserves the complete episode that reaches each clean expert, noisy expert, or random-action target, so the saved dataset can contain more transitions and slightly different proportions than requested. Metadata records both requested targets and actual counts.
+
+Generated datasets can mix clean expert, noisy expert, and random-action episodes. Pass `--composition CLEAN_EXPERT NOISY_EXPERT`; random data fills the remaining proportion. Repeat the argument to sweep specified compositions without taking a Cartesian product between their two values. `--noise-scale` applies only to the noisy expert component, while clean expert actions use zero noise. The default composition is `1 0`.
 
 `DATASET_SCHEMA_VERSION` and `TRAINING_SCHEMA_VERSION` in `sweep.py` invalidate cached artifacts when dataset conversion or training behavior changes without a corresponding CLI change. Increment the relevant value when making such a change; evaluation-only edits require neither increment.
 
@@ -33,7 +35,7 @@ r_t + 0.99 r_(t+1) + ... + 0.99^(l-1) r_(t+l-1).
 
 Windows never cross episode boundaries. Following robomimic's n-step convention, a chunk's terminal and timeout flags are the corresponding `any` over its window; those signals do not redefine the stored episode boundary. The policy backup discount is `0.99^l`. Episodes shorter than `l` contribute no windows; conversion fails clearly if an entire split has no valid window.
 
-At execution time, all `l` predicted actions are applied open-loop. Execution stops early if the environment terminates or truncates, and reported episode returns remain the ordinary undiscounted sum of primitive rewards. Post-training stability horizons and saved rollout timesteps are measured in primitive environment steps; OfflineRL-Kit's training-time `eval/episode_length` log still counts policy decisions. Learned-dynamics `--rollout-length`, dynamics mismatch, Jacobian mismatch, and OOD state-action samples operate at chunk decision boundaries, so one learned-dynamics step represents up to `l` primitive steps.
+At execution time, all `l` predicted actions are applied open-loop. Execution stops early if the environment terminates or truncates, and reported episode returns remain the ordinary undiscounted sum of primitive rewards. Post-training stability horizons and saved rollout timesteps are measured in primitive environment steps. Learned-dynamics `--rollout-length`, dynamics mismatch, Jacobian mismatch, and OOD state-action samples operate at chunk decision boundaries, so one learned-dynamics step represents up to `l` primitive steps.
 
 ```bash
 python sweep.py \

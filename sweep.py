@@ -58,8 +58,11 @@ def parse_args() -> argparse.Namespace:
     generated = parser.add_argument_group("generated dataset options")
     generated.add_argument("--expert", default="/home/shekhe/stable-offline-rl/experts", help="Expert policy .zip path or directory containing <env>.zip; used only for generated expert data and expert evaluation")
     generated.add_argument("--num-samples", type=int, nargs="+", default=[10000], help="Minimum generated transition counts to sweep over; collection finishes the episode that reaches each source target")
-    generated.add_argument("--noise-scale", type=float, nargs="+", default=[0.0], help="Gaussian action-noise scales applied to expert actions in generated datasets")
-    generated.add_argument("--prop-expert", type=float, nargs="+", default=[1.0], help="Target fraction of generated transitions collected from the expert; completing episodes can change the actual fraction")
+    generated.add_argument("--noise-scale", type=float, nargs="+", default=[0.0], help="Gaussian action-noise scales applied to noisy expert actions in generated datasets")
+    generated.add_argument(
+        "--composition", type=float, nargs=2, action="append", metavar=("CLEAN_EXPERT", "NOISY_EXPERT"),
+        help="Generated-data clean and noisy expert proportions; repeat for multiple compositions, with random data filling the remainder (default: 1 0)",
+    )
     generated.add_argument("--max-timesteps", type=int, default=1000, help="Maximum length of each generated rollout trajectory")
 
     training = parser.add_argument_group("policy training")
@@ -74,22 +77,22 @@ def parse_args() -> argparse.Namespace:
     training.add_argument("--epoch", type=int, default=1000, help="Number of policy-training epochs")
     training.add_argument("--step-per-epoch", type=int, default=1000, help="Gradient-update steps per policy-training epoch")
     training.add_argument("--batch-size", type=int, default=256, help="Policy-training batch size")
-    training.add_argument("--eval-episodes", type=int, default=10, help="Episodes used for trainer evaluation and, with --eval, post-training return evaluation")
-    training.add_argument("--eval", action="store_true", help="After training, run full evaluation for each trained policy and then generate plots")
-    training.add_argument("--jacobian-samples", type=int, default=8, help="Evaluation-only number of dataset and rollout states used for finite-difference Jacobian metrics")
-    training.add_argument("--fd-eps", type=float, default=1e-4, help="Evaluation-only central finite-difference perturbation size for Jacobian metrics")
 
     dql = parser.add_argument_group("DQL options")
     dql.add_argument("--dql-eta", type=float, default=None, help="Override the DQL Q-guidance loss weight; defaults to CleanDiffuser's locomotion value of 1")
     dql.add_argument("--dql-weight-temperature", type=float, default=None, help="Override the DQL candidate-action softmax weight; defaults to a CleanDiffuser task value when available")
     dql.add_argument("--dql-reward-normalization", choices=["auto", "none", "episode-range"], default="auto", help="DQL reward scaling: auto uses CleanDiffuser episode-return-range scaling for Minari data and no scaling otherwise")
 
-    stability = parser.add_argument_group("stability and conservativity evaluation")
-    stability.add_argument("--stability-trajectories", type=int, default=8, help="Evaluation-only number of global trajectories and local perturbed-state pairs")
-    stability.add_argument("--stability-horizon", type=int, default=300, help="Evaluation-only maximum primitive steps for global and local stability trajectories")
-    stability.add_argument("--global-max-offset", type=int, default=30, help="Evaluation-only maximum primitive-step offset for global trajectory phase alignment")
-    stability.add_argument("--local-perturbation-scale", type=float, default=0.01, help="Evaluation-only local perturbation norm in standardized physical-state coordinates")
-    stability.add_argument("--ood-samples", type=int, default=10000, help="Evaluation-only maximum held-out and policy decision-boundary samples used for OOD metrics")
+    evaluation = parser.add_argument_group("post-training evaluation")
+    evaluation.add_argument("--eval", action="store_true", help="After training, run full evaluation for each trained policy and then generate plots")
+    evaluation.add_argument("--eval-episodes", type=int, default=10, help="Number of true-environment episodes used to estimate post-training policy and expert returns")
+    evaluation.add_argument("--jacobian-samples", type=int, default=8, help="Number of dataset and rollout states used for finite-difference Jacobian metrics")
+    evaluation.add_argument("--fd-eps", type=float, default=1e-4, help="Central finite-difference perturbation size for Jacobian metrics")
+    evaluation.add_argument("--stability-trajectories", type=int, default=8, help="Number of global trajectories and local perturbed-state pairs")
+    evaluation.add_argument("--stability-horizon", type=int, default=300, help="Maximum primitive steps for global and local stability trajectories")
+    evaluation.add_argument("--global-max-offset", type=int, default=30, help="Maximum primitive-step offset for global trajectory phase alignment")
+    evaluation.add_argument("--local-perturbation-scale", type=float, default=0.01, help="Local perturbation norm in standardized physical-state coordinates")
+    evaluation.add_argument("--ood-samples", type=int, default=10000, help="Maximum held-out and policy decision-boundary samples used for OOD metrics")
 
     model_based = parser.add_argument_group("model-based algorithm options")
     model_based.add_argument("--dynamics-max-epochs", type=int, default=5, help="Maximum epochs for fitting the learned dynamics model before policy training")
@@ -108,6 +111,11 @@ def parse_args() -> argparse.Namespace:
         parser.error("--chunk-lengths values must be positive")
     args.chunk_lengths = list(dict.fromkeys(args.chunk_lengths))
     args.algos = list(dict.fromkeys(args.algos))
+    args.composition = [(1.0, 0.0)] if args.composition is None else [tuple(values) for values in args.composition]
+    args.composition = list(dict.fromkeys(args.composition))
+    for prop_clean, prop_noisy in args.composition:
+        if prop_clean < 0.0 or prop_noisy < 0.0 or prop_clean + prop_noisy > 1.0:
+            parser.error("--composition values must be nonnegative and sum to at most 1")
     if "none" in args.algos and args.algos != ["none"]:
         parser.error("--algos none cannot be combined with training algorithms")
     if args.dataset is not None and args.dataset_source == "generated":
@@ -128,10 +136,15 @@ def run_sweep(env_name: str, expert_path: Path, args: argparse.Namespace) -> Non
     elif args.dataset_source == "robomimic":
         eval_dirs = run_robomimic_sweep(env_name, dataset_root, trained_root, eval_root, args)
     else:
-        for num_samples, noise_scale, prop_expert in itertools.product(
-            args.num_samples, args.noise_scale, args.prop_expert
+        for num_samples, noise_scale, composition in itertools.product(
+            args.num_samples, args.noise_scale, args.composition
         ):
-            dataset_tag = make_dataset_tag(num_samples, noise_scale, prop_expert, args.seed)
+            prop_clean, prop_noisy = composition
+            prop_random = 1.0 - prop_clean - prop_noisy
+            prop_expert = prop_clean + prop_noisy
+            dataset_tag = make_dataset_tag(
+                num_samples, noise_scale, prop_clean, prop_noisy, args.seed
+            )
             dataset_schema = {
                 "version": DATASET_SCHEMA_VERSION,
                 "source": "generated",
@@ -140,6 +153,9 @@ def run_sweep(env_name: str, expert_path: Path, args: argparse.Namespace) -> Non
                 "max_timesteps": args.max_timesteps,
                 "num_samples": num_samples,
                 "noise_scale": noise_scale,
+                "prop_clean_expert": prop_clean,
+                "prop_noisy_expert": prop_noisy,
+                "prop_random": prop_random,
                 "prop_expert": prop_expert,
                 "deterministic": True,
                 "seed": args.seed,
@@ -150,7 +166,8 @@ def run_sweep(env_name: str, expert_path: Path, args: argparse.Namespace) -> Non
                     env_name, trained_root, eval_root, dataset_root / dataset_tag,
                     dataset_tag, dataset_schema, args,
                     lambda: collect_generated_dataset(
-                        env_name, expert_path, num_samples, noise_scale, prop_expert, args
+                        env_name, expert_path, num_samples, noise_scale,
+                        prop_clean, prop_noisy, args,
                     ),
                 )
             )
@@ -218,10 +235,11 @@ def collect_generated_dataset(
     expert_path: Path,
     num_samples: int,
     noise_scale: float,
-    prop_expert: float,
+    prop_clean_expert: float,
+    prop_noisy_expert: float,
     args: argparse.Namespace,
 ) -> tuple[dict[str, np.ndarray], dict]:
-    if prop_expert > 0.0 and not expert_path.exists():
+    if prop_clean_expert + prop_noisy_expert > 0.0 and not expert_path.exists():
         raise FileNotFoundError(f"Expert policy not found: {expert_path}")
 
     print("Collecting generated dataset")
@@ -231,7 +249,8 @@ def collect_generated_dataset(
         max_timesteps=args.max_timesteps,
         num_samples=num_samples,
         noise_scale=noise_scale,
-        prop_expert=prop_expert,
+        prop_clean_expert=prop_clean_expert,
+        prop_noisy_expert=prop_noisy_expert,
         deterministic=True,
         seed=args.seed,
     )
@@ -524,13 +543,11 @@ def train_algo(
             if algo != "dql":
                 trainer = MFPolicyTrainer(
                     policy=policy,
-                    eval_env=eval_env,
                     buffer=buffer,
                     logger=logger,
                     epoch=args.epoch,
                     step_per_epoch=args.step_per_epoch,
                     batch_size=args.batch_size,
-                    eval_episodes=args.eval_episodes,
                     lr_scheduler=lr_scheduler,
                     checkpoint_epochs=checkpoint_epochs(args.epoch),
                 )
@@ -567,7 +584,6 @@ def train_algo(
 
             trainer = MBPolicyTrainer(
                 policy=policy,
-                eval_env=eval_env,
                 real_buffer=real_buffer,
                 fake_buffer=fake_buffer,
                 logger=logger,
@@ -576,7 +592,6 @@ def train_algo(
                 step_per_epoch=args.step_per_epoch,
                 batch_size=args.batch_size,
                 real_ratio=args.real_ratio,
-                eval_episodes=args.eval_episodes,
                 lr_scheduler=lr_scheduler,
                 dynamics_update_freq=args.dynamics_update_freq if algo == "rambo" else 0,
                 checkpoint_epochs=checkpoint_epochs(args.epoch),
@@ -656,7 +671,6 @@ def save_run_manifest(
         "epoch": args.epoch,
         "step_per_epoch": args.step_per_epoch,
         "batch_size": args.batch_size,
-        "training_eval_episodes": args.eval_episodes,
         "adv_weight": args.adv_weight,
         "adv_batch_size": args.adv_batch_size,
         "rollout_length": args.rollout_length,
@@ -697,7 +711,6 @@ def build_logger(
         "epoch": args.epoch,
         "step_per_epoch": args.step_per_epoch,
         "batch_size": args.batch_size,
-        "eval_episodes": args.eval_episodes,
     }
     if dql_config is not None:
         hyperparameters["dql"] = dql_config
@@ -748,8 +761,17 @@ def checkpoint_manifest(run_dir: Path, algo: str, epochs: int, steps_per_epoch: 
     return records
 
 
-def make_dataset_tag(num_samples: int, noise_scale: float, prop_expert: float, seed: int) -> str:
-    return f"samples{num_samples}_expert{prop_expert:g}_noise{noise_scale:g}_seed{seed}"
+def make_dataset_tag(
+    num_samples: int,
+    noise_scale: float,
+    prop_clean_expert: float,
+    prop_noisy_expert: float,
+    seed: int,
+) -> str:
+    return (
+        f"samples{num_samples}_clean{prop_clean_expert:g}_noisy{prop_noisy_expert:g}_"
+        f"noise{noise_scale:g}_seed{seed}"
+    )
 
 
 def resolve_expert_path(expert_arg: str, env_name: str) -> Path:

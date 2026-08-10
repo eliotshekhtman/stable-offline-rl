@@ -1,6 +1,6 @@
 # Tasks:
 # - Generate offline transition datasets by rolling out Gymnasium environments.
-# - Implement noise-injected expert collection and random-action suboptimal collection.
+# - Implement clean expert, noise-injected expert, and random-action collection.
 # - Save/load this project's canonical .npz transition schema and JSON metadata.
 # - Preserve Gymnasium terminated vs truncated signals as terminals vs timeouts.
 
@@ -166,57 +166,76 @@ def collect_dataset(
     max_timesteps: int = 300,
     num_samples: int = 10000,
     noise_scale: float = 0.0,
-    prop_expert: float = 1.0,
+    prop_clean_expert: float = 1.0,
+    prop_noisy_expert: float = 0.0,
     deterministic: bool = True,
     seed: int | None = None,
 ) -> tuple[dict[str, np.ndarray], dict]:
     """Collect an ordered offline-RL dataset containing complete episodes.
 
-    num_samples and prop_expert determine minimum per-source transition targets.
-    Collection finishes the episode that reaches each target, so the returned
-    dataset can contain more transitions and a slightly different source ratio.
+    The two expert proportions determine clean and noisy expert targets; the
+    remainder is random data. Collection finishes the episode that reaches each
+    target, so realized source proportions can differ slightly from requested.
     """
     _validate_collection_args(
         max_timesteps=max_timesteps,
         num_samples=num_samples,
         noise_scale=noise_scale,
-        prop_expert=prop_expert,
+        prop_clean_expert=prop_clean_expert,
+        prop_noisy_expert=prop_noisy_expert,
     )
 
     rng = np.random.default_rng(seed)
-    requested_num_expert, requested_num_suboptimal = _split_sample_counts(num_samples, prop_expert)
+    requested_num_clean, requested_num_noisy, requested_num_random = _split_sample_counts(
+        num_samples, prop_clean_expert, prop_noisy_expert
+    )
     datasets = []
     next_episode_id = 0
-    num_expert = 0
-    num_suboptimal = 0
+    num_clean = 0
+    num_noisy = 0
+    num_random = 0
 
-    if requested_num_expert > 0:
-        expert_dataset = collect_expert(
+    if requested_num_clean > 0:
+        clean_dataset = collect_expert(
             env_name=env_name,
             policy_path=policy_path,
-            num_samples=requested_num_expert,
+            num_samples=requested_num_clean,
+            max_timesteps=max_timesteps,
+            noise_scale=0.0,
+            deterministic=deterministic,
+            rng=rng,
+            episode_id_start=next_episode_id,
+        )
+        datasets.append(clean_dataset)
+        num_clean = len(clean_dataset["rewards"])
+        next_episode_id = int(clean_dataset["episode_ids"].max()) + 1
+    if requested_num_noisy > 0:
+        noisy_dataset = collect_expert(
+            env_name=env_name,
+            policy_path=policy_path,
+            num_samples=requested_num_noisy,
             max_timesteps=max_timesteps,
             noise_scale=noise_scale,
             deterministic=deterministic,
             rng=rng,
             episode_id_start=next_episode_id,
         )
-        datasets.append(expert_dataset)
-        num_expert = len(expert_dataset["rewards"])
-        next_episode_id = int(expert_dataset["episode_ids"].max()) + 1
-    if requested_num_suboptimal > 0:
-        suboptimal_dataset = collect_suboptimal(
+        datasets.append(noisy_dataset)
+        num_noisy = len(noisy_dataset["rewards"])
+        next_episode_id = int(noisy_dataset["episode_ids"].max()) + 1
+    if requested_num_random > 0:
+        random_dataset = collect_suboptimal(
             env_name=env_name,
             policy_path=policy_path,
-            num_samples=requested_num_suboptimal,
+            num_samples=requested_num_random,
             max_timesteps=max_timesteps,
             noise_scale=noise_scale,
             deterministic=deterministic,
             rng=rng,
             episode_id_start=next_episode_id,
         )
-        datasets.append(suboptimal_dataset)
-        num_suboptimal = len(suboptimal_dataset["rewards"])
+        datasets.append(random_dataset)
+        num_random = len(random_dataset["rewards"])
 
     dataset = _concat_datasets(datasets)
     metadata = make_metadata(
@@ -225,11 +244,13 @@ def collect_dataset(
         max_timesteps=max_timesteps,
         num_samples=num_samples,
         noise_scale=noise_scale,
-        prop_expert=prop_expert,
+        prop_clean_expert=prop_clean_expert,
+        prop_noisy_expert=prop_noisy_expert,
         deterministic=deterministic,
         seed=seed,
-        num_expert=num_expert,
-        num_suboptimal=num_suboptimal,
+        num_clean_expert=num_clean,
+        num_noisy_expert=num_noisy,
+        num_random=num_random,
     )
     return dataset, metadata
 
@@ -240,24 +261,33 @@ def make_metadata(
     max_timesteps: int,
     num_samples: int,
     noise_scale: float,
-    prop_expert: float,
+    prop_clean_expert: float,
+    prop_noisy_expert: float,
     deterministic: bool,
     seed: int | None,
-    num_expert: int,
-    num_suboptimal: int,
+    num_clean_expert: int,
+    num_noisy_expert: int,
+    num_random: int,
 ) -> dict:
-    requested_num_expert, requested_num_suboptimal = _split_sample_counts(num_samples, prop_expert)
+    requested_num_clean, requested_num_noisy, requested_num_random = _split_sample_counts(
+        num_samples, prop_clean_expert, prop_noisy_expert
+    )
+    num_transitions = num_clean_expert + num_noisy_expert + num_random
     return {
         "env_name": env_name,
         "policy_path": str(policy_path),
         "max_timesteps": max_timesteps,
         "requested_num_samples": num_samples,
-        "requested_num_expert": requested_num_expert,
-        "requested_num_suboptimal": requested_num_suboptimal,
-        "num_transitions": num_expert + num_suboptimal,
-        "num_expert": num_expert,
-        "num_suboptimal": num_suboptimal,
-        "actual_prop_expert": num_expert / (num_expert + num_suboptimal),
+        "requested_num_clean_expert": requested_num_clean,
+        "requested_num_noisy_expert": requested_num_noisy,
+        "requested_num_random": requested_num_random,
+        "num_transitions": num_transitions,
+        "num_clean_expert": num_clean_expert,
+        "num_noisy_expert": num_noisy_expert,
+        "num_random": num_random,
+        "actual_prop_clean_expert": num_clean_expert / num_transitions,
+        "actual_prop_noisy_expert": num_noisy_expert / num_transitions,
+        "actual_prop_random": num_random / num_transitions,
         "noise_scale": noise_scale,
         "deterministic": deterministic,
         "seed": seed,
@@ -364,7 +394,8 @@ def _validate_collection_args(
     max_timesteps: int,
     num_samples: int,
     noise_scale: float,
-    prop_expert: float,
+    prop_clean_expert: float,
+    prop_noisy_expert: float,
 ) -> None:
     if max_timesteps <= 0:
         raise ValueError("max_timesteps must be positive.")
@@ -372,11 +403,21 @@ def _validate_collection_args(
         raise ValueError("num_samples must be positive.")
     if noise_scale < 0.0:
         raise ValueError("noise_scale must be nonnegative.")
-    if not 0.0 <= prop_expert <= 1.0:
-        raise ValueError("prop_expert must be between 0 and 1.")
+    if not 0.0 <= prop_clean_expert <= 1.0:
+        raise ValueError("prop_clean_expert must be between 0 and 1.")
+    if not 0.0 <= prop_noisy_expert <= 1.0:
+        raise ValueError("prop_noisy_expert must be between 0 and 1.")
+    if prop_clean_expert + prop_noisy_expert > 1.0:
+        raise ValueError("clean and noisy expert proportions cannot sum above 1.")
 
 
-def _split_sample_counts(num_samples: int, prop_expert: float) -> tuple[int, int]:
+def _split_sample_counts(
+    num_samples: int,
+    prop_clean_expert: float,
+    prop_noisy_expert: float,
+) -> tuple[int, int, int]:
+    prop_expert = prop_clean_expert + prop_noisy_expert
     num_expert = int(round(num_samples * prop_expert))
     num_expert = min(max(num_expert, 0), num_samples)
-    return num_expert, num_samples - num_expert
+    num_clean = 0 if prop_expert == 0.0 else int(round(num_expert * prop_clean_expert / prop_expert))
+    return num_clean, num_expert - num_clean, num_samples - num_expert
