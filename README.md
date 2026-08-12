@@ -17,7 +17,7 @@ Dataset splits are reused by the same rule. Paths in new metadata and manifests 
 
 Premade-data sweeps use every matching dataset by default. Pass `--dataset mh` for one Robomimic dataset type, or `--dataset medium-v0` (equivalently its full ID, such as `mujoco/halfcheetah/medium-v0`) for one Minari dataset.
 
-All datasets are split by complete episode. Minari episodes, robomimic demonstrations, and generated rollouts share the same ordered transition schema: every `episode_id` occupies one contiguous block, and consecutive entries within that block are consecutive environment transitions. Generated `--num-samples` values are minimum targets. Collection preserves the complete episode that reaches each clean expert, noisy expert, or random-action target, so the saved dataset can contain more transitions and slightly different proportions than requested. Metadata records both requested targets and actual counts.
+All datasets are split by complete episode. Minari episodes, robomimic demonstrations, and generated rollouts share the same ordered transition schema: every `episode_id` occupies one contiguous block, and consecutive entries within that block are consecutive environment transitions. Generated `--num-samples` values are minimum transition counts. Source proportions allocate whole trajectories, and complete trajectories are added until that minimum is reached. Metadata records requested proportions plus realized trajectory and transition counts and fractions.
 
 Generated datasets can mix clean expert, noisy expert, and random-action episodes. Pass `--composition CLEAN_EXPERT NOISY_EXPERT`; random data fills the remaining proportion. Repeat the argument to sweep specified compositions without taking a Cartesian product between their two values. `--noise-scale` applies only to the noisy expert component, while clean expert actions use zero noise. The default composition is `1 0`.
 
@@ -35,7 +35,7 @@ r_t + 0.99 r_(t+1) + ... + 0.99^(l-1) r_(t+l-1).
 
 Windows never cross episode boundaries. Following robomimic's n-step convention, a chunk's terminal and timeout flags are the corresponding `any` over its window; those signals do not redefine the stored episode boundary. The policy backup discount is `0.99^l`. Episodes shorter than `l` contribute no windows; conversion fails clearly if an entire split has no valid window.
 
-At execution time, all `l` predicted actions are applied open-loop. Execution stops early if the environment terminates or truncates, and reported episode returns remain the ordinary undiscounted sum of primitive rewards. Post-training stability horizons and saved rollout timesteps are measured in primitive environment steps. Learned-dynamics `--rollout-length`, dynamics mismatch, Jacobian mismatch, and OOD state-action samples operate at chunk decision boundaries, so one learned-dynamics step represents up to `l` primitive steps.
+At execution time, all `l` predicted actions are applied open-loop. Execution stops early if the environment terminates or truncates, and reported episode returns remain the ordinary undiscounted sum of primitive rewards. Post-training contraction horizons and saved rollout timesteps are measured in primitive environment steps. Learned-dynamics `--rollout-length` and OOD state-action samples operate at chunk decision boundaries, so one learned-dynamics step represents up to `l` primitive steps.
 
 ```bash
 python sweep.py \
@@ -83,11 +83,12 @@ python sweep.py \
 
 Every run saves policy checkpoints at approximately 0, 10, 20, ..., 100 percent of policy training. Milestones that fall in the same epoch are collapsed. Checkpoints live under `checkpoint/step_<gradient_step>/`; fixed model-based dynamics are stored once at step zero, while RAMBO saves its changing dynamics with each checkpoint.
 
-Passing `--eval` runs both final-policy evaluation and checkpoint-history evaluation before plotting. In addition to reward and the model-based next-state/Jacobian metrics, evaluation reports:
+Passing `--eval` evaluates each final policy, evaluates conservativity at every policy checkpoint, and then plots the selected sweep runs. Performance uses task-native units: success rate for Can and Lift, final fingertip-target distance for Reacher, balance duration for InvertedDoublePendulum, and forward displacement for HalfCheetah.
 
-- **Global stability:** trajectories from different reset states are phase-aligned by the offset minimizing second-half state distance. This alignment is an explicit heuristic for periodic motion.
-- **Local stability:** held-out states are paired with small perturbations in reconstructible `qpos/qvel` coordinates, without phase alignment.
-- **Empirical `(C, rho)`:** standardized distances are bounded at every observed timestep by `C * rho**t`. Values of `rho` are not constrained below one.
-- **State and state-action OOD ratios:** mean rollout-to-training k-nearest-neighbor distance divided by the corresponding held-out-to-training distance. A ratio near one means the rollout is about as far from training data as held-out data is.
+Final-policy contraction pairs deterministic rollouts from the same simulator state. One copy receives a fixed-norm perturbation only in controlled-agent `qpos/qvel`; goals and manipulated objects are unchanged. Distance is the unnormalized Euclidean distance over those same agent coordinates at each primitive timestep. Curves stop when either member terminates, with no phase alignment, fitted `(C, rho)`, or support-fraction report.
 
-Dynamics mismatch and finite-difference Jacobian mismatch are evaluated only for the final model. Reward, stability, and OOD metrics are evaluated at every saved policy checkpoint. Raw arrays are saved under the matching `evals/<environment>/<run-name>/<training-timestamp>/` directory, and plots for the runs selected by the current sweep are written under `evals/<environment>/plots/`.
+State and state-action OOD ratios are evaluated over checkpoints. Each is the mean rollout-to-training k-nearest-neighbor distance divided by the corresponding held-out-to-training distance, so a ratio near one means rollout samples are about as far from training data as held-out samples are.
+
+For Robomimic datasets, plots compare task performance and contraction curves across action chunk lengths. For generated datasets, plots compare them against the realized fraction of complete trajectories collected from the noisy expert. A fixed random fraction gives the clean-expert/noisy-expert ablation; zero clean-expert fraction gives the random/noisy-expert ablation. Checkpoint OOD plots remain separate. Raw arrays are saved under the matching `evals/<environment>/<run-name>/<training-timestamp>/` directory, and plots are written under `evals/<environment>/plots/`.
+
+The learned-dynamics and finite-difference Jacobian evaluation functions remain in `eval.py` for possible future use, but `--eval` does not invoke them or generate mismatch plots.

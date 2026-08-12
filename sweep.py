@@ -57,11 +57,11 @@ def parse_args() -> argparse.Namespace:
 
     generated = parser.add_argument_group("generated dataset options")
     generated.add_argument("--expert", default="/home/shekhe/stable-offline-rl/experts", help="Expert policy .zip path or directory containing <env>.zip; used only for generated expert data and expert evaluation")
-    generated.add_argument("--num-samples", type=int, nargs="+", default=[10000], help="Minimum generated transition counts to sweep over; collection finishes the episode that reaches each source target")
+    generated.add_argument("--num-samples", type=int, nargs="+", default=[10000], help="Minimum generated transition counts to sweep over; collection always retains complete trajectories")
     generated.add_argument("--noise-scale", type=float, nargs="+", default=[0.0], help="Gaussian action-noise scales applied to noisy expert actions in generated datasets")
     generated.add_argument(
         "--composition", type=float, nargs=2, action="append", metavar=("CLEAN_EXPERT", "NOISY_EXPERT"),
-        help="Generated-data clean and noisy expert proportions; repeat for multiple compositions, with random data filling the remainder (default: 1 0)",
+        help="Generated-data clean and noisy expert trajectory proportions; repeat for multiple compositions, with random trajectories filling the remainder (default: 1 0)",
     )
     generated.add_argument("--max-timesteps", type=int, default=1000, help="Maximum length of each generated rollout trajectory")
 
@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     )
     training.add_argument("--epoch", type=int, default=1000, help="Number of policy-training epochs")
     training.add_argument("--step-per-epoch", type=int, default=1000, help="Gradient-update steps per policy-training epoch")
-    training.add_argument("--batch-size", type=int, default=256, help="Policy-training batch size")
+    training.add_argument("--batch-size", type=int, default=512, help="Policy-training batch size")
 
     dql = parser.add_argument_group("DQL options")
     dql.add_argument("--dql-eta", type=float, default=None, help="Override the DQL Q-guidance loss weight; defaults to CleanDiffuser's locomotion value of 1")
@@ -85,22 +85,19 @@ def parse_args() -> argparse.Namespace:
 
     evaluation = parser.add_argument_group("post-training evaluation")
     evaluation.add_argument("--eval", action="store_true", help="After training, run full evaluation for each trained policy and then generate plots")
-    evaluation.add_argument("--eval-episodes", type=int, default=10, help="Number of true-environment episodes used to estimate post-training policy and expert returns")
-    evaluation.add_argument("--jacobian-samples", type=int, default=8, help="Number of dataset and rollout states used for finite-difference Jacobian metrics")
-    evaluation.add_argument("--fd-eps", type=float, default=1e-4, help="Central finite-difference perturbation size for Jacobian metrics")
-    evaluation.add_argument("--stability-trajectories", type=int, default=8, help="Number of global trajectories and local perturbed-state pairs")
-    evaluation.add_argument("--stability-horizon", type=int, default=300, help="Maximum primitive steps for global and local stability trajectories")
-    evaluation.add_argument("--global-max-offset", type=int, default=30, help="Maximum primitive-step offset for global trajectory phase alignment")
-    evaluation.add_argument("--local-perturbation-scale", type=float, default=0.01, help="Local perturbation norm in standardized physical-state coordinates")
+    evaluation.add_argument("--eval-episodes", type=int, default=10, help="Number of true-environment episodes used to estimate final and checkpoint policy performance; also used for generated-data expert evaluation")
+    evaluation.add_argument("--contraction-trajectories", type=int, default=8, help="Number of matched unperturbed and agent-state-perturbed final-policy trajectory pairs")
+    evaluation.add_argument("--contraction-horizon", type=int, default=300, help="Maximum primitive steps in each final-policy contraction trajectory")
+    evaluation.add_argument("--perturbation-scale", type=float, default=0.01, help="Euclidean norm of the initial perturbation applied to controlled-agent qpos/qvel coordinates")
     evaluation.add_argument("--ood-samples", type=int, default=10000, help="Maximum held-out and policy decision-boundary samples used for OOD metrics")
 
     model_based = parser.add_argument_group("model-based algorithm options")
-    model_based.add_argument("--dynamics-max-epochs", type=int, default=5, help="Maximum epochs for fitting the learned dynamics model before policy training")
+    model_based.add_argument("--dynamics-max-epochs", type=int, default=30, help="Maximum epochs for fitting the learned dynamics model before policy training")
     model_based.add_argument("--rollout-freq", type=int, default=1000, help="Policy-training step interval between learned-dynamics rollout generation")
     model_based.add_argument("--rollout-batch-size", type=int, default=10000, help="Number of initial real states used when generating model rollouts")
     model_based.add_argument("--rollout-length", type=int, default=1, help="Number of learned macro-transitions per synthetic rollout")
     model_based.add_argument("--model-retain-epochs", type=int, default=5, help="How many epochs of synthetic model rollouts to retain in the fake replay buffer")
-    model_based.add_argument("--real-ratio", type=float, default=0.05, help="Fraction of each model-based training batch sampled from the real offline dataset rather than the synthetic rollout buffer")
+    model_based.add_argument("--real-ratio", type=float, default=0.50, help="Fraction of each model-based training batch sampled from the real offline dataset rather than the synthetic rollout buffer")
     model_based.add_argument("--dynamics-update-freq", type=int, default=1000, help="RAMBO dynamics-adversary update interval; ignored by other model-based algorithms")
     model_based.add_argument("--adv-batch-size", type=int, default=256, help="RAMBO adversarial dynamics rollout batch size")
     model_based.add_argument("--adv-weight", type=float, default=3e-4, help="RAMBO adversarial dynamics loss weight")
@@ -120,6 +117,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--algos none cannot be combined with training algorithms")
     if args.dataset is not None and args.dataset_source == "generated":
         parser.error("--dataset applies only to minari and robomimic dataset sources")
+    if args.eval_episodes <= 0 or args.contraction_trajectories <= 0 or args.contraction_horizon <= 0:
+        parser.error("evaluation episode, trajectory, and horizon counts must be positive")
+    if args.perturbation_scale < 0.0:
+        parser.error("--perturbation-scale must be nonnegative")
     return args
 
 
@@ -462,12 +463,9 @@ def maybe_evaluate(run_dir: Path, args: argparse.Namespace) -> Path | None:
             eval_episodes=args.eval_episodes,
             expert=args.expert,
             seed=args.seed,
-            jacobian_samples=args.jacobian_samples,
-            fd_eps=args.fd_eps,
-            stability_trajectories=args.stability_trajectories,
-            stability_horizon=args.stability_horizon,
-            global_max_offset=args.global_max_offset,
-            local_perturbation_scale=args.local_perturbation_scale,
+            contraction_trajectories=args.contraction_trajectories,
+            contraction_horizon=args.contraction_horizon,
+            perturbation_scale=args.perturbation_scale,
             ood_samples=args.ood_samples,
         ),
     )

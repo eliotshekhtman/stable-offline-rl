@@ -1,10 +1,9 @@
 # Tasks:
 # - Load completed sweep runs from run manifests and evaluation result files.
-# - Plot generated-dataset reward ablations when exactly one generated axis varies.
-# - Plot Minari reward bars without implying a numeric ablation.
-# - Plot run-level dynamics mismatch ratios against learned policy reward.
-# - Keep algorithms with different action chunk lengths visually distinct.
-# - Plot stability and conservativity over policy-training checkpoints.
+# - Plot task performance and agent-state contraction against action chunk length.
+# - Plot task performance and contraction against generated noisy-trajectory fractions.
+# - Plot state and state-action conservativity over policy-training checkpoints.
+# - Retain dormant learned-dynamics mismatch plotting for future use.
 
 import argparse
 import json
@@ -15,8 +14,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-DATASET_ORDER = ("simple", "medium", "expert")
-ROBOMIMIC_DATASET_ORDER = ("ph", "mh", "mg_sparse", "mg_dense", "paired")
 EPS = 1e-12
 
 
@@ -47,9 +44,7 @@ def plot_root(root: Path, out: Path | None = None, eval_dirs: list[Path] | None 
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)
-    plot_generated_reward_ablation(rows, out)
-    plot_minari_reward_bars(rows, out)
-    plot_robomimic_reward_bars(rows, out)
+    plot_generated_ablation(rows, out)
 
     dataset_tags = sorted({row["dataset_tag"] for row in rows} | {history["dataset_tag"] for history in histories})
     for dataset_tag in dataset_tags:
@@ -57,9 +52,8 @@ def plot_root(root: Path, out: Path | None = None, eval_dirs: list[Path] | None 
         dataset_out.mkdir(exist_ok=True)
         dataset_rows = [row for row in rows if row["dataset_tag"] == dataset_tag]
         dataset_histories = [history for history in histories if history["dataset_tag"] == dataset_tag]
-        plot_final_policy_returns(dataset_rows, dataset_out)
-        plot_stability_distances(dataset_rows, dataset_out)
-        plot_mismatch_ratios(dataset_rows, dataset_out)
+        plot_performance_vs_chunk_length(dataset_rows, dataset_out)
+        plot_contraction_vs_chunk_length(dataset_rows, dataset_out)
         plot_history_relationships(dataset_histories, dataset_out)
         plot_training_histories(dataset_histories, dataset_out)
 
@@ -106,7 +100,10 @@ def dataset_fields(metadata: dict) -> dict:
         "dataset_source": "generated",
         "num_samples": dataset_schema["num_samples"],
         "noise_scale": dataset_schema["noise_scale"],
-        "prop_expert": dataset_schema["prop_expert"],
+        "requested_prop_clean_expert": dataset_schema["prop_clean_expert"],
+        "requested_prop_noisy_expert": dataset_schema["prop_noisy_expert"],
+        "requested_prop_random": dataset_schema["prop_random"],
+        "noisy_trajectory_fraction": metadata["actual_prop_noisy_expert_trajectories"],
     }
 
 
@@ -126,193 +123,122 @@ def policy_label(record: dict) -> str:
     return f"{record['algo']} (l={record['chunk_length']})"
 
 
-def plot_final_policy_returns(rows: list[dict], out: Path) -> None:
-    if not rows:
+def plot_performance_vs_chunk_length(rows: list[dict], out: Path) -> None:
+    if len({row["chunk_length"] for row in rows}) < 2:
         return
 
-    labels = sorted({row["label"] for row in rows})
-    returns = [
-        np.mean([row["policy_return_mean"] for row in rows if row["label"] == label])
-        for label in labels
-    ]
-    fig, ax = plt.subplots(figsize=(max(7, 1.2 * len(labels)), 5))
-    ax.bar(labels, returns)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for algo in sorted({row["algo"] for row in rows}):
+        algo_rows = sorted((row for row in rows if row["algo"] == algo), key=lambda row: row["chunk_length"])
+        ax.plot(
+            [row["chunk_length"] for row in algo_rows],
+            [row["policy_performance_mean"] for row in algo_rows],
+            marker="o",
+            label=algo,
+        )
     ax.axhline(
-        np.mean([row["expert_return_mean"] for row in rows]),
-        color="black",
-        linestyle=":",
-        label="expert",
+        np.mean([row["expert_performance_mean"] for row in rows]),
+        color="black", linestyle=":", label="expert",
     )
-    ax.set_ylabel("policy return")
-    ax.set_title("Final policy return by algorithm and chunk length")
-    ax.tick_params(axis="x", rotation=30)
+    ax.set_xlabel("action chunk length")
+    ax.set_ylabel(rows[0]["performance_label"])
+    ax.set_title(f"Final-policy {rows[0]['performance_label']} vs action chunk length")
     ax.legend()
     fig.tight_layout()
-    fig.savefig(out / "final_policy_returns.png", dpi=200)
+    fig.savefig(out / "performance_vs_chunk_length.png", dpi=200)
     plt.close(fig)
 
 
-def plot_generated_reward_ablation(rows: list[dict], out: Path) -> None:
+def plot_contraction_vs_chunk_length(rows: list[dict], out: Path) -> None:
+    if len({row["chunk_length"] for row in rows}) < 2:
+        return
+    contraction_curve_plot(
+        rows, "chunk_length", "chunk length",
+        "Final-policy contraction by action chunk length",
+        out / "contraction_vs_chunk_length.png",
+    )
+
+
+def plot_generated_ablation(rows: list[dict], out: Path) -> None:
     generated = [row for row in rows if row["dataset_source"] == "generated"]
-    if not generated:
+    if not generated or len({row["noisy_trajectory_fraction"] for row in generated}) < 2:
+        return
+    fixed = ("num_samples", "noise_scale", "chunk_length")
+    if any(len({row[key] for row in generated}) > 1 for key in fixed):
+        print("Skipping generated composition plots: sample count, noise scale, and chunk length must be fixed.")
         return
 
-    axes = ("num_samples", "noise_scale", "prop_expert")
-    varying = [axis for axis in axes if len({row[axis] for row in generated}) > 1]
-    if len(varying) != 1:
-        print(f"Skipping generated reward ablation: expected one varying axis, found {varying}.")
+    if all(row["requested_prop_clean_expert"] == 0.0 for row in generated):
+        family = "random_noisy"
+        title = "Random/noisy trajectory ablation"
+    elif len({row["requested_prop_random"] for row in generated}) == 1:
+        family = "expert_noisy"
+        title = "Clean-expert/noisy-expert trajectory ablation"
+    else:
+        print("Skipping generated composition plots: rows do not form one requested composition ablation.")
         return
 
-    axis = varying[0]
+    experiment_out = out / family
+    experiment_out.mkdir(exist_ok=True)
+    performance_ablation_plot(generated, title, experiment_out / "performance_vs_noisy_fraction.png")
+    contraction_curve_plot(
+        generated, "noisy_trajectory_fraction", "noisy trajectory fraction",
+        title, experiment_out / "contraction_vs_noisy_fraction.png",
+    )
+
+
+def performance_ablation_plot(rows: list[dict], title: str, path: Path) -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
-    for label in sorted({row["label"] for row in generated}):
-        policy_rows = sorted(
-            (row for row in generated if row["label"] == label),
-            key=lambda row: row[axis],
+    for algo in sorted({row["algo"] for row in rows}):
+        algo_rows = sorted(
+            (row for row in rows if row["algo"] == algo),
+            key=lambda row: row["noisy_trajectory_fraction"],
         )
         ax.plot(
-            [row[axis] for row in policy_rows],
-            [row["policy_return_mean"] for row in policy_rows],
-            marker="o",
-            label=label,
+            [row["noisy_trajectory_fraction"] for row in algo_rows],
+            [row["policy_performance_mean"] for row in algo_rows],
+            marker="o", label=algo,
         )
-
-    ax.axhline(np.mean([row["expert_return_mean"] for row in generated]), color="black", linestyle=":", label="expert")
-    ax.set_xlabel(axis.replace("_", " "))
-    ax.set_ylabel("policy return")
-    ax.set_title(f"Generated dataset ablation: {axis.replace('_', ' ')}")
+    ax.axhline(
+        np.mean([row["expert_performance_mean"] for row in rows]),
+        color="black", linestyle=":", label="expert",
+    )
+    ax.set_xlim(-0.02, 1.02)
+    ax.set_xlabel("fraction of trajectories collected from the noisy expert")
+    ax.set_ylabel(rows[0]["performance_label"])
+    ax.set_title(f"{rows[0]['performance_label'].capitalize()}\n{title}")
     ax.legend()
     fig.tight_layout()
-    fig.savefig(out / f"generated_reward_vs_{axis}.png", dpi=200)
+    fig.savefig(path, dpi=200)
     plt.close(fig)
 
 
-def plot_minari_reward_bars(rows: list[dict], out: Path) -> None:
-    minari = [row for row in rows if row["dataset_source"] == "minari"]
-    if not minari:
-        return
-
-    datasets = [name for name in DATASET_ORDER if any(row["minari_dataset"] == name for row in minari)]
-    labels = sorted({row["label"] for row in minari})
-    width = 0.8 / len(labels)
-    x = np.arange(len(datasets))
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    for label_index, label in enumerate(labels):
-        values = []
-        for dataset in datasets:
-            matching = [
-                row["policy_return_mean"] for row in minari
-                if row["label"] == label and row["minari_dataset"] == dataset
-            ]
-            values.append(np.mean(matching) if matching else np.nan)
-        ax.bar(
-            x + (label_index - (len(labels) - 1) / 2) * width,
-            values,
-            width=width,
-            label=label,
-        )
-
-    ax.axhline(np.mean([row["expert_return_mean"] for row in minari]), color="black", linestyle=":", label="expert")
-    ax.set_xticks(x)
-    ax.set_xticklabels(datasets)
-    ax.set_xlabel("Minari dataset")
-    ax.set_ylabel("policy return")
-    ax.set_title("Policy reward by Minari dataset")
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(out / "minari_reward_by_dataset.png", dpi=200)
-    plt.close(fig)
-
-
-def plot_robomimic_reward_bars(rows: list[dict], out: Path) -> None:
-    robomimic = [row for row in rows if row["dataset_source"] == "robomimic"]
-    if not robomimic:
-        return
-
-    datasets = [name for name in ROBOMIMIC_DATASET_ORDER if any(row["robomimic_dataset"] == name for row in robomimic)]
-    labels = sorted({row["label"] for row in robomimic})
-    width = 0.8 / len(labels)
-    x = np.arange(len(datasets))
-
-    fig, ax = plt.subplots(figsize=(9, 5))
-    for label_index, label in enumerate(labels):
-        values = []
-        for dataset in datasets:
-            matching = [
-                row["policy_return_mean"] for row in robomimic
-                if row["label"] == label and row["robomimic_dataset"] == dataset
-            ]
-            values.append(np.mean(matching) if matching else np.nan)
-        ax.bar(
-            x + (label_index - (len(labels) - 1) / 2) * width,
-            values,
-            width=width,
-            label=label,
-        )
-
-    ax.axhline(np.mean([row["expert_return_mean"] for row in robomimic]), color="black", linestyle=":", label="PH return")
-    ax.set_xticks(x)
-    ax.set_xticklabels(datasets)
-    ax.set_xlabel("robomimic dataset")
-    ax.set_ylabel("policy return")
-    ax.set_title("Policy reward by robomimic dataset")
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(out / "robomimic_reward_by_dataset.png", dpi=200)
-    plt.close(fig)
-
-
-def plot_stability_distances(rows: list[dict], out: Path) -> None:
-    stability_distance_plot(rows, out, "global")
-    stability_distance_plot(rows, out, "local")
-
-
-def stability_distance_plot(rows: list[dict], out: Path, stability_type: str) -> None:
-    filename = f"{stability_type}_stability.npz"
-    available = [row for row in rows if (Path(row["eval_dir"]) / filename).exists()]
+def contraction_curve_plot(
+    rows: list[dict],
+    value_key: str,
+    value_label: str,
+    title: str,
+    path: Path,
+) -> None:
+    available = [row for row in rows if (Path(row["eval_dir"]) / "contraction.npz").exists()]
     if not available:
         return
-
-    available.sort(key=lambda row: row["label"])
-    fig, axes = plt.subplots(
-        2, len(available), figsize=(4 * len(available), 7),
-        squeeze=False, sharex="col",
-    )
-    for column, row in enumerate(available):
-        with np.load(Path(row["eval_dir"]) / filename) as data:
-            curves = data["distance_curves"]
-            envelope = data["envelope"]
-            support = data["support"]
-            c = float(data["c"])
-            rho = float(data["rho"])
-
-        normalized = curves / np.maximum(curves[:, :1], EPS)
-        normalized[normalized <= 0.0] = np.nan
-        timesteps = np.arange(len(envelope))
-        bound = c * rho**timesteps
-        bound[bound <= 0.0] = np.nan
-
-        distance_axis = axes[0, column]
-        pair_lines = distance_axis.plot(normalized.T, color="tab:blue", alpha=0.2, linewidth=0.7)
-        pair_lines[0].set_label("trajectory pairs")
-        distance_axis.plot(envelope, color="tab:red", linewidth=2, label="maximum envelope")
-        distance_axis.plot(bound, color="black", linestyle="--", linewidth=1.5, label=r"tight $C\rho^t$ upper bound")
-        distance_axis.axhline(1.0, color="gray", linestyle=":", label="initial distance")
-        distance_axis.set_yscale("log")
-        distance_axis.set_title(f"{row['label']}\nC={c:.3g}, rho={rho:.6g}")
-
-        support_axis = axes[1, column]
-        support_axis.plot(support / support[0], color="tab:purple", linewidth=2)
-        support_axis.set_ylim(-0.02, 1.02)
-        support_axis.set_xlabel("timestep")
-
-    axes[0, 0].set_ylabel("normalized state distance")
-    axes[1, 0].set_ylabel("pair support fraction")
-    axes[0, 0].legend(fontsize=8)
-    fig.suptitle(f"{stability_type.capitalize()} final-policy stability distances")
+    algorithms = sorted({row["algo"] for row in available})
+    fig, axes = plt.subplots(1, len(algorithms), figsize=(5 * len(algorithms), 4), squeeze=False)
+    for axis, algo in zip(axes[0], algorithms):
+        for row in sorted(
+            (row for row in available if row["algo"] == algo), key=lambda row: row[value_key]
+        ):
+            with np.load(Path(row["eval_dir"]) / "contraction.npz") as data:
+                mean_curve = np.nanmean(data["distance_curves"], axis=0)
+            axis.plot(mean_curve, label=f"{value_label}={row[value_key]:g}")
+        axis.set_title(algo)
+        axis.set_xlabel("primitive timestep")
+        axis.legend(fontsize=8)
+    axes[0, 0].set_ylabel("agent-state distance")
+    fig.suptitle(title)
     fig.tight_layout()
-    fig.savefig(out / f"{stability_type}_stability_distances.png", dpi=200)
+    fig.savefig(path, dpi=200)
     plt.close(fig)
 
 
@@ -373,34 +299,24 @@ def plot_history_relationships(histories: list[dict], out: Path) -> None:
         return
 
     history_relationship_plot(
-        histories, "global_stability_rho", "global_stability_c",
-        "global empirical rho", out / "global_stability_vs_reward.png", reference_x=1.0,
+        histories, "state_ood_ratio", "state OOD ratio",
+        out / "state_ood_vs_performance.png",
     )
     history_relationship_plot(
-        histories, "local_stability_rho", "local_stability_c",
-        "local empirical rho", out / "local_stability_vs_reward.png", reference_x=1.0,
-    )
-    history_relationship_plot(
-        histories, "state_ood_ratio", None,
-        "state OOD ratio", out / "state_ood_vs_reward.png", reference_x=1.0,
-    )
-    history_relationship_plot(
-        histories, "state_action_ood_ratio", None,
-        "state-action OOD ratio", out / "state_action_ood_vs_reward.png", reference_x=1.0,
+        histories, "state_action_ood_ratio", "state-action OOD ratio",
+        out / "state_action_ood_vs_performance.png",
     )
 
 
 def history_relationship_plot(
     histories: list[dict],
     x_key: str,
-    c_key: str | None,
     xlabel: str,
     path: Path,
-    reference_x: float | None = None,
 ) -> None:
     histories = [
         history for history in histories
-        if history["records"] and x_key in history["records"][0] and (c_key is None or c_key in history["records"][0])
+        if history["records"] and x_key in history["records"][0]
     ]
     if not histories:
         return
@@ -411,19 +327,18 @@ def history_relationship_plot(
     for history in histories:
         records = history["records"]
         x = np.asarray([record[x_key] for record in records])
-        reward = np.asarray([record["policy_return_mean"] for record in records])
+        performance = np.asarray([record["policy_performance_mean"] for record in records])
         percent = np.asarray([record["actual_percent"] for record in records])
-        sizes = 35 if c_key is None else 25 + 20 * np.log1p([record[c_key] for record in records])
-        ax.plot(x, reward, linewidth=1, alpha=0.7, label=history["label"])
-        ax.scatter(x, reward, c=percent, s=sizes, cmap=color_map, norm=color_scale)
+        ax.plot(x, performance, linewidth=1, alpha=0.7, label=history["label"])
+        ax.scatter(x, performance, c=percent, s=35, cmap=color_map, norm=color_scale)
 
-    if reference_x is not None:
-        ax.axvline(reference_x, color="gray", linestyle=":", label=f"{xlabel} = 1")
-    ax.axhline(np.mean([history["expert_return_mean"] for history in histories]), color="black", linestyle=":", label="expert return")
+    ax.axvline(1.0, color="gray", linestyle=":", label=f"{xlabel} = 1")
+    ax.axhline(
+        np.mean([history["expert_performance_mean"] for history in histories]),
+        color="black", linestyle=":", label="expert",
+    )
     ax.set_xlabel(xlabel)
-    ax.set_ylabel("policy return")
-    if c_key is not None:
-        ax.set_title("Marker size scales with log(1 + C)")
+    ax.set_ylabel(histories[0]["performance_label"])
     ax.legend(fontsize=8)
     fig.colorbar(plt.cm.ScalarMappable(norm=color_scale, cmap=color_map), ax=ax, label="training completed (%)")
     fig.tight_layout()
@@ -435,16 +350,6 @@ def plot_training_histories(histories: list[dict], out: Path) -> None:
     if not histories:
         return
 
-    history_line_plot(
-        histories, ("policy_return_mean",), ("policy return",),
-        out / "reward_vs_training_percent.png",
-    )
-    history_line_plot(
-        histories,
-        ("global_stability_rho", "local_stability_rho", "global_stability_c", "local_stability_c"),
-        ("global rho", "local rho", "global C", "local C"),
-        out / "stability_vs_training_percent.png",
-    )
     history_line_plot(
         histories, ("state_ood_ratio", "state_action_ood_ratio"),
         ("state OOD", "state-action OOD"), out / "ood_vs_training_percent.png",
@@ -466,7 +371,7 @@ def history_line_plot(histories: list[dict], keys: tuple[str, ...], names: tuple
                 marker="o",
                 label=history["label"],
             )
-        if key.endswith("_rho") or key.endswith("_ood_ratio"):
+        if key.endswith("_ood_ratio"):
             axis.axhline(1.0, color="gray", linestyle=":")
         axis.set_ylabel(name)
     axes[0, 0].legend(fontsize=8)

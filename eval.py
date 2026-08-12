@@ -2,9 +2,9 @@
 # - Reload trained OfflineRL-Kit runs from their run_manifest.json files.
 # - Evaluate learned policies and configured expert policies in the true environment.
 # - Execute learned action chunks open-loop while retaining primitive-step metrics.
-# - For model-based runs, evaluate learned macro next-state prediction MSE on held-out data.
-# - For model-based runs, evaluate learned macro next-state prediction MSE along policy rollouts.
-# - Measure empirical global/local trajectory convergence and dataset conservativity.
+# - Measure final-policy contraction after perturbing only controlled-agent coordinates.
+# - Measure policy conservativity over training checkpoints.
+# - Retain dormant learned-dynamics and Jacobian evaluation implementations for future use.
 
 import argparse
 import json
@@ -12,6 +12,7 @@ import shutil
 from pathlib import Path
 
 import gymnasium as gym
+import h5py
 import mujoco
 import numpy as np
 import torch
@@ -34,24 +35,24 @@ def parse_args() -> argparse.Namespace:
 
     run = parser.add_argument_group("run")
     run.add_argument("--run-dir", type=Path, required=True, help="Directory containing run_manifest.json and the trained model files")
-    run.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Torch device used to reload the trained policy and dynamics")
-    run.add_argument("--seed", type=int, default=0, help="Random seed for evaluation rollouts and sampled Jacobian states")
-    run.add_argument("--expert", default=None, help="Expert policy .zip path or directory containing <env>.zip; defaults to the expert recorded during training")
+    run.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Torch device used to reload the trained policy")
+    run.add_argument("--seed", type=int, default=0, help="Random seed for evaluation rollouts, perturbations, and OOD sampling")
+    run.add_argument("--expert", default=None, help="Expert policy .zip path or directory containing <env>.zip for Gymnasium tasks; Robomimic uses its PH dataset as the expert baseline")
 
     rollout_eval = parser.add_argument_group("rollout evaluation")
-    rollout_eval.add_argument("--eval-episodes", type=int, default=10, help="Number of true-environment episodes used to estimate policy and expert returns")
+    rollout_eval.add_argument("--eval-episodes", type=int, default=10, help="Number of true-environment episodes used to estimate policy performance and Gymnasium expert performance")
 
-    jacobian_eval = parser.add_argument_group("model-based jacobian evaluation")
-    jacobian_eval.add_argument("--jacobian-samples", type=int, default=8, help="Number of held-out dataset states and policy-rollout states used for finite-difference Jacobian evaluation")
-    jacobian_eval.add_argument("--fd-eps", type=float, default=1e-4, help="Central finite-difference perturbation size for closed-loop Jacobian estimates")
-
-    stability = parser.add_argument_group("stability and conservativity evaluation")
-    stability.add_argument("--stability-trajectories", type=int, default=8, help="Number of global trajectories and local perturbed-state pairs used for stability metrics")
-    stability.add_argument("--stability-horizon", type=int, default=300, help="Maximum primitive environment steps used for each global and local stability trajectory")
-    stability.add_argument("--global-max-offset", type=int, default=30, help="Largest primitive-step offset considered when phase-aligning global trajectories")
-    stability.add_argument("--local-perturbation-scale", type=float, default=0.01, help="Initial local-state perturbation norm in training-standardized physical-state coordinates")
-    stability.add_argument("--ood-samples", type=int, default=10000, help="Maximum held-out and policy decision-boundary samples used for state and state-action OOD metrics")
-    return parser.parse_args()
+    behavior = parser.add_argument_group("contraction and conservativity evaluation")
+    behavior.add_argument("--contraction-trajectories", type=int, default=8, help="Number of matched unperturbed and agent-state-perturbed trajectory pairs")
+    behavior.add_argument("--contraction-horizon", type=int, default=300, help="Maximum primitive steps in each contraction trajectory")
+    behavior.add_argument("--perturbation-scale", type=float, default=0.01, help="Euclidean norm of the initial perturbation applied to controlled-agent qpos/qvel coordinates")
+    behavior.add_argument("--ood-samples", type=int, default=10000, help="Maximum held-out and policy decision-boundary samples used for OOD metrics")
+    args = parser.parse_args()
+    if args.eval_episodes <= 0 or args.contraction_trajectories <= 0 or args.contraction_horizon <= 0:
+        parser.error("evaluation episode, trajectory, and horizon counts must be positive")
+    if args.perturbation_scale < 0.0:
+        parser.error("--perturbation-scale must be nonnegative")
+    return args
 
 
 def evaluate_run(run_dir: Path, args: argparse.Namespace) -> Path:
@@ -76,16 +77,23 @@ def evaluate_run(run_dir: Path, args: argparse.Namespace) -> Path:
         manifest["chunk_length"],
         manifest["base_discount"],
     )
-    policy, dynamics, obs_mean, obs_std = load_policy_and_dynamics(
+    policy, _, _, _ = load_policy_and_dynamics(
         manifest,
         args.device,
         Path(manifest["model_dir"]) / "policy.pth",
-        Path(manifest["model_dir"]) if manifest["algo"] in MODEL_BASED_ALGOS else None,
+        None,
         train_dataset,
     )
-    rollout_info, global_stability, local_stability, conservativity = evaluate_policy_behavior(
-        policy, manifest, train_dataset, test_dataset, args,
-        dynamics=dynamics, obs_mean=obs_mean, obs_std=obs_std,
+    rollout_info = evaluate_policy_rollouts(
+        policy, manifest, args.eval_episodes, args.seed
+    )
+    contraction = evaluate_contraction(
+        policy, manifest, args.contraction_trajectories,
+        args.contraction_horizon, args.perturbation_scale, args.seed,
+    )
+    conservativity = evaluate_conservativity(
+        train_dataset, test_dataset, rollout_info["decision_observations"],
+        rollout_info["action_chunks"], args.ood_samples, args.seed,
     )
     expert_info = evaluate_expert(manifest, args.eval_episodes, args.seed)
 
@@ -100,12 +108,9 @@ def evaluate_run(run_dir: Path, args: argparse.Namespace) -> Path:
             "eval_episodes": args.eval_episodes,
             "expert": manifest["expert"],
             "seed": args.seed,
-            "jacobian_samples": args.jacobian_samples,
-            "fd_eps": args.fd_eps,
-            "stability_trajectories": args.stability_trajectories,
-            "stability_horizon_primitive_steps": args.stability_horizon,
-            "global_max_offset_primitive_steps": args.global_max_offset,
-            "local_perturbation_scale": args.local_perturbation_scale,
+            "contraction_trajectories": args.contraction_trajectories,
+            "contraction_horizon_primitive_steps": args.contraction_horizon,
+            "perturbation_scale": args.perturbation_scale,
             "ood_samples": args.ood_samples,
         },
         "env_name": manifest["env_name"],
@@ -115,79 +120,33 @@ def evaluate_run(run_dir: Path, args: argparse.Namespace) -> Path:
         "base_discount": manifest["base_discount"],
         "macro_discount": manifest["macro_discount"],
         "rollout_timestep_unit": "primitive_step",
-        "stability_timestep_unit": "primitive_step",
+        "contraction_timestep_unit": "primitive_step",
         "policy_return_mean": float(np.mean(rollout_info["returns"])),
         "policy_return_std": float(np.std(rollout_info["returns"])),
+        "performance_metric": rollout_info["performance_metric"],
+        "performance_label": rollout_info["performance_label"],
+        "performance_higher_is_better": rollout_info["performance_higher_is_better"],
+        "policy_performance_mean": float(np.mean(rollout_info["performance"])),
+        "policy_performance_std": float(np.std(rollout_info["performance"])),
         "expert_return_mean": expert_info["return_mean"],
         "expert_return_std": expert_info["return_std"],
+        "expert_performance_mean": expert_info["performance_mean"],
+        "expert_performance_std": expert_info["performance_std"],
     }
     np.savez_compressed(
         eval_dir / "returns.npz",
         policy_episode_returns=rollout_info["returns"],
         expert_episode_returns=expert_info["returns"],
+        policy_episode_performance=rollout_info["performance"],
+        expert_episode_performance=expert_info["performance"],
     )
 
-    np.savez_compressed(eval_dir / "global_stability.npz", **global_stability)
+    np.savez_compressed(eval_dir / "contraction.npz", **contraction)
     np.savez_compressed(eval_dir / "conservativity.npz", **conservativity)
     results.update(
-        global_stability_c=float(global_stability["c"]),
-        global_stability_rho=float(global_stability["rho"]),
         state_ood_ratio=float(conservativity["state_ood_ratio"]),
         state_action_ood_ratio=float(conservativity["state_action_ood_ratio"]),
     )
-    if local_stability is not None:
-        np.savez_compressed(eval_dir / "local_stability.npz", **local_stability)
-        results.update(
-            local_stability_c=float(local_stability["c"]),
-            local_stability_rho=float(local_stability["rho"]),
-        )
-
-    if dynamics is not None:
-        dataset_errors = evaluate_dynamics_on_dataset(
-            dynamics=dynamics,
-            dataset=test_dataset,
-            obs_mean=obs_mean,
-            obs_std=obs_std,
-        )
-        np.savez_compressed(eval_dir / "dynamics_dataset.npz", next_obs_mse=dataset_errors)
-        np.savez_compressed(
-            eval_dir / "dynamics_rollout.npz",
-            next_obs_mse=rollout_info["next_obs_mse"],
-            episode_ids=rollout_info["dynamics_episode_ids"],
-            primitive_timesteps=rollout_info["dynamics_primitive_timesteps"],
-        )
-        results["dynamics_horizon_primitive_steps"] = manifest["chunk_length"]
-        results["dataset_next_obs_mse"] = float(np.mean(dataset_errors))
-        results["rollout_next_obs_mse"] = float(np.mean(rollout_info["next_obs_mse"]))
-        if manifest["dataset_source"] != "robomimic":
-            dataset_jacobians = evaluate_jacobians_on_observations(
-                policy=policy,
-                dynamics=dynamics,
-                env_name=manifest["env_name"],
-                observations=test_dataset["observations"],
-                sample_count=args.jacobian_samples,
-                seed=args.seed,
-                fd_eps=args.fd_eps,
-                chunk_length=manifest["chunk_length"],
-                obs_mean=obs_mean,
-                obs_std=obs_std,
-            )
-            rollout_jacobians = evaluate_jacobians_on_observations(
-                policy=policy,
-                dynamics=dynamics,
-                env_name=manifest["env_name"],
-                observations=rollout_info["dynamics_observations"],
-                sample_count=args.jacobian_samples,
-                seed=args.seed,
-                fd_eps=args.fd_eps,
-                chunk_length=manifest["chunk_length"],
-                obs_mean=obs_mean,
-                obs_std=obs_std,
-            )
-            np.savez_compressed(eval_dir / "jacobian_dataset.npz", **dataset_jacobians)
-            np.savez_compressed(eval_dir / "jacobian_rollout.npz", **rollout_jacobians)
-            results["dataset_closed_loop_jacobian_mse"] = float(np.mean(dataset_jacobians["closed_loop_jacobian_mse"]))
-            results["rollout_closed_loop_jacobian_mse"] = float(np.mean(rollout_jacobians["closed_loop_jacobian_mse"]))
 
     with (eval_dir / "results.json").open("w", encoding="utf-8") as file:
         json.dump(results, file, indent=2, sort_keys=True)
@@ -222,7 +181,8 @@ def load_policy_and_dynamics(
             manifest["algo"], env, build_args, discount=manifest["macro_discount"],
             obs_mean=obs_mean, obs_std=obs_std,
         )
-        dynamics.load(str(dynamics_path))
+        if dynamics_path is not None:
+            dynamics.load(str(dynamics_path))
     else:
         dql_config = manifest["dql_config"] if manifest["algo"] == "dql" else None
         policy, _ = build_model_free_policy(
@@ -237,41 +197,10 @@ def load_policy_and_dynamics(
     return policy, dynamics, obs_mean, obs_std
 
 
-def evaluate_policy_behavior(
-    policy,
-    manifest: dict,
-    train_dataset: dict[str, np.ndarray],
-    test_dataset: dict[str, np.ndarray],
-    args: argparse.Namespace,
-    dynamics=None,
-    obs_mean: np.ndarray | None = None,
-    obs_std: np.ndarray | None = None,
-):
-    rollout_info = evaluate_policy_rollouts(
-        policy, manifest, args.eval_episodes, args.seed,
-        dynamics=dynamics, obs_mean=obs_mean, obs_std=obs_std,
-    )
-    global_stability = evaluate_global_stability(
-        policy, manifest, train_dataset, args.stability_trajectories,
-        args.stability_horizon, args.global_max_offset, args.seed,
-    )
-    local_stability = None
-    if manifest["dataset_source"] != "robomimic":
-        local_stability = evaluate_local_stability(
-            policy, manifest["env_name"], train_dataset, test_dataset,
-            args.stability_trajectories, args.stability_horizon,
-            args.local_perturbation_scale, args.seed, manifest["chunk_length"],
-        )
-    conservativity = evaluate_conservativity(
-        train_dataset, test_dataset, rollout_info["decision_observations"],
-        rollout_info["action_chunks"], args.ood_samples, args.seed,
-    )
-    return rollout_info, global_stability, local_stability, conservativity
-
-
 def make_eval_env(manifest: dict):
     if manifest["dataset_source"] == "robomimic":
         metadata = load_offline.load_metadata(manifest["dataset_metadata_path"])
+        metadata["env_args"]["env_kwargs"]["reward_shaping"] = False
         return load_offline.make_robomimic_env(metadata)
     return gym.make(manifest["env_name"])
 
@@ -294,16 +223,15 @@ def evaluate_history(
     manifest: dict,
     train_dataset: dict[str, np.ndarray],
     test_dataset: dict[str, np.ndarray],
-    expert_info: dict[str, np.ndarray],
+    expert_info: dict,
     eval_dir: Path,
     args: argparse.Namespace,
 ) -> None:
     records = []
     first_checkpoint = manifest["checkpoints"][0]
-    first_dynamics_path = Path(first_checkpoint["dynamics_path"]) if "dynamics_path" in first_checkpoint else None
-    policy, dynamics, _, _ = load_policy_and_dynamics(
+    policy, _, _, _ = load_policy_and_dynamics(
         manifest, args.device, Path(first_checkpoint["policy_path"]),
-        first_dynamics_path, train_dataset,
+        None, train_dataset,
     )
     for checkpoint_index, checkpoint in enumerate(manifest["checkpoints"]):
         seed_policy_randomness(args.seed)
@@ -311,11 +239,13 @@ def evaluate_history(
             policy.load_state_dict(
                 torch.load(Path(checkpoint["policy_path"]), map_location=args.device, weights_only=True)
             )
-            if dynamics is not None:
-                dynamics.load(checkpoint["dynamics_path"])
             policy.eval()
-        rollout_info, global_stability, local_stability, conservativity = evaluate_policy_behavior(
-            policy, manifest, train_dataset, test_dataset, args
+        rollout_info = evaluate_policy_rollouts(
+            policy, manifest, args.eval_episodes, args.seed
+        )
+        conservativity = evaluate_conservativity(
+            train_dataset, test_dataset, rollout_info["decision_observations"],
+            rollout_info["action_chunks"], args.ood_samples, args.seed,
         )
         record = {
             "requested_percent": checkpoint["requested_percent"],
@@ -323,20 +253,14 @@ def evaluate_history(
             "step": checkpoint["step"],
             "policy_return_mean": float(rollout_info["returns"].mean()),
             "policy_return_std": float(rollout_info["returns"].std()),
-            "global_stability_c": float(global_stability["c"]),
-            "global_stability_rho": float(global_stability["rho"]),
-            "global_survival_fraction": float(global_stability["support"][-1] / global_stability["support"][0]),
+            "policy_performance_mean": float(rollout_info["performance"].mean()),
+            "policy_performance_std": float(rollout_info["performance"].std()),
             "state_ood_ratio": float(conservativity["state_ood_ratio"]),
             "state_action_ood_ratio": float(conservativity["state_action_ood_ratio"]),
         }
-        if local_stability is not None:
-            record.update(
-                local_stability_c=float(local_stability["c"]),
-                local_stability_rho=float(local_stability["rho"]),
-                local_survival_fraction=float(local_stability["support"][-1] / local_stability["support"][0]),
-            )
         records.append(record)
 
+    performance_metric, performance_label, _ = performance_definition(manifest["env_name"])
     history = {
         "env_name": manifest["env_name"],
         "algo": manifest["algo"],
@@ -344,8 +268,10 @@ def evaluate_history(
         "chunk_length": manifest["chunk_length"],
         "base_discount": manifest["base_discount"],
         "macro_discount": manifest["macro_discount"],
-        "stability_timestep_unit": "primitive_step",
+        "performance_metric": performance_metric,
+        "performance_label": performance_label,
         "expert_return_mean": expert_info["return_mean"],
+        "expert_performance_mean": expert_info["performance_mean"],
         "records": records,
     }
     with (eval_dir / "history.json").open("w", encoding="utf-8") as file:
@@ -364,19 +290,23 @@ def evaluate_policy_rollouts(
     dynamics=None,
     obs_mean: np.ndarray | None = None,
     obs_std: np.ndarray | None = None,
-) -> dict[str, np.ndarray]:
+) -> dict:
     env = make_eval_env(manifest)
+    env_name = manifest["env_name"]
     chunk_length = manifest["chunk_length"]
-    returns = []
+    returns, performance = [], []
     decision_observations, action_chunks = [], []
     next_obs_errors, error_observations = [], []
     error_episode_ids, error_primitive_timesteps = [], []
 
     try:
         for episode in range(episodes):
-            obs, _ = env.reset(seed=seed + episode)
+            obs, reset_info = env.reset(seed=seed + episode)
+            obs = current_observation(env, manifest)
             episode_return = 0.0
             episode_primitive_steps = 0
+            episode_success = False
+            final_info = reset_info
             terminated = truncated = False
 
             while not (terminated or truncated):
@@ -387,6 +317,8 @@ def evaluate_policy_rollouts(
                     env, action_chunk, chunk_length
                 )
                 primitive_steps = chunk_info["primitive_steps"]
+                episode_success |= bool(np.any(chunk_info["primitive_rewards"] > 0.0))
+                final_info = chunk_info
                 if dynamics is not None and primitive_steps == chunk_length:
                     error_observations.append(np.asarray(obs, dtype=np.float32).copy())
                     pred_next_obs = predict_next_obs(
@@ -405,11 +337,22 @@ def evaluate_policy_rollouts(
                 obs = next_obs
 
             returns.append(episode_return)
+            performance.append(
+                episode_performance(
+                    env_name, env, episode_return, episode_primitive_steps,
+                    episode_success, reset_info, final_info,
+                )
+            )
     finally:
         env.close()
 
+    performance_metric, performance_label, higher_is_better = performance_definition(env_name)
     return {
         "returns": np.asarray(returns, dtype=np.float32),
+        "performance": np.asarray(performance, dtype=np.float32),
+        "performance_metric": performance_metric,
+        "performance_label": performance_label,
+        "performance_higher_is_better": higher_is_better,
         "decision_observations": np.asarray(decision_observations, dtype=np.float32),
         "action_chunks": np.asarray(action_chunks, dtype=np.float32),
         "next_obs_mse": np.asarray(next_obs_errors, dtype=np.float32),
@@ -419,199 +362,245 @@ def evaluate_policy_rollouts(
     }
 
 
-def evaluate_expert(manifest: dict, episodes: int, seed: int) -> dict[str, np.ndarray]:
+def evaluate_expert(manifest: dict, episodes: int, seed: int) -> dict:
     if manifest["dataset_source"] == "robomimic":
         metadata = robomimic_expert_metadata(manifest)
+        with h5py.File(metadata["hdf5_path"], "r") as file:
+            episode_rewards = [
+                np.asarray(file["data"][key]["rewards"], dtype=np.float32)
+                for key in sorted(file["data"].keys())
+            ]
+        returns = np.asarray([rewards.sum() for rewards in episode_rewards], dtype=np.float32)
+        performance = np.asarray(
+            [np.any(rewards > 0.0) for rewards in episode_rewards], dtype=np.float32
+        )
         return {
-            "returns": np.asarray([metadata["episode_return_mean"]], dtype=np.float32),
-            "return_mean": float(metadata["episode_return_mean"]),
-            "return_std": float(metadata["episode_return_std"]),
+            "returns": returns,
+            "return_mean": float(returns.mean()),
+            "return_std": float(returns.std()),
+            "performance": performance,
+            "performance_mean": float(performance.mean()),
+            "performance_std": float(performance.std()),
         }
 
     env_name = manifest["env_name"]
     expert_path = Path(manifest["expert"])
     policy = rollout.load_expert_policy(env_name, str(expert_path))
     env = gym.make(env_name)
-    returns = []
+    returns, performance = [], []
     try:
         for episode in range(episodes):
-            obs, _ = env.reset(seed=seed + episode)
+            obs, reset_info = env.reset(seed=seed + episode)
             episode_return = 0.0
+            episode_steps = 0
+            episode_success = False
+            final_info = reset_info
             terminated = truncated = False
 
             while not (terminated or truncated):
                 action, _ = policy.predict(obs, deterministic=True)
-                obs, reward, terminated, truncated, _ = env.step(action)
+                obs, reward, terminated, truncated, final_info = env.step(action)
                 episode_return += float(reward)
+                episode_steps += 1
+                episode_success |= reward > 0.0
 
             returns.append(episode_return)
+            performance.append(
+                episode_performance(
+                    env_name, env, episode_return, episode_steps,
+                    episode_success, reset_info, final_info,
+                )
+            )
     finally:
         env.close()
 
     returns = np.asarray(returns, dtype=np.float32)
+    performance = np.asarray(performance, dtype=np.float32)
     return {
         "returns": returns,
         "return_mean": float(returns.mean()),
         "return_std": float(returns.std()),
+        "performance": performance,
+        "performance_mean": float(performance.mean()),
+        "performance_std": float(performance.std()),
     }
 
 
-def evaluate_global_stability(
+def performance_definition(env_name: str) -> tuple[str, str, bool]:
+    if env_name in {"Can", "Lift"}:
+        return "success_rate", "task success rate", True
+    if env_name == "Reacher-v5":
+        return "final_target_distance", "final fingertip-target distance (m)", False
+    if env_name == "InvertedDoublePendulum-v5":
+        return "balance_duration", "balance duration (primitive steps)", True
+    if env_name == "HalfCheetah-v5":
+        return "forward_displacement", "forward displacement (m)", True
+    return "episode_return", "episode return", True
+
+
+def episode_performance(
+    env_name: str,
+    env: gym.Env,
+    episode_return: float,
+    primitive_steps: int,
+    succeeded: bool,
+    reset_info: dict,
+    final_info: dict,
+) -> float:
+    if env_name in {"Can", "Lift"}:
+        return float(succeeded)
+    if env_name == "Reacher-v5":
+        fingertip = env.unwrapped.get_body_com("fingertip")
+        target = env.unwrapped.get_body_com("target")
+        return float(np.linalg.norm(fingertip - target))
+    if env_name == "InvertedDoublePendulum-v5":
+        return float(primitive_steps)
+    if env_name == "HalfCheetah-v5":
+        return float(final_info["x_position"] - reset_info["x_position"])
+    return episode_return
+
+
+def evaluate_contraction(
     policy,
     manifest: dict,
-    train_dataset: dict[str, np.ndarray],
     trajectory_count: int,
-    horizon: int,
-    max_offset: int,
-    seed: int,
-) -> dict[str, np.ndarray]:
-    env = make_eval_env(manifest)
-    chunk_length = manifest["chunk_length"]
-    columns = observation_columns(env, manifest)
-    state_std = train_dataset["observations"][:, columns].std(axis=0)
-    state_std[state_std == 0.0] = 1.0
-    trajectories = []
-    try:
-        for index in range(trajectory_count):
-            obs, _ = env.reset(seed=seed + index)
-            seed_policy_randomness(seed + 100000)
-            if manifest["dataset_source"] == "robomimic":
-                trajectories.append(
-                    rollout_current_env_trajectory(
-                        env, policy, obs, columns, state_std, horizon, chunk_length
-                    )
-                )
-            else:
-                trajectories.append(
-                    rollout_state_trajectory(
-                        env, policy, obs, columns, state_std, horizon, chunk_length
-                    )
-                )
-    finally:
-        env.close()
-
-    offsets, curves = [], []
-    for first in range(len(trajectories)):
-        for second in range(first + 1, len(trajectories)):
-            offset, distances = metrics.align_trajectory_pair(
-                trajectories[first], trajectories[second], max_offset
-            )
-            offsets.append(offset)
-            curves.append(distances)
-
-    c, rho, envelope, support = metrics.fit_empirical_bound(curves)
-    return {
-        "c": np.asarray(c, dtype=np.float32),
-        "rho": np.asarray(rho, dtype=np.float32),
-        "distance_curves": pad_curves(curves),
-        "envelope": envelope,
-        "support": support,
-        "offsets": np.asarray(offsets, dtype=np.int64),
-        "trajectory_lengths": np.asarray([len(item) for item in trajectories], dtype=np.int64),
-        "state_columns": columns,
-    }
-
-
-def evaluate_local_stability(
-    policy,
-    env_name: str,
-    train_dataset: dict[str, np.ndarray],
-    test_dataset: dict[str, np.ndarray],
-    pair_count: int,
     horizon: int,
     perturbation_scale: float,
     seed: int,
-    chunk_length: int,
 ) -> dict[str, np.ndarray]:
-    env = gym.make(env_name)
-    columns = reconstructible_observation_columns(env)
-    state_std = train_dataset["observations"][:, columns].std(axis=0)
-    state_std[state_std == 0.0] = 1.0
+    env = make_eval_env(manifest)
     rng = np.random.default_rng(seed)
-    pair_count = min(pair_count, len(test_dataset["observations"]))
-    indices = rng.choice(len(test_dataset["observations"]), size=pair_count, replace=False)
     curves = []
-    base_lengths, perturbed_lengths = [], []
+    qpos_indices = qvel_indices = None
 
     try:
-        env.reset(seed=seed)
-        for pair_index, dataset_index in enumerate(indices):
-            base_obs = test_dataset["observations"][dataset_index].copy()
-            direction = rng.normal(size=len(columns))
-            direction /= np.linalg.norm(direction)
-            perturbed_obs = base_obs.copy()
-            perturbed_obs[columns] += perturbation_scale * state_std * direction
+        for pair_index in range(trajectory_count):
+            reset_seed = seed + pair_index
+            obs, _ = env.reset(seed=reset_seed)
+            obs = current_observation(env, manifest)
+            qpos, qvel = simulator_state(env, manifest)
+            if qpos_indices is None:
+                qpos_indices, qvel_indices = controlled_agent_indices(env, manifest)
 
-            seed_policy_randomness(seed + 100000 + pair_index)
-            base = rollout_state_trajectory(
-                env, policy, base_obs, columns, state_std, horizon, chunk_length
+            direction = rng.normal(size=len(qpos_indices) + len(qvel_indices))
+            direction /= np.linalg.norm(direction)
+            perturbed_qpos = qpos.copy()
+            perturbed_qvel = qvel.copy()
+            split = len(qpos_indices)
+            perturbed_qpos[qpos_indices] += perturbation_scale * direction[:split]
+            perturbed_qvel[qvel_indices] += perturbation_scale * direction[split:]
+
+            rollout_seed = seed + 100000 + pair_index
+            seed_policy_randomness(rollout_seed)
+            base = rollout_agent_trajectory(
+                env, policy, obs, manifest, qpos_indices, qvel_indices, horizon
             )
-            seed_policy_randomness(seed + 100000 + pair_index)
-            perturbed = rollout_state_trajectory(
-                env, policy, perturbed_obs, columns, state_std, horizon, chunk_length
+            perturbed_obs = reset_to_simulator_state(
+                env, manifest, reset_seed, perturbed_qpos, perturbed_qvel
             )
+            seed_policy_randomness(rollout_seed)
+            perturbed = rollout_agent_trajectory(
+                env, policy, perturbed_obs, manifest, qpos_indices, qvel_indices, horizon
+            )
+
             overlap = min(len(base), len(perturbed))
-            curves.append(np.linalg.norm(base[:overlap] - perturbed[:overlap], axis=1).astype(np.float32))
-            base_lengths.append(len(base))
-            perturbed_lengths.append(len(perturbed))
+            curves.append(
+                np.linalg.norm(base[:overlap] - perturbed[:overlap], axis=1).astype(np.float32)
+            )
     finally:
         env.close()
 
-    c, rho, envelope, support = metrics.fit_empirical_bound(curves)
     return {
-        "c": np.asarray(c, dtype=np.float32),
-        "rho": np.asarray(rho, dtype=np.float32),
         "distance_curves": pad_curves(curves),
-        "envelope": envelope,
-        "support": support,
-        "sample_indices": indices.astype(np.int64),
-        "base_lengths": np.asarray(base_lengths, dtype=np.int64),
-        "perturbed_lengths": np.asarray(perturbed_lengths, dtype=np.int64),
-        "state_columns": columns,
+        "qpos_indices": qpos_indices,
+        "qvel_indices": qvel_indices,
+        "perturbation_scale": np.asarray(perturbation_scale, dtype=np.float32),
     }
 
 
-def rollout_state_trajectory(
-    env: gym.Env,
-    policy,
-    initial_obs: np.ndarray,
-    columns: np.ndarray,
-    state_std: np.ndarray,
-    horizon: int,
-    chunk_length: int,
-) -> np.ndarray:
-    env.reset()
-    set_env_from_obs(env, initial_obs)
-    obs = env.unwrapped._get_obs().astype(np.float32)
-    return rollout_current_env_trajectory(
-        env, policy, obs, columns, state_std, horizon, chunk_length
-    )
-
-
-def rollout_current_env_trajectory(
+def rollout_agent_trajectory(
     env: gym.Env,
     policy,
     obs: np.ndarray,
-    columns: np.ndarray,
-    state_std: np.ndarray,
+    manifest: dict,
+    qpos_indices: np.ndarray,
+    qvel_indices: np.ndarray,
     horizon: int,
-    chunk_length: int,
 ) -> np.ndarray:
-    states = [np.asarray(obs, dtype=np.float32)[columns] / state_std]
+    states = [agent_state(env, manifest, qpos_indices, qvel_indices)]
     primitive_steps = 0
     terminated = truncated = False
+    chunk_length = manifest["chunk_length"]
+
     while primitive_steps < horizon and not (terminated or truncated):
-        action_chunk = policy.select_action(obs.reshape(1, -1), deterministic=True).reshape(-1)
-        obs, _, terminated, truncated, chunk_info = chunking.execute_action_chunk(
-            env,
-            action_chunk,
-            chunk_length,
-            max_primitive_steps=horizon - primitive_steps,
-        )
-        primitive_next_observations = chunk_info["primitive_next_observations"]
-        states.extend(primitive_next_observations[:, columns] / state_std)
-        primitive_steps += chunk_info["primitive_steps"]
+        action_chunk = policy.select_action(obs.reshape(1, -1), deterministic=True)
+        actions = np.asarray(action_chunk).reshape((chunk_length, *env.action_space.shape))
+        for action in actions:
+            obs, _, terminated, truncated, _ = env.step(action)
+            states.append(agent_state(env, manifest, qpos_indices, qvel_indices))
+            primitive_steps += 1
+            if primitive_steps == horizon or terminated or truncated:
+                break
     return np.asarray(states, dtype=np.float32)
+
+
+def controlled_agent_indices(env: gym.Env, manifest: dict) -> tuple[np.ndarray, np.ndarray]:
+    if manifest["dataset_source"] == "robomimic":
+        robot = env.unwrapped.robots[0]
+        qpos = list(robot._ref_joint_pos_indexes)
+        qvel = list(robot._ref_joint_vel_indexes)
+        for arm in robot.arms:
+            qpos.extend(robot._ref_gripper_joint_pos_indexes[arm])
+            qvel.extend(robot._ref_gripper_joint_vel_indexes[arm])
+        return np.asarray(qpos, dtype=np.int64), np.asarray(qvel, dtype=np.int64)
+
+    if manifest["env_name"] == "Reacher-v5":
+        return np.arange(2, dtype=np.int64), np.arange(2, dtype=np.int64)
+    return (
+        np.arange(env.unwrapped.model.nq, dtype=np.int64),
+        np.arange(env.unwrapped.model.nv, dtype=np.int64),
+    )
+
+
+def simulator_state(env: gym.Env, manifest: dict) -> tuple[np.ndarray, np.ndarray]:
+    data = env.unwrapped.sim.data if manifest["dataset_source"] == "robomimic" else env.unwrapped.data
+    return np.asarray(data.qpos).copy(), np.asarray(data.qvel).copy()
+
+
+def agent_state(
+    env: gym.Env,
+    manifest: dict,
+    qpos_indices: np.ndarray,
+    qvel_indices: np.ndarray,
+) -> np.ndarray:
+    qpos, qvel = simulator_state(env, manifest)
+    return np.concatenate((qpos[qpos_indices], qvel[qvel_indices])).astype(np.float32)
+
+
+def reset_to_simulator_state(
+    env: gym.Env,
+    manifest: dict,
+    seed: int,
+    qpos: np.ndarray,
+    qvel: np.ndarray,
+) -> np.ndarray:
+    env.reset(seed=seed)
+    if manifest["dataset_source"] == "robomimic":
+        robosuite_env = env.unwrapped
+        robosuite_env.sim.data.qpos[:] = qpos
+        robosuite_env.sim.data.qvel[:] = qvel
+        robosuite_env.sim.forward()
+        return current_observation(env, manifest)
+
+    env.unwrapped.set_state(qpos, qvel)
+    return current_observation(env, manifest)
+
+
+def current_observation(env: gym.Env, manifest: dict) -> np.ndarray:
+    if manifest["dataset_source"] == "robomimic":
+        observations = env.unwrapped._get_observations(force_update=True)
+        return env._flatten_obs(observations).astype(np.float32)
+    return env.unwrapped._get_obs().astype(np.float32)
 
 
 def evaluate_conservativity(
@@ -827,12 +816,6 @@ def learned_next_obs(
 def reconstructible_observation_columns(env: gym.Env) -> np.ndarray:
     structure = env.unwrapped.observation_structure
     return np.arange(structure["qpos"] + structure["qvel"], dtype=np.int64)
-
-
-def observation_columns(env: gym.Env, manifest: dict) -> np.ndarray:
-    if manifest["dataset_source"] == "robomimic":
-        return np.arange(env.observation_space.shape[0], dtype=np.int64)
-    return reconstructible_observation_columns(env)
 
 
 def set_env_from_obs(env: gym.Env, obs: np.ndarray) -> None:
