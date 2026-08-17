@@ -1,8 +1,9 @@
 # Tasks:
 # - Load completed sweep runs from run manifests and evaluation result files.
-# - Plot task performance and agent-state contraction against action chunk length.
+# - Plot best- and last-checkpoint performance and contraction against action chunk length.
 # - Plot task performance and contraction against generated noisy-trajectory fractions.
 # - Plot state and state-action conservativity over policy-training checkpoints.
+# - Plot task performance over policy-training checkpoints.
 # - Retain dormant learned-dynamics mismatch plotting for future use.
 
 import argparse
@@ -44,7 +45,8 @@ def plot_root(root: Path, out: Path | None = None, eval_dirs: list[Path] | None 
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)
-    plot_generated_ablation(rows, out)
+    for selection in ("best", "last"):
+        plot_generated_ablation(rows, out, selection)
 
     dataset_tags = sorted({row["dataset_tag"] for row in rows} | {history["dataset_tag"] for history in histories})
     for dataset_tag in dataset_tags:
@@ -52,9 +54,11 @@ def plot_root(root: Path, out: Path | None = None, eval_dirs: list[Path] | None 
         dataset_out.mkdir(exist_ok=True)
         dataset_rows = [row for row in rows if row["dataset_tag"] == dataset_tag]
         dataset_histories = [history for history in histories if history["dataset_tag"] == dataset_tag]
-        plot_performance_vs_chunk_length(dataset_rows, dataset_out)
-        plot_contraction_vs_chunk_length(dataset_rows, dataset_out)
-        plot_history_relationships(dataset_histories, dataset_out)
+        for selection in ("best", "last"):
+            selection_out = dataset_out / selection
+            selection_out.mkdir(exist_ok=True)
+            plot_performance_vs_chunk_length(dataset_rows, selection_out, selection)
+            plot_contraction_vs_chunk_length(dataset_rows, selection_out, selection)
         plot_training_histories(dataset_histories, dataset_out)
 
 
@@ -123,7 +127,7 @@ def policy_label(record: dict) -> str:
     return f"{record['algo']} (l={record['chunk_length']})"
 
 
-def plot_performance_vs_chunk_length(rows: list[dict], out: Path) -> None:
+def plot_performance_vs_chunk_length(rows: list[dict], out: Path, selection: str) -> None:
     if len({row["chunk_length"] for row in rows}) < 2:
         return
 
@@ -132,7 +136,7 @@ def plot_performance_vs_chunk_length(rows: list[dict], out: Path) -> None:
         algo_rows = sorted((row for row in rows if row["algo"] == algo), key=lambda row: row["chunk_length"])
         ax.plot(
             [row["chunk_length"] for row in algo_rows],
-            [row["policy_performance_mean"] for row in algo_rows],
+            [row[f"{selection}_policy_performance_mean"] for row in algo_rows],
             marker="o",
             label=algo,
         )
@@ -142,24 +146,25 @@ def plot_performance_vs_chunk_length(rows: list[dict], out: Path) -> None:
     )
     ax.set_xlabel("action chunk length")
     ax.set_ylabel(rows[0]["performance_label"])
-    ax.set_title(f"Final-policy {rows[0]['performance_label']} vs action chunk length")
+    ax.set_title(f"{selection.capitalize()}-checkpoint {rows[0]['performance_label']} vs action chunk length")
     ax.legend()
     fig.tight_layout()
     fig.savefig(out / "performance_vs_chunk_length.png", dpi=200)
     plt.close(fig)
 
 
-def plot_contraction_vs_chunk_length(rows: list[dict], out: Path) -> None:
+def plot_contraction_vs_chunk_length(rows: list[dict], out: Path, selection: str) -> None:
     if len({row["chunk_length"] for row in rows}) < 2:
         return
     contraction_curve_plot(
         rows, "chunk_length", "chunk length",
-        "Final-policy contraction by action chunk length",
+        f"{selection.capitalize()}-checkpoint contraction by action chunk length",
         out / "contraction_vs_chunk_length.png",
+        selection,
     )
 
 
-def plot_generated_ablation(rows: list[dict], out: Path) -> None:
+def plot_generated_ablation(rows: list[dict], out: Path, selection: str) -> None:
     generated = [row for row in rows if row["dataset_source"] == "generated"]
     if not generated or len({row["noisy_trajectory_fraction"] for row in generated}) < 2:
         return
@@ -178,16 +183,19 @@ def plot_generated_ablation(rows: list[dict], out: Path) -> None:
         print("Skipping generated composition plots: rows do not form one requested composition ablation.")
         return
 
-    experiment_out = out / family
-    experiment_out.mkdir(exist_ok=True)
-    performance_ablation_plot(generated, title, experiment_out / "performance_vs_noisy_fraction.png")
+    experiment_out = out / family / selection
+    experiment_out.mkdir(parents=True, exist_ok=True)
+    performance_ablation_plot(
+        generated, title, experiment_out / "performance_vs_noisy_fraction.png", selection
+    )
     contraction_curve_plot(
         generated, "noisy_trajectory_fraction", "noisy trajectory fraction",
-        title, experiment_out / "contraction_vs_noisy_fraction.png",
+        f"{selection.capitalize()}-checkpoint {title.lower()}",
+        experiment_out / "contraction_vs_noisy_fraction.png", selection,
     )
 
 
-def performance_ablation_plot(rows: list[dict], title: str, path: Path) -> None:
+def performance_ablation_plot(rows: list[dict], title: str, path: Path, selection: str) -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
     for algo in sorted({row["algo"] for row in rows}):
         algo_rows = sorted(
@@ -196,7 +204,7 @@ def performance_ablation_plot(rows: list[dict], title: str, path: Path) -> None:
         )
         ax.plot(
             [row["noisy_trajectory_fraction"] for row in algo_rows],
-            [row["policy_performance_mean"] for row in algo_rows],
+            [row[f"{selection}_policy_performance_mean"] for row in algo_rows],
             marker="o", label=algo,
         )
     ax.axhline(
@@ -206,7 +214,7 @@ def performance_ablation_plot(rows: list[dict], title: str, path: Path) -> None:
     ax.set_xlim(-0.02, 1.02)
     ax.set_xlabel("fraction of trajectories collected from the noisy expert")
     ax.set_ylabel(rows[0]["performance_label"])
-    ax.set_title(f"{rows[0]['performance_label'].capitalize()}\n{title}")
+    ax.set_title(f"{selection.capitalize()}-checkpoint {rows[0]['performance_label']}\n{title}")
     ax.legend()
     fig.tight_layout()
     fig.savefig(path, dpi=200)
@@ -219,8 +227,10 @@ def contraction_curve_plot(
     value_label: str,
     title: str,
     path: Path,
+    selection: str,
 ) -> None:
-    available = [row for row in rows if (Path(row["eval_dir"]) / "contraction.npz").exists()]
+    filename = f"contraction_{selection}.npz"
+    available = [row for row in rows if (Path(row["eval_dir"]) / filename).exists()]
     if not available:
         return
     algorithms = sorted({row["algo"] for row in available})
@@ -229,13 +239,13 @@ def contraction_curve_plot(
         for row in sorted(
             (row for row in available if row["algo"] == algo), key=lambda row: row[value_key]
         ):
-            with np.load(Path(row["eval_dir"]) / "contraction.npz") as data:
+            with np.load(Path(row["eval_dir"]) / filename) as data:
                 mean_curve = np.nanmean(data["distance_curves"], axis=0)
             axis.plot(mean_curve, label=f"{value_label}={row[value_key]:g}")
         axis.set_title(algo)
         axis.set_xlabel("primitive timestep")
         axis.legend(fontsize=8)
-    axes[0, 0].set_ylabel("agent-state distance")
+    axes[0, 0].set_ylabel("agent Cartesian-position distance (m)")
     fig.suptitle(title)
     fig.tight_layout()
     fig.savefig(path, dpi=200)
@@ -294,66 +304,37 @@ def plot_mismatch_ratios(rows: list[dict], out: Path) -> None:
     )
 
 
-def plot_history_relationships(histories: list[dict], out: Path) -> None:
-    if not histories:
-        return
-
-    history_relationship_plot(
-        histories, "state_ood_ratio", "state OOD ratio",
-        out / "state_ood_vs_performance.png",
-    )
-    history_relationship_plot(
-        histories, "state_action_ood_ratio", "state-action OOD ratio",
-        out / "state_action_ood_vs_performance.png",
-    )
-
-
-def history_relationship_plot(
-    histories: list[dict],
-    x_key: str,
-    xlabel: str,
-    path: Path,
-) -> None:
-    histories = [
-        history for history in histories
-        if history["records"] and x_key in history["records"][0]
-    ]
-    if not histories:
-        return
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    color_scale = plt.Normalize(0, 100)
-    color_map = plt.get_cmap("viridis")
-    for history in histories:
-        records = history["records"]
-        x = np.asarray([record[x_key] for record in records])
-        performance = np.asarray([record["policy_performance_mean"] for record in records])
-        percent = np.asarray([record["actual_percent"] for record in records])
-        ax.plot(x, performance, linewidth=1, alpha=0.7, label=history["label"])
-        ax.scatter(x, performance, c=percent, s=35, cmap=color_map, norm=color_scale)
-
-    ax.axvline(1.0, color="gray", linestyle=":", label=f"{xlabel} = 1")
-    ax.axhline(
-        np.mean([history["expert_performance_mean"] for history in histories]),
-        color="black", linestyle=":", label="expert",
-    )
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(histories[0]["performance_label"])
-    ax.legend(fontsize=8)
-    fig.colorbar(plt.cm.ScalarMappable(norm=color_scale, cmap=color_map), ax=ax, label="training completed (%)")
-    fig.tight_layout()
-    fig.savefig(path, dpi=200)
-    plt.close(fig)
-
-
 def plot_training_histories(histories: list[dict], out: Path) -> None:
     if not histories:
         return
 
+    performance_history_plot(histories, out / "performance_vs_training_percent.png")
     history_line_plot(
         histories, ("state_ood_ratio", "state_action_ood_ratio"),
         ("state OOD", "state-action OOD"), out / "ood_vs_training_percent.png",
     )
+
+
+def performance_history_plot(histories: list[dict], path: Path) -> None:
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for history in histories:
+        records = history["records"]
+        ax.plot(
+            [record["actual_percent"] for record in records],
+            [record["policy_performance_mean"] for record in records],
+            marker="o",
+            label=history["label"],
+        )
+    ax.axhline(
+        np.mean([history["expert_performance_mean"] for history in histories]),
+        color="black", linestyle=":", label="expert",
+    )
+    ax.set_xlabel("training completed (%)")
+    ax.set_ylabel(histories[0]["performance_label"])
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
 
 
 def history_line_plot(histories: list[dict], keys: tuple[str, ...], names: tuple[str, ...], path: Path) -> None:

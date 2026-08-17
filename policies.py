@@ -226,6 +226,7 @@ def build_model_based_policy(
             num_samples=10,
             deterministic_backup=True,
             max_q_backup=False,
+            clamp_target_q=env.spec.id != "Reacher-v5",
         )
         return policy, dynamics, torch.optim.lr_scheduler.CosineAnnealingLR(actor_optim, args.epoch)
 

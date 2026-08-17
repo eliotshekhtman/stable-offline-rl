@@ -85,10 +85,11 @@ def parse_args() -> argparse.Namespace:
 
     evaluation = parser.add_argument_group("post-training evaluation")
     evaluation.add_argument("--eval", action="store_true", help="After training, run full evaluation for each trained policy and then generate plots")
-    evaluation.add_argument("--eval-episodes", type=int, default=10, help="Number of true-environment episodes used to estimate final and checkpoint policy performance; also used for generated-data expert evaluation")
-    evaluation.add_argument("--contraction-trajectories", type=int, default=8, help="Number of matched unperturbed and agent-state-perturbed final-policy trajectory pairs")
-    evaluation.add_argument("--contraction-horizon", type=int, default=300, help="Maximum primitive steps in each final-policy contraction trajectory")
-    evaluation.add_argument("--perturbation-scale", type=float, default=0.01, help="Euclidean norm of the initial perturbation applied to controlled-agent qpos/qvel coordinates")
+    evaluation.add_argument("--reuse-eval", action="store_true", help="With --eval, reuse matching cached checkpoint rollouts and completed evaluation results")
+    evaluation.add_argument("--eval-episodes", type=int, default=100, help="Number of true-environment episodes used to estimate final and checkpoint policy performance; also used for generated-data expert evaluation")
+    evaluation.add_argument("--contraction-trajectories", type=int, default=16, help="Number of matched unperturbed and agent-state-perturbed trajectories for each best and last policy")
+    evaluation.add_argument("--contraction-horizon", type=int, default=300, help="Maximum primitive steps in each best- and last-policy contraction trajectory")
+    evaluation.add_argument("--perturbation-scale", type=float, default=0.1, help="Euclidean norm of the initial perturbation applied to controlled-agent qpos/qvel coordinates")
     evaluation.add_argument("--ood-samples", type=int, default=10000, help="Maximum held-out and policy decision-boundary samples used for OOD metrics")
 
     model_based = parser.add_argument_group("model-based algorithm options")
@@ -119,8 +120,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--dataset applies only to minari and robomimic dataset sources")
     if args.eval_episodes <= 0 or args.contraction_trajectories <= 0 or args.contraction_horizon <= 0:
         parser.error("evaluation episode, trajectory, and horizon counts must be positive")
+    if args.contraction_trajectories > args.eval_episodes:
+        parser.error("--contraction-trajectories cannot exceed --eval-episodes")
     if args.perturbation_scale < 0.0:
         parser.error("--perturbation-scale must be nonnegative")
+    if args.reuse_eval and not args.eval:
+        parser.error("--reuse-eval requires --eval")
     return args
 
 
@@ -467,6 +472,7 @@ def maybe_evaluate(run_dir: Path, args: argparse.Namespace) -> Path | None:
             contraction_horizon=args.contraction_horizon,
             perturbation_scale=args.perturbation_scale,
             ood_samples=args.ood_samples,
+            reuse_eval=args.reuse_eval,
         ),
     )
 
