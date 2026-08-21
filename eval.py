@@ -448,8 +448,12 @@ def rollout_policy_episode(
             episode_return += float(reward)
             primitive_steps += 1
             positions.append(agent_positions(env, manifest, body_ids))
-            succeeded |= reward > 0.0
-            done = terminated or truncated or stops_on_sparse_success(manifest, reward)
+            task_succeeded = (
+                manifest["dataset_source"] == "robomimic"
+                and bool(env.unwrapped._check_success())
+            )
+            succeeded |= task_succeeded
+            done = terminated or truncated or task_succeeded
             if done or (horizon is not None and primitive_steps == horizon):
                 break
 
@@ -465,10 +469,6 @@ def rollout_policy_episode(
         "initial_qpos": start_qpos,
         "initial_qvel": start_qvel,
     }
-
-
-def stops_on_sparse_success(manifest: dict, reward: float) -> bool:
-    return manifest["dataset_source"] == "robomimic" and reward > 0.0
 
 
 def rollout_cache_config(manifest: dict, checkpoint: dict, args: argparse.Namespace) -> dict:
@@ -663,7 +663,7 @@ def evaluate_expert(manifest: dict, episodes: int, seed: int) -> dict:
 
 
 def performance_definition(env_name: str) -> tuple[str, str, bool]:
-    if env_name in {"Can", "Lift"}:
+    if env_name in {"Can", "Lift", "ToolHang"}:
         return "success_rate", "task success rate", True
     if env_name == "Reacher-v5":
         return "final_target_distance", "final fingertip-target distance (m)", False
@@ -683,7 +683,7 @@ def episode_performance(
     reset_info: dict,
     final_info: dict,
 ) -> float:
-    if env_name in {"Can", "Lift"}:
+    if env_name in {"Can", "Lift", "ToolHang"}:
         return float(succeeded)
     if env_name == "Reacher-v5":
         fingertip = env.unwrapped.get_body_com("fingertip")

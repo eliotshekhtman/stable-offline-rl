@@ -8,16 +8,20 @@ import eval as evaluation
 
 
 class PositionEnv(gym.Env):
-    def __init__(self, terminate_at: int = 5):
+    def __init__(self, terminate_at: int = 5, success_at: int | None = None):
         self.action_space = gym.spaces.Box(-1.0, 1.0, shape=(1,), dtype=np.float32)
         self.observation_space = gym.spaces.Box(-np.inf, np.inf, shape=(1,), dtype=np.float32)
         self.model = SimpleNamespace(nq=1, nv=1)
+        positions = np.zeros((2, 3), dtype=np.float64)
         self.data = SimpleNamespace(
             qpos=np.zeros(1, dtype=np.float64),
             qvel=np.zeros(1, dtype=np.float64),
-            xpos=np.zeros((2, 3), dtype=np.float64),
+            xpos=positions,
+            body_xpos=positions,
         )
+        self.sim = SimpleNamespace(data=self.data)
         self.terminate_at = terminate_at
+        self.success_at = success_at
         self.steps = 0
 
     def reset(self, *, seed=None, options=None):
@@ -41,6 +45,15 @@ class PositionEnv(gym.Env):
 
     def _get_obs(self):
         return self.data.qpos.astype(np.float32).copy()
+
+    def _get_observations(self, force_update=False):
+        return {"obs": self._get_obs()}
+
+    def _flatten_obs(self, observations):
+        return observations["obs"]
+
+    def _check_success(self):
+        return self.success_at is not None and self.steps >= self.success_at
 
 
 class CountingChunkPolicy:
@@ -76,11 +89,23 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(result["return"], 5.0)
         self.assertEqual(result["performance"], 5.0)
 
-    def test_only_robomimic_sparse_reward_stops_on_success(self):
-        self.assertFalse(evaluation.stops_on_sparse_success(manifest(), 1.0))
-        self.assertTrue(
-            evaluation.stops_on_sparse_success({"dataset_source": "robomimic"}, 1.0)
+    def test_robomimic_rollout_uses_task_success_instead_of_positive_reward(self):
+        env = PositionEnv(terminate_at=5, success_at=4)
+        policy = CountingChunkPolicy(chunk_length=3)
+        robomimic_manifest = {
+            "env_name": "Lift",
+            "dataset_source": "robomimic",
+            "chunk_length": 3,
+        }
+
+        result = evaluation.rollout_policy_episode(
+            env, policy, robomimic_manifest, reset_seed=0, body_ids=np.asarray([1])
         )
+
+        self.assertEqual(policy.calls, 2)
+        self.assertEqual(len(result["positions"]), 5)
+        self.assertEqual(result["return"], 4.0)
+        self.assertEqual(result["performance"], 1.0)
 
     def test_best_checkpoint_uses_metric_direction_and_latest_tie(self):
         records = [

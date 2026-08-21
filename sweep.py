@@ -2,7 +2,7 @@
 # - Parse the experiment CLI and keep one run focused on one Gymnasium environment.
 # - Choose the dataset source: generated rollouts, converted Minari datasets, or robomimic datasets.
 # - Cache/load datasets, build OfflineRL-Kit replay buffers, and launch trainers.
-# - Sweep algorithms and action chunk lengths over the same primitive dataset splits.
+# - Sweep algorithms and action chunk lengths over each requested random seed.
 # - Own experiment directories, milestone checkpoints, logging, seeding, and run naming.
 
 import argparse
@@ -39,7 +39,14 @@ BASE_DISCOUNT = 0.99
 def main() -> None:
     args = parse_args()
     expert_path = resolve_expert_path(args.expert, args.env)
-    run_sweep(env_name=args.env, expert_path=expert_path, args=args)
+    eval_dirs = []
+    for seed in args.seeds:
+        seed_args = argparse.Namespace(**vars(args))
+        seed_args.seed = seed
+        eval_dirs.extend(
+            run_sweep(env_name=args.env, expert_path=expert_path, args=seed_args)
+        )
+    maybe_plot(EVAL_ROOT / args.env, eval_dirs, args)
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,7 +54,7 @@ def parse_args() -> argparse.Namespace:
 
     experiment = parser.add_argument_group("experiment")
     experiment.add_argument("--env", required=True, help="Gymnasium environment id to train on, e.g. HalfCheetah-v5")
-    experiment.add_argument("--seed", type=int, default=0, help="Random seed used for dataset splitting, generated rollouts, and training")
+    experiment.add_argument("--seed", dest="seeds", type=int, nargs="+", default=[0], help="Random seeds used for dataset splitting, generated rollouts, training, and evaluation")
     experiment.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Torch device used for OfflineRL-Kit policies and dynamics")
 
     dataset = parser.add_argument_group("dataset source and split")
@@ -57,7 +64,7 @@ def parse_args() -> argparse.Namespace:
 
     generated = parser.add_argument_group("generated dataset options")
     generated.add_argument("--expert", default="/home/shekhe/stable-offline-rl/experts", help="Expert policy .zip path or directory containing <env>.zip; used only for generated expert data and expert evaluation")
-    generated.add_argument("--num-samples", type=int, nargs="+", default=[10000], help="Minimum generated transition counts to sweep over; collection always retains complete trajectories")
+    generated.add_argument("--num-samples", type=int, nargs="+", default=[1000000], help="Minimum generated transition counts to sweep over; collection always retains complete trajectories")
     generated.add_argument("--noise-scale", type=float, nargs="+", default=[0.0], help="Gaussian action-noise scales applied to noisy expert actions in generated datasets")
     generated.add_argument(
         "--composition", type=float, nargs=2, action="append", metavar=("CLEAN_EXPERT", "NOISY_EXPERT"),
@@ -96,7 +103,7 @@ def parse_args() -> argparse.Namespace:
     model_based.add_argument("--dynamics-max-epochs", type=int, default=30, help="Maximum epochs for fitting the learned dynamics model before policy training")
     model_based.add_argument("--rollout-freq", type=int, default=1000, help="Policy-training step interval between learned-dynamics rollout generation")
     model_based.add_argument("--rollout-batch-size", type=int, default=10000, help="Number of initial real states used when generating model rollouts")
-    model_based.add_argument("--rollout-length", type=int, default=1, help="Number of learned macro-transitions per synthetic rollout")
+    model_based.add_argument("--rollout-length", type=int, default=5, help="Number of learned macro-transitions per synthetic rollout")
     model_based.add_argument("--model-retain-epochs", type=int, default=5, help="How many epochs of synthetic model rollouts to retain in the fake replay buffer")
     model_based.add_argument("--real-ratio", type=float, default=0.50, help="Fraction of each model-based training batch sampled from the real offline dataset rather than the synthetic rollout buffer")
     model_based.add_argument("--dynamics-update-freq", type=int, default=1000, help="RAMBO dynamics-adversary update interval; ignored by other model-based algorithms")
@@ -107,6 +114,7 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if any(chunk_length <= 0 for chunk_length in args.chunk_lengths):
         parser.error("--chunk-lengths values must be positive")
+    args.seeds = list(dict.fromkeys(args.seeds))
     args.chunk_lengths = list(dict.fromkeys(args.chunk_lengths))
     args.algos = list(dict.fromkeys(args.algos))
     args.composition = [(1.0, 0.0)] if args.composition is None else [tuple(values) for values in args.composition]
@@ -129,7 +137,7 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def run_sweep(env_name: str, expert_path: Path, args: argparse.Namespace) -> None:
+def run_sweep(env_name: str, expert_path: Path, args: argparse.Namespace) -> list[Path]:
     dataset_root = DATASET_ROOT / env_name
     trained_root = TRAINED_ROOT / env_name
     eval_root = EVAL_ROOT / env_name
@@ -178,7 +186,7 @@ def run_sweep(env_name: str, expert_path: Path, args: argparse.Namespace) -> Non
                 )
             )
 
-    maybe_plot(eval_root, eval_dirs, args)
+    return eval_dirs
 
 
 def run_minari_sweep(

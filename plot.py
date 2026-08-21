@@ -1,5 +1,6 @@
 # Tasks:
 # - Load completed sweep runs from run manifests and evaluation result files.
+# - Average matching results across the random seeds selected by the sweep.
 # - Plot best- and last-checkpoint performance and contraction against action chunk length.
 # - Plot task performance and contraction against generated noisy-trajectory fractions.
 # - Plot state and state-action conservativity over policy-training checkpoints.
@@ -41,19 +42,21 @@ def plot_root(root: Path, out: Path | None = None, eval_dirs: list[Path] | None 
             latest[results_path.parent.parent.name] = results_path.parent
         eval_dirs = sorted(latest.values())
     rows = load_rows(eval_dirs)
-    histories = load_histories(eval_dirs)
+    histories = load_histories(eval_dirs, rows)
+    rows = average_seed_rows(rows)
+    histories = average_seed_histories(histories)
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)
     for selection in ("best", "last"):
         plot_generated_ablation(rows, out, selection)
 
-    dataset_tags = sorted({row["dataset_tag"] for row in rows} | {history["dataset_tag"] for history in histories})
+    dataset_tags = sorted({row["plot_dataset_tag"] for row in rows} | {history["plot_dataset_tag"] for history in histories})
     for dataset_tag in dataset_tags:
         dataset_out = out / dataset_tag
         dataset_out.mkdir(exist_ok=True)
-        dataset_rows = [row for row in rows if row["dataset_tag"] == dataset_tag]
-        dataset_histories = [history for history in histories if history["dataset_tag"] == dataset_tag]
+        dataset_rows = [row for row in rows if row["plot_dataset_tag"] == dataset_tag]
+        dataset_histories = [history for history in histories if history["plot_dataset_tag"] == dataset_tag]
         for selection in ("best", "last"):
             selection_out = dataset_out / selection
             selection_out.mkdir(exist_ok=True)
@@ -81,9 +84,54 @@ def load_rows(eval_dirs: list[Path]) -> list[dict]:
             "run_dir": str(manifest_path.parent),
             "eval_dir": str(eval_dir.resolve()),
         }
+        training_schema = {
+            key: value for key, value in manifest["training_schema"].items()
+            if key != "seed"
+        }
+        training_schema["dataset"] = {
+            key: value for key, value in training_schema["dataset"].items()
+            if key != "seed"
+        }
+        row["seed_group"] = json.dumps(training_schema, sort_keys=True)
+        row["plot_dataset_tag"] = row["dataset_tag"]
+        if row["dataset_source"] == "generated":
+            dataset_schema = manifest["training_schema"]["dataset"]
+            row["seedless_dataset_tag"] = (
+                f"samples{dataset_schema['num_samples']}_"
+                f"clean{dataset_schema['prop_clean_expert']:g}_"
+                f"noisy{dataset_schema['prop_noisy_expert']:g}_"
+                f"noise{dataset_schema['noise_scale']:g}"
+            )
+        else:
+            row["seedless_dataset_tag"] = row["dataset_tag"]
         row["label"] = policy_label(row)
         rows.append(row)
     return rows
+
+
+def average_seed_rows(rows: list[dict]) -> list[dict]:
+    groups = {}
+    for row in rows:
+        groups.setdefault(row["seed_group"], []).append(row)
+
+    averaged = []
+    for seed_rows in groups.values():
+        row = dict(seed_rows[0])
+        row["seed_rows"] = seed_rows
+        for key in (
+            "best_policy_performance_mean",
+            "last_policy_performance_mean",
+            "expert_performance_mean",
+        ):
+            row[key] = float(np.mean([seed_row[key] for seed_row in seed_rows]))
+        if row["dataset_source"] == "generated":
+            row["noisy_trajectory_fraction"] = float(np.mean([
+                seed_row["noisy_trajectory_fraction"] for seed_row in seed_rows
+            ]))
+            if len(seed_rows) > 1:
+                row["plot_dataset_tag"] = row["seedless_dataset_tag"]
+        averaged.append(row)
+    return averaged
 
 
 def dataset_fields(metadata: dict) -> dict:
@@ -111,16 +159,56 @@ def dataset_fields(metadata: dict) -> dict:
     }
 
 
-def load_histories(eval_dirs: list[Path]) -> list[dict]:
+def load_histories(eval_dirs: list[Path], rows: list[dict]) -> list[dict]:
+    rows_by_eval_dir = {row["eval_dir"]: row for row in rows}
     histories = []
     for eval_dir in sorted(eval_dirs):
         history_path = eval_dir / "history.json"
-        if not history_path.exists():
+        row = rows_by_eval_dir.get(str(eval_dir.resolve()))
+        if not history_path.exists() or row is None:
             continue
         history = load_json(history_path)
+        history["seed_group"] = row["seed_group"]
+        history["plot_dataset_tag"] = row["plot_dataset_tag"]
+        history["seedless_dataset_tag"] = row["seedless_dataset_tag"]
         history["label"] = policy_label(history)
         histories.append(history)
     return histories
+
+
+def average_seed_histories(histories: list[dict]) -> list[dict]:
+    groups = {}
+    for history in histories:
+        groups.setdefault(history["seed_group"], []).append(history)
+
+    averaged = []
+    for seed_histories in groups.values():
+        history = dict(seed_histories[0])
+        history["expert_performance_mean"] = float(np.mean([
+            seed_history["expert_performance_mean"]
+            for seed_history in seed_histories
+        ]))
+        if len(seed_histories) > 1 and history["dataset_tag"] != history["seedless_dataset_tag"]:
+            history["plot_dataset_tag"] = history["seedless_dataset_tag"]
+
+        records_by_percent = {}
+        for seed_history in seed_histories:
+            for record in seed_history["records"]:
+                records_by_percent.setdefault(record["actual_percent"], []).append(record)
+        history["records"] = []
+        for actual_percent, seed_records in sorted(records_by_percent.items()):
+            record = dict(seed_records[0])
+            for key in (
+                "policy_performance_mean",
+                "state_ood_ratio",
+                "state_action_ood_ratio",
+            ):
+                values = [seed_record[key] for seed_record in seed_records if key in seed_record]
+                if values:
+                    record[key] = float(np.mean(values))
+            history["records"].append(record)
+        averaged.append(history)
+    return averaged
 
 
 def policy_label(record: dict) -> str:
@@ -230,7 +318,10 @@ def contraction_curve_plot(
     selection: str,
 ) -> None:
     filename = f"contraction_{selection}.npz"
-    available = [row for row in rows if (Path(row["eval_dir"]) / filename).exists()]
+    available = [
+        row for row in rows
+        if any((Path(seed_row["eval_dir"]) / filename).exists() for seed_row in row["seed_rows"])
+    ]
     if not available:
         return
     algorithms = sorted({row["algo"] for row in available})
@@ -239,8 +330,13 @@ def contraction_curve_plot(
         for row in sorted(
             (row for row in available if row["algo"] == algo), key=lambda row: row[value_key]
         ):
-            with np.load(Path(row["eval_dir"]) / filename) as data:
-                mean_curve = np.nanmean(data["distance_curves"], axis=0)
+            seed_curves = []
+            for seed_row in row["seed_rows"]:
+                contraction_path = Path(seed_row["eval_dir"]) / filename
+                if contraction_path.exists():
+                    with np.load(contraction_path) as data:
+                        seed_curves.append(np.nanmean(data["distance_curves"], axis=0))
+            mean_curve = np.nanmean(seed_curves, axis=0)
             axis.plot(mean_curve, label=f"{value_label}={row[value_key]:g}")
         axis.set_title(algo)
         axis.set_xlabel("primitive timestep")
