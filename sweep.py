@@ -90,6 +90,18 @@ def parse_args() -> argparse.Namespace:
     dql.add_argument("--dql-weight-temperature", type=float, default=None, help="Override the DQL candidate-action softmax weight; defaults to a CleanDiffuser task value when available")
     dql.add_argument("--dql-reward-normalization", choices=["auto", "none", "episode-range"], default="auto", help="DQL reward scaling: auto uses CleanDiffuser episode-return-range scaling for Minari data and no scaling otherwise")
 
+    iql = parser.add_argument_group("IQL options")
+    iql.add_argument("--iql-temperature", type=float, default=3.0, help="IQL advantage-weighting temperature; larger values favor higher-advantage dataset actions more strongly")
+    iql.add_argument("--iql-expectile", type=float, default=0.7, help="IQL value-function expectile, strictly between 0 and 1")
+    iql.add_argument("--iql-learning-rate", type=float, default=3e-4, help="Learning rate shared by the IQL actor, two Q-functions, and value function")
+    iql.add_argument("--iql-lr-schedule", choices=["cosine", "constant"], default="cosine", help="IQL actor learning-rate schedule; cosine anneals over policy-training epochs")
+    iql.add_argument("--iql-hidden-dims", type=int, nargs="+", default=[256, 256], help="Hidden-layer widths shared by the IQL actor, two Q-functions, and value function")
+
+    td3bc = parser.add_argument_group("TD3+BC options")
+    td3bc.add_argument("--td3bc-learning-rate", type=float, default=3e-4, help="Learning rate shared by the TD3+BC actor and two critics")
+    td3bc.add_argument("--td3bc-alpha", type=float, default=2.5, help="TD3+BC weight on Q-value maximization relative to behavior cloning")
+    td3bc.add_argument("--td3bc-hidden-dims", type=int, nargs="+", default=[256, 256], help="Hidden-layer widths shared by the TD3+BC actor and two critics")
+
     evaluation = parser.add_argument_group("post-training evaluation")
     evaluation.add_argument("--eval", action="store_true", help="After training, run full evaluation for each trained policy and then generate plots")
     evaluation.add_argument("--reuse-eval", action="store_true", help="With --eval, reuse matching cached checkpoint rollouts and completed evaluation results")
@@ -114,6 +126,16 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if any(chunk_length <= 0 for chunk_length in args.chunk_lengths):
         parser.error("--chunk-lengths values must be positive")
+    if args.iql_temperature <= 0.0:
+        parser.error("--iql-temperature must be positive")
+    if not 0.0 < args.iql_expectile < 1.0:
+        parser.error("--iql-expectile must be strictly between 0 and 1")
+    if args.iql_learning_rate <= 0.0 or any(width <= 0 for width in args.iql_hidden_dims):
+        parser.error("IQL learning rate and hidden dimensions must be positive")
+    if args.td3bc_learning_rate <= 0.0 or args.td3bc_alpha <= 0.0:
+        parser.error("TD3+BC learning rate and alpha must be positive")
+    if any(width <= 0 for width in args.td3bc_hidden_dims):
+        parser.error("TD3+BC hidden dimensions must be positive")
     args.seeds = list(dict.fromkeys(args.seeds))
     args.chunk_lengths = list(dict.fromkeys(args.chunk_lengths))
     args.algos = list(dict.fromkeys(args.algos))
@@ -414,6 +436,20 @@ def make_training_schema(
             "eta": args.dql_eta,
             "weight_temperature": args.dql_weight_temperature,
             "reward_normalization": args.dql_reward_normalization,
+        }
+    if algo == "iql":
+        schema["iql"] = {
+            "temperature": args.iql_temperature,
+            "expectile": args.iql_expectile,
+            "learning_rate": args.iql_learning_rate,
+            "lr_schedule": args.iql_lr_schedule,
+            "hidden_dims": args.iql_hidden_dims,
+        }
+    if algo == "td3bc":
+        schema["td3bc"] = {
+            "learning_rate": args.td3bc_learning_rate,
+            "alpha": args.td3bc_alpha,
+            "hidden_dims": args.td3bc_hidden_dims,
         }
     if algo in {"cql", "combo"}:
         schema["implementation_version"] = 2

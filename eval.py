@@ -258,6 +258,18 @@ def load_policy_and_dynamics(
         rollout_length=manifest["rollout_length"],
         adv_batch_size=manifest["adv_batch_size"],
     )
+    if manifest["algo"] == "iql":
+        iql = manifest["training_schema"]["iql"]
+        build_args.iql_temperature = iql["temperature"]
+        build_args.iql_expectile = iql["expectile"]
+        build_args.iql_learning_rate = iql["learning_rate"]
+        build_args.iql_lr_schedule = iql["lr_schedule"]
+        build_args.iql_hidden_dims = iql["hidden_dims"]
+    elif manifest["algo"] == "td3bc":
+        td3bc = manifest["training_schema"]["td3bc"]
+        build_args.td3bc_learning_rate = td3bc["learning_rate"]
+        build_args.td3bc_alpha = td3bc["alpha"]
+        build_args.td3bc_hidden_dims = td3bc["hidden_dims"]
 
     obs_mean = obs_std = None
     if manifest["algo"] in MODEL_BASED_ALGOS:

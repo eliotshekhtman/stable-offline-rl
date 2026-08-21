@@ -97,7 +97,7 @@ def build_model_free_policy(
         ), None
 
     if algo == "iql":
-        hidden_dims = [256, 256]
+        hidden_dims = args.iql_hidden_dims
         actor_backbone = MLP(input_dim=obs_dim, hidden_dims=hidden_dims, dropout_rate=None)
         dist = DiagGaussian(
             latent_dim=getattr(actor_backbone, "output_dim"),
@@ -107,13 +107,13 @@ def build_model_free_policy(
             max_mu=max_action,
         )
         actor = ActorProb(actor_backbone, dist, args.device)
-        critic_q1, critic_q1_optim = build_critic(obs_dim, action_dim, hidden_dims, args.device, 3e-4)
-        critic_q2, critic_q2_optim = build_critic(obs_dim, action_dim, hidden_dims, args.device, 3e-4)
+        critic_q1, critic_q1_optim = build_critic(obs_dim, action_dim, hidden_dims, args.device, args.iql_learning_rate)
+        critic_q2, critic_q2_optim = build_critic(obs_dim, action_dim, hidden_dims, args.device, args.iql_learning_rate)
         critic_v_backbone = MLP(input_dim=obs_dim, hidden_dims=hidden_dims)
         critic_v = Critic(critic_v_backbone, args.device)
         orthogonal_init(actor, critic_q1, critic_q2, critic_v)
-        actor_optim = torch.optim.Adam(actor.parameters(), lr=3e-4)
-        critic_v_optim = torch.optim.Adam(critic_v.parameters(), lr=3e-4)
+        actor_optim = torch.optim.Adam(actor.parameters(), lr=args.iql_learning_rate)
+        critic_v_optim = torch.optim.Adam(critic_v.parameters(), lr=args.iql_learning_rate)
         policy = IQLPolicy(
             actor,
             critic_q1,
@@ -126,19 +126,23 @@ def build_model_free_policy(
             action_space=env.action_space,
             tau=0.005,
             gamma=discount,
-            expectile=0.7,
-            temperature=3.0,
+            expectile=args.iql_expectile,
+            temperature=args.iql_temperature,
         )
-        return policy, torch.optim.lr_scheduler.CosineAnnealingLR(actor_optim, args.epoch)
+        scheduler = (
+            torch.optim.lr_scheduler.CosineAnnealingLR(actor_optim, args.epoch)
+            if args.iql_lr_schedule == "cosine" else None
+        )
+        return policy, scheduler
 
     if algo == "td3bc":
         obs_mean, obs_std = buffer.normalize_obs()
-        hidden_dims = [256, 256]
+        hidden_dims = args.td3bc_hidden_dims
         actor_backbone = MLP(input_dim=obs_dim, hidden_dims=hidden_dims)
         actor = Actor(actor_backbone, action_dim, max_action=max_action, device=args.device)
-        critic1, critic1_optim = build_critic(obs_dim, action_dim, hidden_dims, args.device, 3e-4)
-        critic2, critic2_optim = build_critic(obs_dim, action_dim, hidden_dims, args.device, 3e-4)
-        actor_optim = torch.optim.Adam(actor.parameters(), lr=3e-4)
+        critic1, critic1_optim = build_critic(obs_dim, action_dim, hidden_dims, args.device, args.td3bc_learning_rate)
+        critic2, critic2_optim = build_critic(obs_dim, action_dim, hidden_dims, args.device, args.td3bc_learning_rate)
+        actor_optim = torch.optim.Adam(actor.parameters(), lr=args.td3bc_learning_rate)
         return TD3BCPolicy(
             actor,
             critic1,
@@ -153,7 +157,7 @@ def build_model_free_policy(
             policy_noise=0.2,
             noise_clip=0.5,
             update_actor_freq=2,
-            alpha=2.5,
+            alpha=args.td3bc_alpha,
             scaler=StandardScaler(mu=obs_mean, std=obs_std),
         ), None
 
