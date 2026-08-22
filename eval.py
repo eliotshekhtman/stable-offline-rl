@@ -258,7 +258,10 @@ def load_policy_and_dynamics(
         rollout_length=manifest["rollout_length"],
         adv_batch_size=manifest["adv_batch_size"],
     )
-    if manifest["algo"] == "iql":
+    if manifest["algo"] == "mobile":
+        mobile = manifest["training_schema"].get("mobile", {})
+        build_args.mobile_return_shift = mobile.get("return_shift", 0.0)
+    elif manifest["algo"] == "iql":
         iql = manifest["training_schema"]["iql"]
         build_args.iql_temperature = iql["temperature"]
         build_args.iql_expectile = iql["expectile"]

@@ -215,6 +215,11 @@ def build_model_based_policy(
         critics = torch.nn.ModuleList(
             [Critic(MLP(input_dim=obs_dim + action_dim, hidden_dims=hidden_dims), args.device) for _ in range(2)]
         )
+        return_shift = args.mobile_return_shift if env.spec.id == "Reacher-v5" else 0.0
+        if return_shift:
+            with torch.no_grad():
+                for critic in critics:
+                    critic.last.bias.add_(return_shift)
         critics_optim = torch.optim.Adam(critics.parameters(), lr=3e-4)
         alpha = build_auto_alpha(action_dim, args.device, 1e-4)
         policy = MOBILEPolicy(
@@ -230,7 +235,8 @@ def build_model_based_policy(
             num_samples=10,
             deterministic_backup=True,
             max_q_backup=False,
-            clamp_target_q=env.spec.id != "Reacher-v5",
+            clamp_target_q=True,
+            return_shift=return_shift,
         )
         return policy, dynamics, torch.optim.lr_scheduler.CosineAnnealingLR(actor_optim, args.epoch)
 

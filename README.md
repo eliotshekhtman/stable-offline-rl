@@ -21,6 +21,8 @@ All datasets are split by complete episode. Minari episodes, robomimic demonstra
 
 Generated datasets can mix clean expert, noisy expert, and random-action episodes. Pass `--composition CLEAN_EXPERT NOISY_EXPERT`; random data fills the remaining proportion. Repeat the argument to sweep specified compositions without taking a Cartesian product between their two values. `--noise-scale` applies only to the noisy expert component, while clean expert actions use zero noise. The default composition is `1 0`.
 
+MOBILE on `Reacher-v5` uses a shifted zero clamp for its critic targets. `--mobile-return-shift D` defaults to `30`: the critics are initialized with `+D`, each macro reward receives `(1 - macro_discount) * D`, and clamping at zero in shifted units is equivalent to a target floor of `-D` in the original units. The option is ignored by other environments, whose MOBILE behavior is unchanged.
+
 `DATASET_SCHEMA_VERSION` and `TRAINING_SCHEMA_VERSION` in `sweep.py` invalidate cached artifacts when dataset conversion or training behavior changes without a corresponding CLI change. Increment the relevant value when making such a change; evaluation-only edits require neither increment.
 
 ## Action chunks

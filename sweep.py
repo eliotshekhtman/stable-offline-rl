@@ -118,6 +118,7 @@ def parse_args() -> argparse.Namespace:
     model_based.add_argument("--rollout-length", type=int, default=5, help="Number of learned macro-transitions per synthetic rollout")
     model_based.add_argument("--model-retain-epochs", type=int, default=5, help="How many epochs of synthetic model rollouts to retain in the fake replay buffer")
     model_based.add_argument("--real-ratio", type=float, default=0.50, help="Fraction of each model-based training batch sampled from the real offline dataset rather than the synthetic rollout buffer")
+    model_based.add_argument("--mobile-return-shift", type=float, default=30.0, help="Reacher-only MOBILE return/Q shift D used to place the clamped target floor at -D")
     model_based.add_argument("--dynamics-update-freq", type=int, default=1000, help="RAMBO dynamics-adversary update interval; ignored by other model-based algorithms")
     model_based.add_argument("--adv-batch-size", type=int, default=256, help="RAMBO adversarial dynamics rollout batch size")
     model_based.add_argument("--adv-weight", type=float, default=3e-4, help="RAMBO adversarial dynamics loss weight")
@@ -136,6 +137,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("TD3+BC learning rate and alpha must be positive")
     if any(width <= 0 for width in args.td3bc_hidden_dims):
         parser.error("TD3+BC hidden dimensions must be positive")
+    if not math.isfinite(args.mobile_return_shift) or args.mobile_return_shift < 0.0:
+        parser.error("--mobile-return-shift must be finite and nonnegative")
     args.seeds = list(dict.fromkeys(args.seeds))
     args.chunk_lengths = list(dict.fromkeys(args.chunk_lengths))
     args.algos = list(dict.fromkeys(args.algos))
@@ -450,6 +453,11 @@ def make_training_schema(
             "learning_rate": args.td3bc_learning_rate,
             "alpha": args.td3bc_alpha,
             "hidden_dims": args.td3bc_hidden_dims,
+        }
+    if algo == "mobile" and env_name == "Reacher-v5":
+        schema["mobile"] = {
+            "return_shift": args.mobile_return_shift,
+            "clamp_target_q": True,
         }
     if algo in {"cql", "combo"}:
         schema["implementation_version"] = 2
