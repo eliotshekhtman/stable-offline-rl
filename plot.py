@@ -1,7 +1,7 @@
 # Tasks:
 # - Load completed sweep runs from run manifests and evaluation result files.
 # - Average matching results across the random seeds selected by the sweep.
-# - Plot best- and last-checkpoint performance and contraction against action chunk length.
+# - Plot final-policy performance and contraction against action chunk length.
 # - Plot task performance and contraction against generated noisy-trajectory fractions.
 # - Plot state and state-action conservativity over policy-training checkpoints.
 # - Plot task performance over policy-training checkpoints.
@@ -17,6 +17,10 @@ import numpy as np
 
 
 EPS = 1e-12
+EVALUATION_SCHEMA_VERSION = 2
+BOOTSTRAP_REPLICATES = 10000
+BOOTSTRAP_PERCENTILES = (10.0, 90.0)
+BOOTSTRAP_SEED = 0
 
 
 def main() -> None:
@@ -37,10 +41,7 @@ def parse_args() -> argparse.Namespace:
 def plot_root(root: Path, out: Path | None = None, eval_dirs: list[Path] | None = None) -> None:
     out = root / "plots" if out is None else out
     if eval_dirs is None:
-        latest = {}
-        for results_path in sorted(root.glob("*/*/results.json")):
-            latest[results_path.parent.parent.name] = results_path.parent
-        eval_dirs = sorted(latest.values())
+        eval_dirs = latest_eval_dirs(root)
     rows = load_rows(eval_dirs)
     histories = load_histories(eval_dirs, rows)
     rows = average_seed_rows(rows)
@@ -48,8 +49,7 @@ def plot_root(root: Path, out: Path | None = None, eval_dirs: list[Path] | None 
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)
-    for selection in ("best", "last"):
-        plot_generated_ablation(rows, out, selection)
+    plot_generated_ablation(rows, out)
 
     dataset_tags = sorted({row["plot_dataset_tag"] for row in rows} | {history["plot_dataset_tag"] for history in histories})
     for dataset_tag in dataset_tags:
@@ -57,12 +57,23 @@ def plot_root(root: Path, out: Path | None = None, eval_dirs: list[Path] | None 
         dataset_out.mkdir(exist_ok=True)
         dataset_rows = [row for row in rows if row["plot_dataset_tag"] == dataset_tag]
         dataset_histories = [history for history in histories if history["plot_dataset_tag"] == dataset_tag]
-        for selection in ("best", "last"):
-            selection_out = dataset_out / selection
-            selection_out.mkdir(exist_ok=True)
-            plot_performance_vs_chunk_length(dataset_rows, selection_out, selection)
-            plot_contraction_vs_chunk_length(dataset_rows, selection_out, selection)
+        selection_out = dataset_out / "final"
+        selection_out.mkdir(exist_ok=True)
+        plot_performance_vs_chunk_length(dataset_rows, selection_out)
+        plot_contraction_vs_chunk_length(dataset_rows, selection_out)
         plot_training_histories(dataset_histories, dataset_out)
+
+
+def latest_eval_dirs(root: Path) -> list[Path]:
+    latest = {}
+    for results_path in sorted(root.glob("*/*/results.json")):
+        results = load_json(results_path)
+        manifest_path = Path(results["run_manifest_path"])
+        if not manifest_path.exists():
+            continue
+        manifest = load_json(manifest_path)
+        latest[json.dumps(manifest["training_schema"], sort_keys=True)] = results_path.parent
+    return sorted(latest.values())
 
 
 def load_rows(eval_dirs: list[Path]) -> list[dict]:
@@ -70,10 +81,11 @@ def load_rows(eval_dirs: list[Path]) -> list[dict]:
     for eval_dir in sorted(eval_dirs):
         results_path = eval_dir / "results.json"
         if not results_path.exists():
-            print(f"Skipping incomplete evaluation: {eval_dir}")
             continue
 
         results = load_json(results_path)
+        if results["evaluation_config"].get("schema_version") != EVALUATION_SCHEMA_VERSION:
+            continue
         manifest_path = Path(results["run_manifest_path"])
         manifest = load_json(manifest_path)
         metadata = load_json(Path(manifest["dataset_metadata_path"]))
@@ -119,7 +131,6 @@ def average_seed_rows(rows: list[dict]) -> list[dict]:
         row = dict(seed_rows[0])
         row["seed_rows"] = seed_rows
         for key in (
-            "best_policy_performance_mean",
             "last_policy_performance_mean",
             "expert_performance_mean",
         ):
@@ -168,6 +179,7 @@ def load_histories(eval_dirs: list[Path], rows: list[dict]) -> list[dict]:
         if not history_path.exists() or row is None:
             continue
         history = load_json(history_path)
+        history["eval_dir"] = str(eval_dir.resolve())
         history["seed_group"] = row["seed_group"]
         history["plot_dataset_tag"] = row["plot_dataset_tag"]
         history["seedless_dataset_tag"] = row["seedless_dataset_tag"]
@@ -184,6 +196,7 @@ def average_seed_histories(histories: list[dict]) -> list[dict]:
     averaged = []
     for seed_histories in groups.values():
         history = dict(seed_histories[0])
+        history["seed_histories"] = seed_histories
         history["expert_performance_mean"] = float(np.mean([
             seed_history["expert_performance_mean"]
             for seed_history in seed_histories
@@ -215,50 +228,148 @@ def policy_label(record: dict) -> str:
     return f"{record['algo']} (l={record['chunk_length']})"
 
 
-def plot_performance_vs_chunk_length(rows: list[dict], out: Path, selection: str) -> None:
+def bootstrap_mean(samples_by_seed: list[np.ndarray]) -> tuple[float, float, float]:
+    samples_by_seed = [np.asarray(samples, dtype=np.float64).reshape(-1) for samples in samples_by_seed]
+    center = float(np.mean([samples.mean() for samples in samples_by_seed]))
+    rng = np.random.default_rng(BOOTSTRAP_SEED)
+    seed_count = len(samples_by_seed)
+    seed_choices = rng.integers(0, seed_count, size=(BOOTSTRAP_REPLICATES, seed_count))
+    bootstrap_means = np.empty((BOOTSTRAP_REPLICATES, seed_count), dtype=np.float64)
+
+    for slot in range(seed_count):
+        for seed_index, samples in enumerate(samples_by_seed):
+            rows = np.flatnonzero(seed_choices[:, slot] == seed_index)
+            indices = rng.integers(0, len(samples), size=(len(rows), len(samples)))
+            bootstrap_means[rows, slot] = samples[indices].mean(axis=1)
+
+    low, high = np.percentile(bootstrap_means.mean(axis=1), BOOTSTRAP_PERCENTILES)
+    return center, float(low), float(high)
+
+
+def finite_mean(values: np.ndarray, axis: int) -> np.ndarray:
+    counts = np.sum(np.isfinite(values), axis=axis)
+    return np.divide(
+        np.nansum(values, axis=axis),
+        counts,
+        out=np.full(counts.shape, np.nan, dtype=np.float64),
+        where=counts > 0,
+    )
+
+
+def bootstrap_curve(
+    curves_by_seed: list[np.ndarray],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    width = max(curves.shape[1] for curves in curves_by_seed)
+    padded = []
+    for curves in curves_by_seed:
+        seed_curves = np.full((len(curves), width), np.nan, dtype=np.float64)
+        seed_curves[:, : curves.shape[1]] = curves
+        padded.append(seed_curves)
+
+    center = finite_mean(
+        np.stack([finite_mean(curves, axis=0) for curves in padded]), axis=0
+    )
+    rng = np.random.default_rng(BOOTSTRAP_SEED)
+    seed_count = len(padded)
+    seed_choices = rng.integers(0, seed_count, size=(BOOTSTRAP_REPLICATES, seed_count))
+    sums = np.zeros((BOOTSTRAP_REPLICATES, width), dtype=np.float64)
+    counts = np.zeros((BOOTSTRAP_REPLICATES, width), dtype=np.int16)
+
+    for slot in range(seed_count):
+        for seed_index, curves in enumerate(padded):
+            rows = np.flatnonzero(seed_choices[:, slot] == seed_index)
+            for start in range(0, len(rows), 500):
+                batch_rows = rows[start : start + 500]
+                indices = rng.integers(
+                    0, len(curves), size=(len(batch_rows), len(curves))
+                )
+                means = finite_mean(curves[indices], axis=1)
+                valid = np.isfinite(means)
+                sums[batch_rows] += np.where(valid, means, 0.0)
+                counts[batch_rows] += valid
+
+    bootstrap_means = np.divide(
+        sums,
+        counts,
+        out=np.full(sums.shape, np.nan, dtype=np.float64),
+        where=counts > 0,
+    )
+    low = np.full(width, np.nan, dtype=np.float64)
+    high = np.full(width, np.nan, dtype=np.float64)
+    for timestep in range(width):
+        values = bootstrap_means[:, timestep]
+        values = values[np.isfinite(values)]
+        if len(values):
+            low[timestep], high[timestep] = np.percentile(values, BOOTSTRAP_PERCENTILES)
+    return center, low, high
+
+
+def final_performance_samples(row: dict) -> list[np.ndarray]:
+    samples = []
+    for seed_row in row["seed_rows"]:
+        with np.load(Path(seed_row["eval_dir"]) / "returns_last.npz") as data:
+            samples.append(data["policy_episode_performance"])
+    return samples
+
+
+def history_performance_samples(history: dict, step: int) -> list[np.ndarray]:
+    samples = []
+    for seed_history in history["seed_histories"]:
+        record = next(record for record in seed_history["records"] if record["step"] == step)
+        with np.load(Path(seed_history["eval_dir"]) / "rollouts" / f"step_{record['step']}.npz") as data:
+            samples.append(data["performance"])
+    return samples
+
+
+def history_scalar_samples(history: dict, step: int, key: str) -> list[np.ndarray]:
+    samples = []
+    for seed_history in history["seed_histories"]:
+        record = next(record for record in seed_history["records"] if record["step"] == step)
+        samples.append(np.asarray([record[key]], dtype=np.float64))
+    return samples
+
+
+def plot_performance_vs_chunk_length(rows: list[dict], out: Path) -> None:
     if len({row["chunk_length"] for row in rows}) < 2:
         return
 
     fig, ax = plt.subplots(figsize=(8, 5))
     for algo in sorted({row["algo"] for row in rows}):
         algo_rows = sorted((row for row in rows if row["algo"] == algo), key=lambda row: row["chunk_length"])
-        ax.plot(
-            [row["chunk_length"] for row in algo_rows],
-            [row[f"{selection}_policy_performance_mean"] for row in algo_rows],
-            marker="o",
-            label=algo,
-        )
+        x = [row["chunk_length"] for row in algo_rows]
+        intervals = [bootstrap_mean(final_performance_samples(row)) for row in algo_rows]
+        center, low, high = map(np.asarray, zip(*intervals))
+        line, = ax.plot(x, center, marker="o", label=algo)
+        ax.fill_between(x, low, high, color=line.get_color(), alpha=0.2)
     ax.axhline(
         np.mean([row["expert_performance_mean"] for row in rows]),
         color="black", linestyle=":", label="expert",
     )
     ax.set_xlabel("action chunk length")
     ax.set_ylabel(rows[0]["performance_label"])
-    ax.set_title(f"{selection.capitalize()}-checkpoint {rows[0]['performance_label']} vs action chunk length")
+    ax.set_title(f"Final-policy {rows[0]['performance_label']} vs action chunk length")
     ax.legend()
     fig.tight_layout()
     fig.savefig(out / "performance_vs_chunk_length.png", dpi=200)
     plt.close(fig)
 
 
-def plot_contraction_vs_chunk_length(rows: list[dict], out: Path, selection: str) -> None:
+def plot_contraction_vs_chunk_length(rows: list[dict], out: Path) -> None:
     if len({row["chunk_length"] for row in rows}) < 2:
         return
     contraction_curve_plot(
         rows, "chunk_length", "chunk length",
-        f"{selection.capitalize()}-checkpoint contraction by action chunk length",
+        "Final-policy contraction by action chunk length",
         out / "contraction_vs_chunk_length.png",
-        selection,
     )
 
 
-def plot_generated_ablation(rows: list[dict], out: Path, selection: str) -> None:
+def plot_generated_ablation(rows: list[dict], out: Path) -> None:
     generated = [row for row in rows if row["dataset_source"] == "generated"]
     if not generated or len({row["noisy_trajectory_fraction"] for row in generated}) < 2:
         return
     fixed = ("num_samples", "noise_scale", "chunk_length")
     if any(len({row[key] for row in generated}) > 1 for key in fixed):
-        print("Skipping generated composition plots: sample count, noise scale, and chunk length must be fixed.")
         return
 
     if all(row["requested_prop_clean_expert"] == 0.0 for row in generated):
@@ -268,33 +379,32 @@ def plot_generated_ablation(rows: list[dict], out: Path, selection: str) -> None
         family = "expert_noisy"
         title = "Clean-expert/noisy-expert trajectory ablation"
     else:
-        print("Skipping generated composition plots: rows do not form one requested composition ablation.")
         return
 
-    experiment_out = out / family / selection
+    experiment_out = out / family / "final"
     experiment_out.mkdir(parents=True, exist_ok=True)
     performance_ablation_plot(
-        generated, title, experiment_out / "performance_vs_noisy_fraction.png", selection
+        generated, title, experiment_out / "performance_vs_noisy_fraction.png"
     )
     contraction_curve_plot(
         generated, "noisy_trajectory_fraction", "noisy trajectory fraction",
-        f"{selection.capitalize()}-checkpoint {title.lower()}",
-        experiment_out / "contraction_vs_noisy_fraction.png", selection,
+        f"Final-policy {title.lower()}",
+        experiment_out / "contraction_vs_noisy_fraction.png",
     )
 
 
-def performance_ablation_plot(rows: list[dict], title: str, path: Path, selection: str) -> None:
+def performance_ablation_plot(rows: list[dict], title: str, path: Path) -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
     for algo in sorted({row["algo"] for row in rows}):
         algo_rows = sorted(
             (row for row in rows if row["algo"] == algo),
             key=lambda row: row["noisy_trajectory_fraction"],
         )
-        ax.plot(
-            [row["noisy_trajectory_fraction"] for row in algo_rows],
-            [row[f"{selection}_policy_performance_mean"] for row in algo_rows],
-            marker="o", label=algo,
-        )
+        x = [row["noisy_trajectory_fraction"] for row in algo_rows]
+        intervals = [bootstrap_mean(final_performance_samples(row)) for row in algo_rows]
+        center, low, high = map(np.asarray, zip(*intervals))
+        line, = ax.plot(x, center, marker="o", label=algo)
+        ax.fill_between(x, low, high, color=line.get_color(), alpha=0.2)
     ax.axhline(
         np.mean([row["expert_performance_mean"] for row in rows]),
         color="black", linestyle=":", label="expert",
@@ -302,7 +412,7 @@ def performance_ablation_plot(rows: list[dict], title: str, path: Path, selectio
     ax.set_xlim(-0.02, 1.02)
     ax.set_xlabel("fraction of trajectories collected from the noisy expert")
     ax.set_ylabel(rows[0]["performance_label"])
-    ax.set_title(f"{selection.capitalize()}-checkpoint {rows[0]['performance_label']}\n{title}")
+    ax.set_title(f"Final-policy {rows[0]['performance_label']}\n{title}")
     ax.legend()
     fig.tight_layout()
     fig.savefig(path, dpi=200)
@@ -315,9 +425,8 @@ def contraction_curve_plot(
     value_label: str,
     title: str,
     path: Path,
-    selection: str,
 ) -> None:
-    filename = f"contraction_{selection}.npz"
+    filename = "contraction_last.npz"
     available = [
         row for row in rows
         if any((Path(seed_row["eval_dir"]) / filename).exists() for seed_row in row["seed_rows"])
@@ -335,9 +444,13 @@ def contraction_curve_plot(
                 contraction_path = Path(seed_row["eval_dir"]) / filename
                 if contraction_path.exists():
                     with np.load(contraction_path) as data:
-                        seed_curves.append(np.nanmean(data["distance_curves"], axis=0))
-            mean_curve = np.nanmean(seed_curves, axis=0)
-            axis.plot(mean_curve, label=f"{value_label}={row[value_key]:g}")
+                        seed_curves.append(data["distance_curves"])
+            center, low, high = bootstrap_curve(seed_curves)
+            timesteps = np.arange(len(center))
+            line, = axis.plot(center, label=f"{value_label}={row[value_key]:g}")
+            axis.fill_between(
+                timesteps, low, high, color=line.get_color(), alpha=0.2
+            )
         axis.set_title(algo)
         axis.set_xlabel("primitive timestep")
         axis.legend(fontsize=8)
@@ -415,12 +528,14 @@ def performance_history_plot(histories: list[dict], path: Path) -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
     for history in histories:
         records = history["records"]
-        ax.plot(
-            [record["actual_percent"] for record in records],
-            [record["policy_performance_mean"] for record in records],
-            marker="o",
-            label=history["label"],
-        )
+        x = [record["actual_percent"] for record in records]
+        intervals = [
+            bootstrap_mean(history_performance_samples(history, record["step"]))
+            for record in records
+        ]
+        center, low, high = map(np.asarray, zip(*intervals))
+        line, = ax.plot(x, center, marker="o", label=history["label"])
+        ax.fill_between(x, low, high, color=line.get_color(), alpha=0.2)
     ax.axhline(
         np.mean([history["expert_performance_mean"] for history in histories]),
         color="black", linestyle=":", label="expert",
@@ -442,12 +557,14 @@ def history_line_plot(histories: list[dict], keys: tuple[str, ...], names: tuple
             continue
         for history in key_histories:
             records = history["records"]
-            axis.plot(
-                [record["actual_percent"] for record in records],
-                [record[key] for record in records],
-                marker="o",
-                label=history["label"],
-            )
+            x = [record["actual_percent"] for record in records]
+            intervals = [
+                bootstrap_mean(history_scalar_samples(history, record["step"], key))
+                for record in records
+            ]
+            center, low, high = map(np.asarray, zip(*intervals))
+            line, = axis.plot(x, center, marker="o", label=history["label"])
+            axis.fill_between(x, low, high, color=line.get_color(), alpha=0.2)
         if key.endswith("_ood_ratio"):
             axis.axhline(1.0, color="gray", linestyle=":")
         axis.set_ylabel(name)

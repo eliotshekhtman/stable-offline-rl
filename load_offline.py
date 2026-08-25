@@ -159,7 +159,7 @@ def list_robomimic_dataset_specs(
                 f"Unknown robomimic dataset {dataset_name!r} for {env_name!r}; available: {available}"
             )
         specs = matches
-    return [
+    dataset_specs = [
         {
             "source": "robomimic",
             "task": env_name,
@@ -169,6 +169,10 @@ def list_robomimic_dataset_specs(
         }
         for dataset_type, repo_path, horizon in specs
     ]
+    if env_name == "Lift":
+        for spec in dataset_specs:
+            spec["task_semantics"] = "continuing"
+    return dataset_specs
 
 
 def load_robomimic_dataset(spec: dict[str, Any], seed: int | None = None) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
@@ -178,7 +182,7 @@ def load_robomimic_dataset(spec: dict[str, Any], seed: int | None = None) -> tup
     dataset_path = hf_hub_download(repo_id=ROBOMIMIC_HF_REPO_ID, filename=spec["repo_path"], repo_type="dataset")
     with h5py.File(dataset_path, "r") as file:
         demos = [
-            robomimic_demo_to_transitions(file["data"][demo_key], episode_id)
+            robomimic_demo_to_transitions(file["data"][demo_key], episode_id, spec["task"])
             for episode_id, demo_key in enumerate(sorted(file["data"].keys()))
         ]
         dataset = concat_datasets(demos)
@@ -200,7 +204,11 @@ def load_robomimic_dataset(spec: dict[str, Any], seed: int | None = None) -> tup
     }
 
 
-def robomimic_demo_to_transitions(demo: h5py.Group, episode_id: int) -> dict[str, np.ndarray]:
+def robomimic_demo_to_transitions(
+    demo: h5py.Group,
+    episode_id: int,
+    task: str,
+) -> dict[str, np.ndarray]:
     observations = np.concatenate([np.asarray(demo["obs"][key], dtype=np.float32) for key in ROBOMIMIC_OBS_KEYS], axis=1)
     next_observations = np.concatenate([
         np.asarray(demo["next_obs"][key], dtype=np.float32) for key in ROBOMIMIC_OBS_KEYS
@@ -209,7 +217,10 @@ def robomimic_demo_to_transitions(demo: h5py.Group, episode_id: int) -> dict[str
     rewards = np.asarray(demo["rewards"], dtype=np.float32)
     terminals = np.asarray(demo["dones"], dtype=bool)
     timeouts = np.zeros(len(actions), dtype=bool)
-    if len(timeouts) and not terminals[-1]:
+    if task == "Lift":
+        terminals = np.zeros_like(terminals)
+        timeouts[-1] = True
+    elif len(timeouts) and not terminals[-1]:
         timeouts[-1] = True
 
     return {
@@ -224,7 +235,8 @@ def robomimic_demo_to_transitions(demo: h5py.Group, episode_id: int) -> dict[str
 
 
 def make_robomimic_dataset_tag(spec: dict[str, Any]) -> str:
-    return f"robomimic_{spec['task'].lower()}_{spec['dataset_type']}"
+    tag = f"robomimic_{spec['task'].lower()}_{spec['dataset_type']}"
+    return f"{tag}_continuing" if spec["task"] == "Lift" else tag
 
 
 def load_metadata(metadata_path: str | Path) -> dict[str, Any]:

@@ -2,7 +2,7 @@
 # - Reload trained OfflineRL-Kit runs from their run_manifest.json files.
 # - Evaluate learned policies and configured expert policies in the true environment.
 # - Execute learned action chunks open-loop while retaining primitive-step metrics.
-# - Measure best- and last-policy contraction after perturbing only controlled-agent coordinates.
+# - Measure final-policy contraction after perturbing only controlled-agent coordinates.
 # - Measure policy conservativity over training checkpoints.
 # - Retain dormant learned-dynamics and Jacobian evaluation implementations for future use.
 
@@ -26,8 +26,9 @@ from policies import MODEL_BASED_ALGOS, build_model_based_policy, build_model_fr
 from sweep import build_buffer
 
 
-EVALUATION_SCHEMA_VERSION = 1
+EVALUATION_SCHEMA_VERSION = 2
 ROLLOUT_CACHE_VERSION = 1
+FINAL_EVAL_SEED_OFFSET = 1_000_000
 
 
 def main() -> None:
@@ -46,7 +47,8 @@ def parse_args() -> argparse.Namespace:
     run.add_argument("--reuse-eval", action="store_true", help="Reuse matching cached checkpoint rollouts and completed evaluation results")
 
     rollout_eval = parser.add_argument_group("rollout evaluation")
-    rollout_eval.add_argument("--eval-episodes", type=int, default=10, help="Number of true-environment episodes used to estimate policy performance and Gymnasium expert performance")
+    rollout_eval.add_argument("--checkpoint-eval-episodes", type=int, default=20, help="Number of true-environment episodes used to monitor each non-final training checkpoint")
+    rollout_eval.add_argument("--final-eval-episodes", type=int, default=100, help="Number of true-environment episodes used for the final policy and Gymnasium expert report")
 
     behavior = parser.add_argument_group("contraction and conservativity evaluation")
     behavior.add_argument("--contraction-trajectories", type=int, default=8, help="Number of matched unperturbed and agent-state-perturbed trajectory pairs")
@@ -54,10 +56,12 @@ def parse_args() -> argparse.Namespace:
     behavior.add_argument("--perturbation-scale", type=float, default=0.01, help="Euclidean norm of the initial perturbation applied to controlled-agent qpos/qvel coordinates")
     behavior.add_argument("--ood-samples", type=int, default=10000, help="Maximum held-out and policy decision-boundary samples used for OOD metrics")
     args = parser.parse_args()
-    if args.eval_episodes <= 0 or args.contraction_trajectories <= 0 or args.contraction_horizon <= 0:
+    if args.checkpoint_eval_episodes <= 0 or args.final_eval_episodes <= 0:
+        parser.error("checkpoint and final evaluation episode counts must be positive")
+    if args.contraction_trajectories <= 0 or args.contraction_horizon <= 0:
         parser.error("evaluation episode, trajectory, and horizon counts must be positive")
-    if args.contraction_trajectories > args.eval_episodes:
-        parser.error("--contraction-trajectories cannot exceed --eval-episodes")
+    if args.contraction_trajectories > args.final_eval_episodes:
+        parser.error("--contraction-trajectories cannot exceed --final-eval-episodes")
     if args.perturbation_scale < 0.0:
         parser.error("--perturbation-scale must be nonnegative")
     return args
@@ -79,7 +83,6 @@ def evaluate_run(run_dir: Path, args: argparse.Namespace) -> Path:
     eval_dir = Path(manifest["eval_dir"])
     config = evaluation_config(manifest, args)
     if args.reuse_eval and evaluation_is_complete(eval_dir, config):
-        print(f"Reusing completed evaluation: {eval_dir}")
         return eval_dir
     if eval_dir.exists() and not args.reuse_eval:
         shutil.rmtree(eval_dir)
@@ -111,18 +114,26 @@ def evaluate_run(run_dir: Path, args: argparse.Namespace) -> Path:
     rollout_infos = {}
     records = []
     last_loaded_path = Path(last_checkpoint["policy_path"])
+    final_rollout_seed = args.seed + FINAL_EVAL_SEED_OFFSET
     try:
         for checkpoint in checkpoints:
+            is_final = checkpoint["step"] == last_checkpoint["step"]
+            episodes = args.final_eval_episodes if is_final else args.checkpoint_eval_episodes
+            rollout_seed = final_rollout_seed if is_final else args.seed
             checkpoint_path = Path(checkpoint["policy_path"])
-            rollout_info = load_cached_rollout(eval_dir, manifest, checkpoint, args)
+            rollout_info = load_cached_rollout(
+                eval_dir, manifest, checkpoint, args, episodes, rollout_seed
+            )
             if rollout_info is None:
                 if checkpoint_path != last_loaded_path:
                     load_policy_checkpoint(policy, checkpoint_path, args.device)
                     last_loaded_path = checkpoint_path
                 rollout_info = evaluate_policy_rollouts(
-                    policy, env, manifest, args.eval_episodes, args.seed, body_ids
+                    policy, env, manifest, episodes, rollout_seed, body_ids
                 )
-                save_cached_rollout(eval_dir, manifest, checkpoint, args, rollout_info)
+                save_cached_rollout(
+                    eval_dir, manifest, checkpoint, episodes, rollout_seed, rollout_info
+                )
             rollout_infos[checkpoint["step"]] = rollout_info
             conservativity = evaluate_conservativity(
                 conservativity_reference,
@@ -131,44 +142,34 @@ def evaluate_run(run_dir: Path, args: argparse.Namespace) -> Path:
                 args.ood_samples,
                 args.seed,
             )
-            records.append(checkpoint_record(checkpoint, rollout_info, conservativity))
+            records.append(
+                checkpoint_record(checkpoint, rollout_info, conservativity, episodes, rollout_seed)
+            )
 
-        higher_is_better = performance_definition(manifest["env_name"])[2]
-        best_record = select_best_record(records, higher_is_better)
-        best_checkpoint = next(
-            checkpoint for checkpoint in checkpoints if checkpoint["step"] == best_record["step"]
+        contraction = load_cached_contraction(
+            eval_dir, manifest, last_checkpoint, args, final_rollout_seed
         )
-        selected = {"last": last_checkpoint, "best": best_checkpoint}
-        contractions = {}
-        for name, checkpoint in selected.items():
-            if name == "best" and checkpoint["step"] == last_checkpoint["step"]:
-                contractions[name] = contractions["last"]
-                save_cached_contraction(eval_dir, name, checkpoint, args, contractions[name])
-                continue
-            contraction = load_cached_contraction(eval_dir, name, checkpoint, args)
-            if contraction is None:
-                checkpoint_path = Path(checkpoint["policy_path"])
-                if checkpoint_path != last_loaded_path:
-                    load_policy_checkpoint(policy, checkpoint_path, args.device)
-                    last_loaded_path = checkpoint_path
-                contraction = evaluate_contraction(
-                    policy, env, manifest, rollout_infos[checkpoint["step"]],
-                    args.contraction_trajectories, args.contraction_horizon,
-                    args.perturbation_scale, args.seed, body_ids, body_names,
-                )
-                save_cached_contraction(eval_dir, name, checkpoint, args, contraction)
-            contractions[name] = contraction
+        if contraction is None:
+            if Path(last_checkpoint["policy_path"]) != last_loaded_path:
+                load_policy_checkpoint(policy, Path(last_checkpoint["policy_path"]), args.device)
+            contraction = evaluate_contraction(
+                policy, env, manifest, rollout_infos[last_checkpoint["step"]],
+                args.contraction_trajectories, args.contraction_horizon,
+                args.perturbation_scale, final_rollout_seed, body_ids, body_names,
+            )
+            save_cached_contraction(
+                eval_dir, manifest, last_checkpoint, args, final_rollout_seed, contraction
+            )
     finally:
         chunk_env.close()
 
     last_info = rollout_infos[last_checkpoint["step"]]
-    best_info = rollout_infos[best_checkpoint["step"]]
     last_conservativity = evaluate_conservativity(
         conservativity_reference,
         last_info["decision_observations"], last_info["action_chunks"],
         args.ood_samples, args.seed,
     )
-    expert_info = load_or_evaluate_expert(eval_dir, manifest, args)
+    expert_info = load_or_evaluate_expert(eval_dir, manifest, args, final_rollout_seed)
 
     results = {
         "run_manifest_path": str(manifest_path),
@@ -186,22 +187,24 @@ def evaluate_run(run_dir: Path, args: argparse.Namespace) -> Path:
         "performance_metric": last_info["performance_metric"],
         "performance_label": last_info["performance_label"],
         "performance_higher_is_better": last_info["performance_higher_is_better"],
-        **policy_summary("last", last_checkpoint, last_info),
-        **policy_summary("best", best_checkpoint, best_info),
+        "last_checkpoint_step": last_checkpoint["step"],
+        "last_checkpoint_percent": last_checkpoint["actual_percent"],
+        "last_policy_return_mean": float(last_info["returns"].mean()),
+        "last_policy_return_std": float(last_info["returns"].std()),
+        "last_policy_performance_mean": float(last_info["performance"].mean()),
+        "last_policy_performance_std": float(last_info["performance"].std()),
         "expert_return_mean": expert_info["return_mean"],
         "expert_return_std": expert_info["return_std"],
         "expert_performance_mean": expert_info["performance_mean"],
         "expert_performance_std": expert_info["performance_std"],
     }
-    for name, rollout_info in (("last", last_info), ("best", best_info)):
-        np.savez_compressed(
-            eval_dir / f"returns_{name}.npz",
-            policy_episode_returns=rollout_info["returns"],
-            expert_episode_returns=expert_info["returns"],
-            policy_episode_performance=rollout_info["performance"],
-            expert_episode_performance=expert_info["performance"],
-        )
-        np.savez_compressed(eval_dir / f"contraction_{name}.npz", **contractions[name])
+    np.savez_compressed(
+        eval_dir / "returns_last.npz",
+        policy_episode_returns=last_info["returns"],
+        expert_episode_returns=expert_info["returns"],
+        policy_episode_performance=last_info["performance"],
+        expert_episode_performance=expert_info["performance"],
+    )
     np.savez_compressed(eval_dir / "conservativity.npz", **last_conservativity)
     results.update(
         last_state_ood_ratio=float(last_conservativity["state_ood_ratio"]),
@@ -210,15 +213,15 @@ def evaluate_run(run_dir: Path, args: argparse.Namespace) -> Path:
     save_history(manifest, expert_info, records, eval_dir)
     with (eval_dir / "results.json").open("w", encoding="utf-8") as file:
         json.dump(results, file, indent=2, sort_keys=True)
-    print(f"Saved evaluation: {eval_dir}")
     return eval_dir
 
 
 def evaluation_config(manifest: dict, args: argparse.Namespace) -> dict:
-    return {
+    config = {
         "schema_version": EVALUATION_SCHEMA_VERSION,
         "device": args.device,
-        "eval_episodes": args.eval_episodes,
+        "checkpoint_eval_episodes": args.checkpoint_eval_episodes,
+        "final_eval_episodes": args.final_eval_episodes,
         "expert": manifest["expert"],
         "seed": args.seed,
         "contraction_trajectories": args.contraction_trajectories,
@@ -226,13 +229,16 @@ def evaluation_config(manifest: dict, args: argparse.Namespace) -> dict:
         "perturbation_scale": args.perturbation_scale,
         "ood_samples": args.ood_samples,
     }
+    task_semantics = manifest["training_schema"]["dataset"].get("task_semantics")
+    if task_semantics is not None:
+        config["task_semantics"] = task_semantics
+    return config
 
 
 def evaluation_is_complete(eval_dir: Path, config: dict) -> bool:
     required = (
         "results.json", "history.json", "history.npz", "returns_last.npz",
-        "returns_best.npz", "contraction_last.npz", "contraction_best.npz",
-        "conservativity.npz",
+        "contraction_last.npz", "conservativity.npz",
     )
     results_path = eval_dir / "results.json"
     if not results_path.exists() or not all((eval_dir / name).exists() for name in required):
@@ -258,6 +264,13 @@ def load_policy_and_dynamics(
         rollout_length=manifest["rollout_length"],
         adv_batch_size=manifest["adv_batch_size"],
     )
+    if manifest["algo"] in MODEL_BASED_ALGOS:
+        model_based = manifest["training_schema"]["model_based"]
+        build_args.model_manipulation_settings = "manipulation_settings" in model_based
+        build_args.model_actor_learning_rate = model_based.get("actor_learning_rate")
+        build_args.model_critic_learning_rate = model_based.get("critic_learning_rate", 3e-4)
+        build_args.mopo_penalty_coef = manifest["training_schema"].get("mopo", {}).get("penalty_coef", 0.5)
+        build_args.mobile_penalty_coef = manifest["training_schema"].get("mobile", {}).get("penalty_coef", 1.5)
     if manifest["algo"] == "mobile":
         mobile = manifest["training_schema"].get("mobile", {})
         build_args.mobile_return_shift = mobile.get("return_shift", 0.0)
@@ -324,39 +337,25 @@ def robomimic_expert_metadata(manifest: dict) -> dict:
     return ph_metadata
 
 
-def checkpoint_record(checkpoint: dict, rollout_info: dict, conservativity: dict) -> dict:
+def checkpoint_record(
+    checkpoint: dict,
+    rollout_info: dict,
+    conservativity: dict,
+    episodes: int,
+    rollout_seed: int,
+) -> dict:
     return {
         "requested_percent": checkpoint["requested_percent"],
         "actual_percent": checkpoint["actual_percent"],
         "step": checkpoint["step"],
+        "evaluation_episodes": episodes,
+        "evaluation_seed": rollout_seed,
         "policy_return_mean": float(rollout_info["returns"].mean()),
         "policy_return_std": float(rollout_info["returns"].std()),
         "policy_performance_mean": float(rollout_info["performance"].mean()),
         "policy_performance_std": float(rollout_info["performance"].std()),
         "state_ood_ratio": float(conservativity["state_ood_ratio"]),
         "state_action_ood_ratio": float(conservativity["state_action_ood_ratio"]),
-    }
-
-
-def select_best_record(records: list[dict], higher_is_better: bool) -> dict:
-    direction = 1.0 if higher_is_better else -1.0
-    return max(
-        records,
-        key=lambda record: (
-            direction * record["policy_performance_mean"],
-            record["actual_percent"],
-        ),
-    )
-
-
-def policy_summary(name: str, checkpoint: dict, rollout_info: dict) -> dict:
-    return {
-        f"{name}_checkpoint_step": checkpoint["step"],
-        f"{name}_checkpoint_percent": checkpoint["actual_percent"],
-        f"{name}_policy_return_mean": float(rollout_info["returns"].mean()),
-        f"{name}_policy_return_std": float(rollout_info["returns"].std()),
-        f"{name}_policy_performance_mean": float(rollout_info["performance"].mean()),
-        f"{name}_policy_performance_std": float(rollout_info["performance"].std()),
     }
 
 
@@ -436,6 +435,7 @@ def rollout_policy_episode(
     horizon: int | None = None,
     initial_qpos: np.ndarray | None = None,
     initial_qvel: np.ndarray | None = None,
+    stop_on_success: bool = True,
 ) -> dict:
     if initial_qpos is None:
         _, reset_info = env.reset(seed=reset_seed)
@@ -468,7 +468,7 @@ def rollout_policy_episode(
                 and bool(env.unwrapped._check_success())
             )
             succeeded |= task_succeeded
-            done = terminated or truncated or task_succeeded
+            done = terminated or truncated or (stop_on_success and task_succeeded)
             if done or (horizon is not None and primitive_steps == horizon):
                 break
 
@@ -486,7 +486,12 @@ def rollout_policy_episode(
     }
 
 
-def rollout_cache_config(manifest: dict, checkpoint: dict, args: argparse.Namespace) -> dict:
+def rollout_cache_config(
+    manifest: dict,
+    checkpoint: dict,
+    episodes: int,
+    rollout_seed: int,
+) -> dict:
     return {
         "version": ROLLOUT_CACHE_VERSION,
         "env_name": manifest["env_name"],
@@ -494,8 +499,8 @@ def rollout_cache_config(manifest: dict, checkpoint: dict, args: argparse.Namesp
         "chunk_length": manifest["chunk_length"],
         "checkpoint_step": checkpoint["step"],
         "policy_path": checkpoint["policy_path"],
-        "episodes": args.eval_episodes,
-        "seed": args.seed,
+        "episodes": episodes,
+        "seed": rollout_seed,
     }
 
 
@@ -504,6 +509,8 @@ def load_cached_rollout(
     manifest: dict,
     checkpoint: dict,
     args: argparse.Namespace,
+    episodes: int,
+    rollout_seed: int,
 ) -> dict | None:
     if not args.reuse_eval:
         return None
@@ -512,7 +519,9 @@ def load_cached_rollout(
     if not path.exists() or not config_path.exists():
         return None
     with config_path.open("r", encoding="utf-8") as file:
-        if json.load(file) != rollout_cache_config(manifest, checkpoint, args):
+        if json.load(file) != rollout_cache_config(
+            manifest, checkpoint, episodes, rollout_seed
+        ):
             return None
     with np.load(path) as data:
         rollout_info = {key: data[key] for key in data.files}
@@ -529,7 +538,8 @@ def save_cached_rollout(
     eval_dir: Path,
     manifest: dict,
     checkpoint: dict,
-    args: argparse.Namespace,
+    episodes: int,
+    rollout_seed: int,
     rollout_info: dict,
 ) -> None:
     path = eval_dir / "rollouts" / f"step_{checkpoint['step']}.npz"
@@ -537,35 +547,47 @@ def save_cached_rollout(
     arrays = {key: value for key, value in rollout_info.items() if isinstance(value, np.ndarray)}
     np.savez_compressed(path, **arrays)
     with path.with_suffix(".json").open("w", encoding="utf-8") as file:
-        json.dump(rollout_cache_config(manifest, checkpoint, args), file, indent=2, sort_keys=True)
+        json.dump(
+            rollout_cache_config(manifest, checkpoint, episodes, rollout_seed),
+            file, indent=2, sort_keys=True,
+        )
 
 
-def contraction_cache_config(name: str, checkpoint: dict, args: argparse.Namespace) -> dict:
-    return {
+def contraction_cache_config(
+    manifest: dict,
+    checkpoint: dict,
+    args: argparse.Namespace,
+    rollout_seed: int,
+) -> dict:
+    config = {
         "version": EVALUATION_SCHEMA_VERSION,
-        "selection": name,
         "checkpoint_step": checkpoint["step"],
         "trajectories": args.contraction_trajectories,
         "horizon": args.contraction_horizon,
         "perturbation_scale": args.perturbation_scale,
-        "seed": args.seed,
+        "seed": rollout_seed,
     }
+    task_semantics = manifest["training_schema"]["dataset"].get("task_semantics")
+    if task_semantics is not None:
+        config["task_semantics"] = task_semantics
+    return config
 
 
 def load_cached_contraction(
     eval_dir: Path,
-    name: str,
+    manifest: dict,
     checkpoint: dict,
     args: argparse.Namespace,
+    rollout_seed: int,
 ) -> dict | None:
     if not args.reuse_eval:
         return None
-    path = eval_dir / f"contraction_{name}.npz"
-    config_path = eval_dir / f"contraction_{name}.json"
+    path = eval_dir / "contraction_last.npz"
+    config_path = eval_dir / "contraction_last.json"
     if not path.exists() or not config_path.exists():
         return None
     with config_path.open("r", encoding="utf-8") as file:
-        if json.load(file) != contraction_cache_config(name, checkpoint, args):
+        if json.load(file) != contraction_cache_config(manifest, checkpoint, args, rollout_seed):
             return None
     with np.load(path) as data:
         return {key: data[key] for key in data.files}
@@ -573,25 +595,34 @@ def load_cached_contraction(
 
 def save_cached_contraction(
     eval_dir: Path,
-    name: str,
+    manifest: dict,
     checkpoint: dict,
     args: argparse.Namespace,
+    rollout_seed: int,
     contraction: dict,
 ) -> None:
-    np.savez_compressed(eval_dir / f"contraction_{name}.npz", **contraction)
-    with (eval_dir / f"contraction_{name}.json").open("w", encoding="utf-8") as file:
-        json.dump(contraction_cache_config(name, checkpoint, args), file, indent=2, sort_keys=True)
+    np.savez_compressed(eval_dir / "contraction_last.npz", **contraction)
+    with (eval_dir / "contraction_last.json").open("w", encoding="utf-8") as file:
+        json.dump(
+            contraction_cache_config(manifest, checkpoint, args, rollout_seed),
+            file, indent=2, sort_keys=True,
+        )
 
 
-def load_or_evaluate_expert(eval_dir: Path, manifest: dict, args: argparse.Namespace) -> dict:
+def load_or_evaluate_expert(
+    eval_dir: Path,
+    manifest: dict,
+    args: argparse.Namespace,
+    rollout_seed: int,
+) -> dict:
     path = eval_dir / "expert.npz"
     config_path = eval_dir / "expert.json"
     config = {
         "version": EVALUATION_SCHEMA_VERSION,
         "env_name": manifest["env_name"],
         "expert": manifest["expert"],
-        "episodes": args.eval_episodes,
-        "seed": args.seed,
+        "episodes": args.final_eval_episodes,
+        "seed": rollout_seed,
     }
     if args.reuse_eval and path.exists() and config_path.exists():
         with config_path.open("r", encoding="utf-8") as file:
@@ -606,7 +637,7 @@ def load_or_evaluate_expert(eval_dir: Path, manifest: dict, args: argparse.Names
                 "performance_mean": float(arrays["performance"].mean()),
                 "performance_std": float(arrays["performance"].std()),
             }
-    expert_info = evaluate_expert(manifest, args.eval_episodes, args.seed)
+    expert_info = evaluate_expert(manifest, args.final_eval_episodes, rollout_seed)
     np.savez_compressed(path, returns=expert_info["returns"], performance=expert_info["performance"])
     with config_path.open("w", encoding="utf-8") as file:
         json.dump(config, file, indent=2, sort_keys=True)
@@ -726,6 +757,9 @@ def evaluate_contraction(
     rng = np.random.default_rng(seed)
     curves = []
     qpos_indices, qvel_indices = controlled_agent_indices(env, manifest)
+    continuing = (
+        manifest["training_schema"]["dataset"].get("task_semantics") == "continuing"
+    )
 
     for pair_index in range(trajectory_count):
         qpos = base_rollouts["initial_qpos"][pair_index]
@@ -738,14 +772,24 @@ def evaluate_contraction(
         perturbed_qpos[qpos_indices] += perturbation_scale * direction[:split]
         perturbed_qvel[qvel_indices] += perturbation_scale * direction[split:]
 
+        if continuing:
+            base = rollout_policy_episode(
+                env, policy, manifest, seed + pair_index, body_ids,
+                horizon=horizon,
+                initial_qpos=qpos,
+                initial_qvel=qvel,
+                stop_on_success=False,
+            )["positions"]
+        else:
+            base_length = min(int(base_rollouts["position_lengths"][pair_index]), horizon + 1)
+            base = base_rollouts["position_trajectories"][pair_index, :base_length]
         perturbed = rollout_policy_episode(
             env, policy, manifest, seed + pair_index, body_ids,
             horizon=horizon,
             initial_qpos=perturbed_qpos,
             initial_qvel=perturbed_qvel,
+            stop_on_success=not continuing,
         )["positions"]
-        base_length = min(int(base_rollouts["position_lengths"][pair_index]), horizon + 1)
-        base = base_rollouts["position_trajectories"][pair_index, :base_length]
         overlap = min(len(base), len(perturbed))
         curves.append(
             np.linalg.norm(base[:overlap] - perturbed[:overlap], axis=1).astype(np.float32)

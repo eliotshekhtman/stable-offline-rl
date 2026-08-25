@@ -56,6 +56,7 @@ def parse_args() -> argparse.Namespace:
     experiment.add_argument("--env", required=True, help="Gymnasium environment id to train on, e.g. HalfCheetah-v5")
     experiment.add_argument("--seed", dest="seeds", type=int, nargs="+", default=[0], help="Random seeds used for dataset splitting, generated rollouts, training, and evaluation")
     experiment.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Torch device used for OfflineRL-Kit policies and dynamics")
+    experiment.add_argument("--quiet", action="store_true", help="Suppress routine output, including the epoch-level training progress bar; warnings and errors remain visible")
 
     dataset = parser.add_argument_group("dataset source and split")
     dataset.add_argument("--dataset-source", choices=["generated", "minari", "robomimic"], default="generated", help="Use generated expert/random rollouts, all matching Minari datasets, or low-dimensional robomimic datasets for the environment")
@@ -105,19 +106,25 @@ def parse_args() -> argparse.Namespace:
     evaluation = parser.add_argument_group("post-training evaluation")
     evaluation.add_argument("--eval", action="store_true", help="After training, run full evaluation for each trained policy and then generate plots")
     evaluation.add_argument("--reuse-eval", action="store_true", help="With --eval, reuse matching cached checkpoint rollouts and completed evaluation results")
-    evaluation.add_argument("--eval-episodes", type=int, default=100, help="Number of true-environment episodes used to estimate final and checkpoint policy performance; also used for generated-data expert evaluation")
-    evaluation.add_argument("--contraction-trajectories", type=int, default=16, help="Number of matched unperturbed and agent-state-perturbed trajectories for each best and last policy")
-    evaluation.add_argument("--contraction-horizon", type=int, default=300, help="Maximum primitive steps in each best- and last-policy contraction trajectory")
+    evaluation.add_argument("--checkpoint-eval-episodes", type=int, default=20, help="Number of true-environment episodes used to monitor each non-final training checkpoint")
+    evaluation.add_argument("--final-eval-episodes", type=int, default=100, help="Number of true-environment episodes used for the final policy and generated-data expert report")
+    evaluation.add_argument("--contraction-trajectories", type=int, default=16, help="Number of matched unperturbed and agent-state-perturbed trajectories for the final policy")
+    evaluation.add_argument("--contraction-horizon", type=int, default=300, help="Maximum primitive steps in each final-policy contraction trajectory")
     evaluation.add_argument("--perturbation-scale", type=float, default=0.1, help="Euclidean norm of the initial perturbation applied to controlled-agent qpos/qvel coordinates")
     evaluation.add_argument("--ood-samples", type=int, default=10000, help="Maximum held-out and policy decision-boundary samples used for OOD metrics")
 
     model_based = parser.add_argument_group("model-based algorithm options")
+    model_based.add_argument("--model-actor-learning-rate", type=float, default=None, help="Override the actor learning rate for model-based algorithms; defaults to 1e-4, or 3e-5 with --model-manipulation-settings")
+    model_based.add_argument("--model-critic-learning-rate", type=float, default=3e-4, help="Learning rate for model-based critics; the default preserves the existing 3e-4 setting")
     model_based.add_argument("--dynamics-max-epochs", type=int, default=30, help="Maximum epochs for fitting the learned dynamics model before policy training")
     model_based.add_argument("--rollout-freq", type=int, default=1000, help="Policy-training step interval between learned-dynamics rollout generation")
     model_based.add_argument("--rollout-batch-size", type=int, default=10000, help="Number of initial real states used when generating model rollouts")
     model_based.add_argument("--rollout-length", type=int, default=5, help="Number of learned macro-transitions per synthetic rollout")
     model_based.add_argument("--model-retain-epochs", type=int, default=5, help="How many epochs of synthetic model rollouts to retain in the fake replay buffer")
     model_based.add_argument("--real-ratio", type=float, default=0.50, help="Fraction of each model-based training batch sampled from the real offline dataset rather than the synthetic rollout buffer")
+    model_based.add_argument("--model-manipulation-settings", action="store_true", help="Use MOBILE's published Adroit manipulation architecture, actor learning rate, reward normalization, and MOBILE critic settings for MOPO/MOBILE")
+    model_based.add_argument("--mopo-penalty-coef", type=float, default=0.5, help="MOPO coefficient multiplying learned-dynamics uncertainty in synthetic rewards")
+    model_based.add_argument("--mobile-penalty-coef", type=float, default=1.5, help="MOBILE coefficient multiplying model-Bellman inconsistency on synthetic targets")
     model_based.add_argument("--mobile-return-shift", type=float, default=30.0, help="Reacher-only MOBILE return/Q shift D used to place the clamped target floor at -D")
     model_based.add_argument("--dynamics-update-freq", type=int, default=1000, help="RAMBO dynamics-adversary update interval; ignored by other model-based algorithms")
     model_based.add_argument("--adv-batch-size", type=int, default=256, help="RAMBO adversarial dynamics rollout batch size")
@@ -139,6 +146,17 @@ def parse_args() -> argparse.Namespace:
         parser.error("TD3+BC hidden dimensions must be positive")
     if not math.isfinite(args.mobile_return_shift) or args.mobile_return_shift < 0.0:
         parser.error("--mobile-return-shift must be finite and nonnegative")
+    if not math.isfinite(args.mopo_penalty_coef) or args.mopo_penalty_coef < 0.0:
+        parser.error("--mopo-penalty-coef must be finite and nonnegative")
+    if not math.isfinite(args.mobile_penalty_coef) or args.mobile_penalty_coef < 0.0:
+        parser.error("--mobile-penalty-coef must be finite and nonnegative")
+    if args.model_actor_learning_rate is not None and (
+        not math.isfinite(args.model_actor_learning_rate)
+        or args.model_actor_learning_rate <= 0.0
+    ):
+        parser.error("--model-actor-learning-rate must be finite and positive")
+    if not math.isfinite(args.model_critic_learning_rate) or args.model_critic_learning_rate <= 0.0:
+        parser.error("--model-critic-learning-rate must be finite and positive")
     args.seeds = list(dict.fromkeys(args.seeds))
     args.chunk_lengths = list(dict.fromkeys(args.chunk_lengths))
     args.algos = list(dict.fromkeys(args.algos))
@@ -151,10 +169,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--algos none cannot be combined with training algorithms")
     if args.dataset is not None and args.dataset_source == "generated":
         parser.error("--dataset applies only to minari and robomimic dataset sources")
-    if args.eval_episodes <= 0 or args.contraction_trajectories <= 0 or args.contraction_horizon <= 0:
+    if args.checkpoint_eval_episodes <= 0 or args.final_eval_episodes <= 0:
+        parser.error("checkpoint and final evaluation episode counts must be positive")
+    if args.contraction_trajectories <= 0 or args.contraction_horizon <= 0:
         parser.error("evaluation episode, trajectory, and horizon counts must be positive")
-    if args.contraction_trajectories > args.eval_episodes:
-        parser.error("--contraction-trajectories cannot exceed --eval-episodes")
+    if args.contraction_trajectories > args.final_eval_episodes:
+        parser.error("--contraction-trajectories cannot exceed --final-eval-episodes")
     if args.perturbation_scale < 0.0:
         parser.error("--perturbation-scale must be nonnegative")
     if args.reuse_eval and not args.eval:
@@ -281,7 +301,6 @@ def collect_generated_dataset(
     if prop_clean_expert + prop_noisy_expert > 0.0 and not expert_path.exists():
         raise FileNotFoundError(f"Expert policy not found: {expert_path}")
 
-    print("Collecting generated dataset")
     return rollout.collect_dataset(
         env_name=env_name,
         policy_path=str(expert_path),
@@ -307,7 +326,6 @@ def get_or_create_dataset(
         if metadata.get("dataset_schema") == dataset_schema and all(
             (dataset_dir / filename).exists() for filename in ("full.npz", "train.npz", "test.npz")
         ):
-            print(f"Loading dataset split: {dataset_dir}")
             return rollout.load_dataset(dataset_dir / "train.npz"), split_paths(dataset_dir)
 
     dataset, metadata = create_dataset()
@@ -403,9 +421,6 @@ def train_algos(
                     training_schema=schema,
                     args=args,
                 )
-            else:
-                print(f"Reusing trained run: {run_dir}")
-
             eval_dir = maybe_evaluate(run_dir, args)
             if eval_dir is not None:
                 eval_dirs.append(eval_dir)
@@ -454,11 +469,21 @@ def make_training_schema(
             "alpha": args.td3bc_alpha,
             "hidden_dims": args.td3bc_hidden_dims,
         }
-    if algo == "mobile" and env_name == "Reacher-v5":
-        schema["mobile"] = {
-            "return_shift": args.mobile_return_shift,
-            "clamp_target_q": True,
-        }
+    if algo == "mopo" and args.mopo_penalty_coef != 0.5:
+        schema["mopo"] = {"penalty_coef": args.mopo_penalty_coef}
+    if algo == "mobile":
+        mobile_schema = {}
+        if env_name == "Reacher-v5":
+            mobile_schema.update(
+                return_shift=args.mobile_return_shift,
+                clamp_target_q=True,
+            )
+        if args.mobile_penalty_coef != 1.5:
+            mobile_schema["penalty_coef"] = args.mobile_penalty_coef
+        if args.model_manipulation_settings:
+            mobile_schema.update(num_critics=10, max_q_backup=True)
+        if mobile_schema:
+            schema["mobile"] = mobile_schema
     if algo in {"cql", "combo"}:
         schema["implementation_version"] = 2
     if algo in MODEL_BASED_ALGOS:
@@ -470,6 +495,19 @@ def make_training_schema(
             "model_retain_epochs": args.model_retain_epochs,
             "real_ratio": args.real_ratio,
         }
+        if args.model_actor_learning_rate is not None:
+            schema["model_based"]["actor_learning_rate"] = args.model_actor_learning_rate
+        if args.model_critic_learning_rate != 3e-4:
+            schema["model_based"]["critic_learning_rate"] = args.model_critic_learning_rate
+        if env_name == "Lift":
+            schema["model_based"]["synthetic_termination"] = "never"
+        if args.model_manipulation_settings and algo in {"mopo", "mobile"}:
+            schema["model_based"]["manipulation_settings"] = {
+                "actor_hidden_dims": [256, 256, 256],
+                "dynamics_hidden_dims": [400, 400, 400, 400],
+                "actor_learning_rate": args.model_actor_learning_rate or 3e-5,
+                "reward_normalization": "zscore",
+            }
     if algo == "rambo":
         schema["rambo"] = {
             "dynamics_update_freq": args.dynamics_update_freq,
@@ -517,7 +555,8 @@ def maybe_evaluate(run_dir: Path, args: argparse.Namespace) -> Path | None:
         run_dir,
         argparse.Namespace(
             device=args.device,
-            eval_episodes=args.eval_episodes,
+            checkpoint_eval_episodes=args.checkpoint_eval_episodes,
+            final_eval_episodes=args.final_eval_episodes,
             expert=args.expert,
             seed=args.seed,
             contraction_trajectories=args.contraction_trajectories,
@@ -606,9 +645,17 @@ def train_algo(
                     batch_size=args.batch_size,
                     lr_scheduler=lr_scheduler,
                     checkpoint_epochs=checkpoint_epochs(args.epoch),
+                    show_progress=not args.quiet,
                 )
         else:
-            real_buffer = build_buffer(chunk_dataset, eval_env, args.device)
+            model_dataset = chunk_dataset
+            if args.model_manipulation_settings and algo in {"mopo", "mobile"}:
+                model_dataset = dict(chunk_dataset)
+                rewards = chunk_dataset["rewards"]
+                model_dataset["rewards"] = (
+                    (rewards - rewards.mean()) / (rewards.std() + 1e-3)
+                ).astype(np.float32)
+            real_buffer = build_buffer(model_dataset, eval_env, args.device)
             obs_mean = obs_std = None
             if algo == "rambo":
                 obs_mean, obs_std = real_buffer.normalize_obs()
@@ -627,7 +674,6 @@ def train_algo(
                 obs_std=obs_std,
             )
 
-            print(f"Training dynamics for {algo}: {run_dir}")
             dynamics.train(real_buffer.sample_all(), logger, max_epochs=args.dynamics_max_epochs, max_epochs_since_update=5)
             if algo == "rambo":
                 policy.pretrain(
@@ -651,6 +697,7 @@ def train_algo(
                 lr_scheduler=lr_scheduler,
                 dynamics_update_freq=args.dynamics_update_freq if algo == "rambo" else 0,
                 checkpoint_epochs=checkpoint_epochs(args.epoch),
+                show_progress=not args.quiet,
             )
 
         initial_checkpoint = Path(logger.checkpoint_dir) / "step_0"
@@ -659,11 +706,11 @@ def train_algo(
         if algo in MODEL_BASED_ALGOS:
             dynamics.save(initial_checkpoint)
 
-        print(f"Training {algo}: {run_dir}")
         if algo == "dql":
             train_dql(
                 policy, buffer, logger, args.epoch, args.step_per_epoch,
                 args.batch_size, checkpoint_epochs(args.epoch),
+                show_progress=not args.quiet,
             )
         else:
             trainer.train()
@@ -755,7 +802,7 @@ def build_logger(
         "policy_training_progress": "csv",
         "tb": "tensorboard",
     }
-    logger = Logger(str(run_dir), output_config)
+    logger = Logger(str(run_dir), output_config, console_output=False)
     hyperparameters = {
         "algo": algo,
         "env": env_name,

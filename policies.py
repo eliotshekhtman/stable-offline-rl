@@ -26,9 +26,9 @@ MODEL_BASED_ALGOS = ("mopo", "combo", "mobile", "rambo")
 ROBOMIMIC_TASKS = {"can", "lift", "square", "transport", "toolhang"}
 
 MODEL_BASED_DEFAULTS = {
-    "mopo": {"hidden_dims": [256, 256], "dynamics_penalty_coef": 0.5},
+    "mopo": {"hidden_dims": [256, 256]},
     "combo": {"hidden_dims": [256, 256, 256], "dynamics_penalty_coef": 0.0, "cql_weight": 5.0},
-    "mobile": {"hidden_dims": [256, 256], "dynamics_penalty_coef": 0.0, "policy_penalty_coef": 1.5},
+    "mobile": {"hidden_dims": [256, 256], "dynamics_penalty_coef": 0.0},
     "rambo": {"hidden_dims": [256, 256, 256], "dynamics_penalty_coef": 0.0},
 }
 
@@ -199,28 +199,39 @@ def build_model_based_policy(
     action_dim = int(np.prod(env.action_space.shape))
     max_action = float(env.action_space.high[0])
     defaults = MODEL_BASED_DEFAULTS[algo]
-    hidden_dims = defaults["hidden_dims"]
+    manipulation_settings = args.model_manipulation_settings and algo in {"mopo", "mobile"}
+    hidden_dims = [256, 256, 256] if manipulation_settings else defaults["hidden_dims"]
+    dynamics_hidden_dims = [400, 400, 400, 400] if manipulation_settings else [200, 200, 200, 200]
+    actor_lr = getattr(args, "model_actor_learning_rate", None)
+    if actor_lr is None:
+        actor_lr = 3e-5 if manipulation_settings else 1e-4
+    critic_lr = args.model_critic_learning_rate
+    dynamics_penalty_coef = args.mopo_penalty_coef if algo == "mopo" else defaults["dynamics_penalty_coef"]
     dynamics = build_dynamics(
         obs_dim,
         action_dim,
         env.spec.id,
         args,
-        penalty_coef=defaults["dynamics_penalty_coef"],
+        hidden_dims=dynamics_hidden_dims,
+        penalty_coef=dynamics_penalty_coef,
         obs_mean=obs_mean,
         obs_std=obs_std,
     )
 
     if algo == "mobile":
-        actor, actor_optim = build_prob_actor(obs_dim, action_dim, max_action, hidden_dims, args.device, 1e-4)
+        actor, actor_optim = build_prob_actor(obs_dim, action_dim, max_action, hidden_dims, args.device, actor_lr)
         critics = torch.nn.ModuleList(
-            [Critic(MLP(input_dim=obs_dim + action_dim, hidden_dims=hidden_dims), args.device) for _ in range(2)]
+            [
+                Critic(MLP(input_dim=obs_dim + action_dim, hidden_dims=hidden_dims), args.device)
+                for _ in range(10 if manipulation_settings else 2)
+            ]
         )
         return_shift = args.mobile_return_shift if env.spec.id == "Reacher-v5" else 0.0
         if return_shift:
             with torch.no_grad():
                 for critic in critics:
                     critic.last.bias.add_(return_shift)
-        critics_optim = torch.optim.Adam(critics.parameters(), lr=3e-4)
+        critics_optim = torch.optim.Adam(critics.parameters(), lr=critic_lr)
         alpha = build_auto_alpha(action_dim, args.device, 1e-4)
         policy = MOBILEPolicy(
             dynamics,
@@ -231,18 +242,18 @@ def build_model_based_policy(
             tau=0.005,
             gamma=discount,
             alpha=alpha,
-            penalty_coef=defaults["policy_penalty_coef"],
+            penalty_coef=args.mobile_penalty_coef,
             num_samples=10,
             deterministic_backup=True,
-            max_q_backup=False,
+            max_q_backup=manipulation_settings,
             clamp_target_q=True,
             return_shift=return_shift,
         )
         return policy, dynamics, torch.optim.lr_scheduler.CosineAnnealingLR(actor_optim, args.epoch)
 
-    actor, actor_optim = build_prob_actor(obs_dim, action_dim, max_action, hidden_dims, args.device, 1e-4)
-    critic1, critic1_optim = build_critic(obs_dim, action_dim, hidden_dims, args.device, 3e-4)
-    critic2, critic2_optim = build_critic(obs_dim, action_dim, hidden_dims, args.device, 3e-4)
+    actor, actor_optim = build_prob_actor(obs_dim, action_dim, max_action, hidden_dims, args.device, actor_lr)
+    critic1, critic1_optim = build_critic(obs_dim, action_dim, hidden_dims, args.device, critic_lr)
+    critic2, critic2_optim = build_critic(obs_dim, action_dim, hidden_dims, args.device, critic_lr)
     alpha = build_auto_alpha(action_dim, args.device, 1e-4)
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(actor_optim, args.epoch)
 
@@ -320,6 +331,7 @@ def build_dynamics(
     action_dim: int,
     task: str,
     args: argparse.Namespace,
+    hidden_dims: list[int],
     penalty_coef: float,
     obs_mean: np.ndarray | None = None,
     obs_std: np.ndarray | None = None,
@@ -327,7 +339,7 @@ def build_dynamics(
     dynamics_model = EnsembleDynamicsModel(
         obs_dim=obs_dim,
         action_dim=action_dim,
-        hidden_dims=[200, 200, 200, 200],
+        hidden_dims=hidden_dims,
         num_ensemble=7,
         num_elites=5,
         weight_decays=[2.5e-5, 5e-5, 7.5e-5, 7.5e-5, 1e-4],

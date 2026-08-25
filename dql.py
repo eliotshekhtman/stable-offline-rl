@@ -328,15 +328,19 @@ def train_dql(
     steps_per_epoch: int,
     batch_size: int,
     checkpoint_epochs: list[int],
+    show_progress: bool = True,
 ) -> None:
     start_time = time.time()
     total_steps = 0
-    for epoch in range(1, epochs + 1):
+    epoch_progress = tqdm(
+        range(1, epochs + 1),
+        desc="Training epochs",
+        disable=not show_progress,
+    )
+    for epoch in epoch_progress:
         policy.train()
-        progress = tqdm(range(steps_per_epoch), desc=f"Epoch #{epoch}/{epochs}")
-        for _ in progress:
+        for _ in range(steps_per_epoch):
             losses = policy.learn(buffer.sample(batch_size))
-            progress.set_postfix(**losses)
             for key, value in losses.items():
                 logger.logkv_mean(key, value)
             total_steps += 1
