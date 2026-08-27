@@ -421,6 +421,9 @@ def train_algos(
                     training_schema=schema,
                     args=args,
                 )
+            from validation import validate_run
+
+            validate_run(run_dir, args.device)
             eval_dir = maybe_evaluate(run_dir, args)
             if eval_dir is not None:
                 eval_dirs.append(eval_dir)
