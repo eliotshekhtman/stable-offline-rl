@@ -1,5 +1,6 @@
-# Expert files
 experts/*
+*_log.txt
+scripts/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
