@@ -12,10 +12,17 @@ class RobomimicDatasetTests(unittest.TestCase):
         self.assertEqual(len(load_offline.list_robomimic_dataset_specs("Can")), 5)
         specs = load_offline.list_robomimic_dataset_specs("Can", "mh")
         self.assertEqual([spec["dataset_type"] for spec in specs], ["mh"])
+        self.assertNotIn("task_semantics", specs[0])
+        lift_spec = load_offline.list_robomimic_dataset_specs("Lift", "mg_dense")[0]
+        self.assertEqual(lift_spec["task_semantics"], "continuing")
+        self.assertEqual(
+            load_offline.make_robomimic_dataset_tag(lift_spec),
+            "robomimic_lift_mg_dense_continuing",
+        )
         with self.assertRaisesRegex(ValueError, "available: ph, mh, mg_sparse, mg_dense, paired"):
             load_offline.list_robomimic_dataset_specs("Can", "unknown")
 
-    def test_internal_done_does_not_truncate_demo(self):
+    def test_lift_discards_success_terminals_but_other_tasks_retain_them(self):
         with h5py.File("robomimic-test.hdf5", "w", driver="core", backing_store=False) as file:
             demo = file.create_group("demo")
             obs = demo.create_group("obs")
@@ -28,12 +35,15 @@ class RobomimicDatasetTests(unittest.TestCase):
             demo.create_dataset("rewards", data=np.asarray([0, 1, 2, 3], dtype=np.float32))
             demo.create_dataset("dones", data=np.asarray([False, True, False, False]))
 
-            dataset = load_offline.robomimic_demo_to_transitions(demo, episode_id=7)
+            can = load_offline.robomimic_demo_to_transitions(demo, episode_id=7, task="Can")
+            lift = load_offline.robomimic_demo_to_transitions(demo, episode_id=7, task="Lift")
 
-        np.testing.assert_array_equal(dataset["rewards"], [0, 1, 2, 3])
-        np.testing.assert_array_equal(dataset["terminals"], [False, True, False, False])
-        np.testing.assert_array_equal(dataset["timeouts"], [False, False, False, True])
-        np.testing.assert_array_equal(dataset["episode_ids"], [7, 7, 7, 7])
+        np.testing.assert_array_equal(can["rewards"], [0, 1, 2, 3])
+        np.testing.assert_array_equal(can["terminals"], [False, True, False, False])
+        np.testing.assert_array_equal(can["timeouts"], [False, False, False, True])
+        np.testing.assert_array_equal(lift["terminals"], [False, False, False, False])
+        np.testing.assert_array_equal(lift["timeouts"], [False, False, False, True])
+        np.testing.assert_array_equal(lift["episode_ids"], [7, 7, 7, 7])
 
 
 class MinariDatasetTests(unittest.TestCase):

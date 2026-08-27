@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import gymnasium as gym
 import numpy as np
@@ -19,7 +20,7 @@ class PositionEnv(gym.Env):
             xpos=positions,
             body_xpos=positions,
         )
-        self.sim = SimpleNamespace(data=self.data)
+        self.sim = SimpleNamespace(data=self.data, forward=lambda: None)
         self.terminate_at = terminate_at
         self.success_at = success_at
         self.steps = 0
@@ -71,6 +72,7 @@ def manifest(chunk_length: int = 3) -> dict:
         "env_name": "HalfCheetah-v5",
         "dataset_source": "minari",
         "chunk_length": chunk_length,
+        "training_schema": {"dataset": {"source": "minari"}},
     }
 
 
@@ -107,14 +109,25 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(result["return"], 4.0)
         self.assertEqual(result["performance"], 1.0)
 
-    def test_best_checkpoint_uses_metric_direction_and_latest_tie(self):
-        records = [
-            {"policy_performance_mean": 2.0, "actual_percent": 20.0},
-            {"policy_performance_mean": 1.0, "actual_percent": 50.0},
-            {"policy_performance_mean": 1.0, "actual_percent": 80.0},
-        ]
-        self.assertEqual(evaluation.select_best_record(records, True)["actual_percent"], 20.0)
-        self.assertEqual(evaluation.select_best_record(records, False)["actual_percent"], 80.0)
+    def test_checkpoint_record_tracks_evaluation_budget_and_seed(self):
+        rollout_info = {
+            "returns": np.asarray([1.0, 3.0]),
+            "performance": np.asarray([0.0, 1.0]),
+        }
+        conservativity = {
+            "state_ood_ratio": np.asarray(1.2),
+            "state_action_ood_ratio": np.asarray(1.4),
+        }
+        checkpoint = {"requested_percent": 100, "actual_percent": 100.0, "step": 200}
+
+        record = evaluation.checkpoint_record(
+            checkpoint, rollout_info, conservativity, episodes=2, rollout_seed=1_000_000
+        )
+
+        self.assertEqual(record["evaluation_episodes"], 2)
+        self.assertEqual(record["evaluation_seed"], 1_000_000)
+        self.assertEqual(record["policy_return_mean"], 2.0)
+        self.assertEqual(record["policy_performance_mean"], 0.5)
 
     def test_zero_perturbation_matches_reused_base_trajectory(self):
         env = PositionEnv(terminate_at=5)
@@ -129,6 +142,35 @@ class EvaluationTests(unittest.TestCase):
             body_names=["agent"],
         )
 
+        np.testing.assert_allclose(contraction["distance_curves"], 0.0)
+
+    def test_continuing_lift_contraction_runs_past_success(self):
+        env = PositionEnv(terminate_at=5, success_at=2)
+        policy = CountingChunkPolicy(chunk_length=1)
+        continuing_manifest = {
+            "env_name": "Lift",
+            "dataset_source": "robomimic",
+            "chunk_length": 1,
+            "training_schema": {"dataset": {"task_semantics": "continuing"}},
+        }
+        base = evaluation.evaluate_policy_rollouts(
+            policy, env, continuing_manifest, episodes=1, seed=0,
+            body_ids=np.asarray([1]),
+        )
+
+        self.assertEqual(base["position_lengths"].tolist(), [3])
+        with patch.object(
+            evaluation,
+            "controlled_agent_indices",
+            return_value=(np.asarray([0]), np.asarray([0])),
+        ):
+            contraction = evaluation.evaluate_contraction(
+                policy, env, continuing_manifest, base, trajectory_count=1, horizon=5,
+                perturbation_scale=0.0, seed=0, body_ids=np.asarray([1]),
+                body_names=["agent"],
+            )
+
+        self.assertEqual(contraction["distance_curves"].shape, (1, 6))
         np.testing.assert_allclose(contraction["distance_curves"], 0.0)
 
 
