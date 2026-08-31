@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import h5py
@@ -61,6 +62,52 @@ class MinariDatasetTests(unittest.TestCase):
         self.assertEqual(load_offline.list_minari_dataset_ids("HalfCheetah-v5", expected[0]), expected)
         with self.assertRaisesRegex(ValueError, "available: expert-v0, medium-v0, simple-v0"):
             load_offline.list_minari_dataset_ids("HalfCheetah-v5", "unknown-v0")
+
+    @patch("minari.load_dataset")
+    def test_loads_seeded_subset_without_replacement_and_checks_capacity(self, load_dataset):
+        episodes = []
+        for episode_id in range(4):
+            observations = np.asarray(
+                [[10 * episode_id], [10 * episode_id + 1], [10 * episode_id + 2]],
+                dtype=np.float32,
+            )
+            episodes.append(SimpleNamespace(
+                id=episode_id,
+                observations=observations,
+                actions=np.zeros((2, 1), dtype=np.float32),
+                rewards=np.full(2, episode_id, dtype=np.float32),
+                terminations=np.zeros(2, dtype=bool),
+                truncations=np.asarray([False, True]),
+            ))
+
+        minari_dataset = SimpleNamespace(
+            total_episodes=4,
+            total_steps=8,
+            episode_indices=np.arange(4),
+            env_spec=SimpleNamespace(id="Reacher-v5"),
+        )
+        minari_dataset.iterate_episodes = lambda indices: iter(
+            [episodes[index] for index in indices]
+        )
+        load_dataset.return_value = minari_dataset
+
+        dataset, metadata = load_offline.load_minari_episode_subset(
+            "mujoco/reacher/medium-v0", num_episodes=3, seed=7, episode_id_start=10
+        )
+        expected_indices = np.random.default_rng(7).permutation(4)[:3]
+        np.testing.assert_array_equal(
+            dataset["observations"][::2, 0] // 10, expected_indices
+        )
+        np.testing.assert_array_equal(
+            dataset["episode_ids"], [10, 10, 11, 11, 12, 12]
+        )
+        self.assertEqual(metadata["available_num_episodes"], 4)
+        self.assertEqual(metadata["available_num_transitions"], 8)
+
+        with self.assertRaisesRegex(ValueError, "contains only 4 episodes"):
+            load_offline.load_minari_episode_subset(
+                "mujoco/reacher/medium-v0", num_episodes=5, seed=7, episode_id_start=0
+            )
 
 
 if __name__ == "__main__":

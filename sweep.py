@@ -1,6 +1,6 @@
 # Tasks:
 # - Parse the experiment CLI and keep one run focused on one Gymnasium environment.
-# - Choose the dataset source: generated rollouts, converted Minari datasets, or robomimic datasets.
+# - Choose generated, Minari, clean/Minari mixture, or robomimic data.
 # - Cache/load datasets, build OfflineRL-Kit replay buffers, and launch trainers.
 # - Sweep algorithms and action chunk lengths over each requested random seed.
 # - Own experiment directories, milestone checkpoints, logging, seeding, and run naming.
@@ -59,19 +59,20 @@ def parse_args() -> argparse.Namespace:
     experiment.add_argument("--quiet", action="store_true", help="Suppress routine output, including the epoch-level training progress bar; warnings and errors remain visible")
 
     dataset = parser.add_argument_group("dataset source and split")
-    dataset.add_argument("--dataset-source", choices=["generated", "minari", "robomimic"], default="generated", help="Use generated expert/random rollouts, all matching Minari datasets, or low-dimensional robomimic datasets for the environment")
-    dataset.add_argument("--dataset", default=None, help="Limit a premade-data sweep to one Robomimic type (e.g. mh) or Minari leaf/full id (e.g. medium-v0); omit to use all matching datasets")
+    dataset.add_argument("--dataset-source", choices=["generated", "minari", "clean-minari", "robomimic"], default="generated", help="Use generated rollouts, full Minari datasets, clean-expert/Minari mixtures, or low-dimensional robomimic datasets")
+    dataset.add_argument("--dataset", default=None, help="Limit a premade-data sweep to one Robomimic type or Minari leaf/full id; required for clean-minari and omitted to use all datasets for other premade sources")
     dataset.add_argument("--test-fraction", type=float, default=0.2, help="Fraction of each dataset held out for post-training evaluation")
 
-    generated = parser.add_argument_group("generated dataset options")
-    generated.add_argument("--expert", default="/home/shekhe/stable-offline-rl/experts", help="Expert policy .zip path or directory containing <env>.zip; used only for generated expert data and expert evaluation")
-    generated.add_argument("--num-samples", type=int, nargs="+", default=[1000000], help="Minimum generated transition counts to sweep over; collection always retains complete trajectories")
+    generated = parser.add_argument_group("generated and clean-Minari dataset options")
+    generated.add_argument("--expert", default="/home/shekhe/stable-offline-rl/experts", help="Expert policy .zip path or directory containing <env>.zip; used for generated or clean-Minari expert trajectories and expert evaluation")
+    generated.add_argument("--num-samples", type=int, nargs="+", default=[1000000], help="Minimum transition counts for generated and clean-minari datasets; collection always retains complete trajectories")
     generated.add_argument("--noise-scale", type=float, nargs="+", default=[0.0], help="Gaussian action-noise scales applied to noisy expert actions in generated datasets")
     generated.add_argument(
         "--composition", type=float, nargs=2, action="append", metavar=("CLEAN_EXPERT", "NOISY_EXPERT"),
         help="Generated-data clean and noisy expert trajectory proportions; repeat for multiple compositions, with random trajectories filling the remainder (default: 1 0)",
     )
-    generated.add_argument("--max-timesteps", type=int, default=1000, help="Maximum length of each generated rollout trajectory")
+    generated.add_argument("--max-timesteps", type=int, default=1000, help="Maximum length of each generated clean, noisy, or random rollout trajectory")
+    generated.add_argument("--minari-fraction", dest="minari_fractions", type=float, nargs="+", default=[0.0, 0.25, 0.5, 0.75, 1.0], help="Clean-minari trajectory fractions to sweep; the remainder comes from clean expert trajectories")
 
     training = parser.add_argument_group("policy training")
     training.add_argument(
@@ -89,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     dql = parser.add_argument_group("DQL options")
     dql.add_argument("--dql-eta", type=float, default=None, help="Override the DQL Q-guidance loss weight; defaults to CleanDiffuser's locomotion value of 1")
     dql.add_argument("--dql-weight-temperature", type=float, default=None, help="Override the DQL candidate-action softmax weight; defaults to a CleanDiffuser task value when available")
-    dql.add_argument("--dql-reward-normalization", choices=["auto", "none", "episode-range"], default="auto", help="DQL reward scaling: auto uses CleanDiffuser episode-return-range scaling for Minari data and no scaling otherwise")
+    dql.add_argument("--dql-reward-normalization", choices=["auto", "none", "episode-range"], default="auto", help="DQL reward scaling: auto uses CleanDiffuser episode-return-range scaling for full Minari datasets and no scaling otherwise")
 
     iql = parser.add_argument_group("IQL options")
     iql.add_argument("--iql-temperature", type=float, default=3.0, help="IQL advantage-weighting temperature; larger values favor higher-advantage dataset actions more strongly")
@@ -160,6 +161,12 @@ def parse_args() -> argparse.Namespace:
     args.seeds = list(dict.fromkeys(args.seeds))
     args.chunk_lengths = list(dict.fromkeys(args.chunk_lengths))
     args.algos = list(dict.fromkeys(args.algos))
+    args.minari_fractions = list(dict.fromkeys(args.minari_fractions))
+    if any(
+        not math.isfinite(fraction) or not 0.0 <= fraction <= 1.0
+        for fraction in args.minari_fractions
+    ):
+        parser.error("--minari-fraction values must be finite and between 0 and 1")
     args.composition = [(1.0, 0.0)] if args.composition is None else [tuple(values) for values in args.composition]
     args.composition = list(dict.fromkeys(args.composition))
     for prop_clean, prop_noisy in args.composition:
@@ -168,7 +175,9 @@ def parse_args() -> argparse.Namespace:
     if "none" in args.algos and args.algos != ["none"]:
         parser.error("--algos none cannot be combined with training algorithms")
     if args.dataset is not None and args.dataset_source == "generated":
-        parser.error("--dataset applies only to minari and robomimic dataset sources")
+        parser.error("--dataset applies only to premade dataset sources")
+    if args.dataset_source == "clean-minari" and args.dataset is None:
+        parser.error("--dataset is required with --dataset-source clean-minari")
     if args.checkpoint_eval_episodes <= 0 or args.final_eval_episodes <= 0:
         parser.error("checkpoint and final evaluation episode counts must be positive")
     if args.contraction_trajectories <= 0 or args.contraction_horizon <= 0:
@@ -192,6 +201,10 @@ def run_sweep(env_name: str, expert_path: Path, args: argparse.Namespace) -> lis
 
     if args.dataset_source == "minari":
         eval_dirs = run_minari_sweep(env_name, dataset_root, trained_root, eval_root, args)
+    elif args.dataset_source == "clean-minari":
+        eval_dirs = run_clean_minari_sweep(
+            env_name, expert_path, dataset_root, trained_root, eval_root, args
+        )
     elif args.dataset_source == "robomimic":
         eval_dirs = run_robomimic_sweep(env_name, dataset_root, trained_root, eval_root, args)
     else:
@@ -199,39 +212,56 @@ def run_sweep(env_name: str, expert_path: Path, args: argparse.Namespace) -> lis
             args.num_samples, args.noise_scale, args.composition
         ):
             prop_clean, prop_noisy = composition
-            prop_random = 1.0 - prop_clean - prop_noisy
-            prop_expert = prop_clean + prop_noisy
-            dataset_tag = make_dataset_tag(
-                num_samples, noise_scale, prop_clean, prop_noisy, args.seed
-            )
-            dataset_schema = {
-                "version": DATASET_SCHEMA_VERSION,
-                "source": "generated",
-                "env_name": env_name,
-                "expert_path": str(expert_path),
-                "max_timesteps": args.max_timesteps,
-                "num_samples": num_samples,
-                "noise_scale": noise_scale,
-                "prop_clean_expert": prop_clean,
-                "prop_noisy_expert": prop_noisy,
-                "prop_random": prop_random,
-                "prop_expert": prop_expert,
-                "deterministic": True,
-                "seed": args.seed,
-                "test_fraction": args.test_fraction,
-            }
             eval_dirs.extend(
-                train_algos(
-                    env_name, trained_root, eval_root, dataset_root / dataset_tag,
-                    dataset_tag, dataset_schema, args,
-                    lambda: collect_generated_dataset(
-                        env_name, expert_path, num_samples, noise_scale,
-                        prop_clean, prop_noisy, args,
-                    ),
+                run_generated_configuration(
+                    env_name, expert_path, dataset_root, trained_root, eval_root,
+                    num_samples, noise_scale, prop_clean, prop_noisy, args,
                 )
             )
 
     return eval_dirs
+
+
+def run_generated_configuration(
+    env_name: str,
+    expert_path: Path,
+    dataset_root: Path,
+    trained_root: Path,
+    eval_root: Path,
+    num_samples: int,
+    noise_scale: float,
+    prop_clean: float,
+    prop_noisy: float,
+    args: argparse.Namespace,
+) -> list[Path]:
+    prop_random = 1.0 - prop_clean - prop_noisy
+    dataset_tag = make_dataset_tag(
+        num_samples, noise_scale, prop_clean, prop_noisy, args.seed
+    )
+    dataset_schema = {
+        "version": DATASET_SCHEMA_VERSION,
+        "source": "generated",
+        "env_name": env_name,
+        "expert_path": str(expert_path),
+        "max_timesteps": args.max_timesteps,
+        "num_samples": num_samples,
+        "noise_scale": noise_scale,
+        "prop_clean_expert": prop_clean,
+        "prop_noisy_expert": prop_noisy,
+        "prop_random": prop_random,
+        "prop_expert": prop_clean + prop_noisy,
+        "deterministic": True,
+        "seed": args.seed,
+        "test_fraction": args.test_fraction,
+    }
+    return train_algos(
+        env_name, trained_root, eval_root, dataset_root / dataset_tag,
+        dataset_tag, dataset_schema, args,
+        lambda: collect_generated_dataset(
+            env_name, expert_path, num_samples, noise_scale,
+            prop_clean, prop_noisy, args,
+        ),
+    )
 
 
 def run_minari_sweep(
@@ -258,6 +288,108 @@ def run_minari_sweep(
                 env_name, trained_root, eval_root, dataset_root / dataset_tag,
                 dataset_tag, dataset_schema, args,
                 lambda dataset_id=dataset_id: load_offline.load_minari_dataset(dataset_id, seed=args.seed),
+            )
+        )
+    return eval_dirs
+
+
+def run_clean_minari_sweep(
+    env_name: str,
+    expert_path: Path,
+    dataset_root: Path,
+    trained_root: Path,
+    eval_root: Path,
+    args: argparse.Namespace,
+) -> list[Path]:
+    dataset_id = load_offline.list_minari_dataset_ids(env_name, args.dataset)[0]
+    eval_dirs = []
+
+    for num_samples, minari_fraction in itertools.product(
+        args.num_samples, args.minari_fractions
+    ):
+        if minari_fraction == 0.0:
+            eval_dirs.extend(
+                run_generated_clean_endpoint(
+                    env_name, expert_path, dataset_root, trained_root, eval_root,
+                    num_samples, args,
+                )
+            )
+            continue
+
+        dataset_tag = make_clean_minari_dataset_tag(
+            dataset_id, num_samples, minari_fraction, args.seed
+        )
+        dataset_schema = {
+            "version": DATASET_SCHEMA_VERSION,
+            "source": "clean-minari",
+            "env_name": env_name,
+            "expert_path": str(expert_path),
+            "dataset_id": dataset_id,
+            "max_timesteps": args.max_timesteps,
+            "num_samples": num_samples,
+            "minari_fraction": minari_fraction,
+            "deterministic": True,
+            "seed": args.seed,
+            "test_fraction": args.test_fraction,
+        }
+        eval_dirs.extend(
+            train_algos(
+                env_name, trained_root, eval_root, dataset_root / dataset_tag,
+                dataset_tag, dataset_schema, args,
+                lambda num_samples=num_samples, minari_fraction=minari_fraction: collect_clean_minari_dataset(
+                    env_name, expert_path, dataset_id, num_samples,
+                    minari_fraction, args,
+                ),
+            )
+        )
+
+    return eval_dirs
+
+
+def run_generated_clean_endpoint(
+    env_name: str,
+    expert_path: Path,
+    dataset_root: Path,
+    trained_root: Path,
+    eval_root: Path,
+    num_samples: int,
+    args: argparse.Namespace,
+) -> list[Path]:
+    generated_args = argparse.Namespace(**vars(args))
+    generated_args.dataset_source = "generated"
+    configurations = (
+        [(None, None)] if args.algos == ["none"]
+        else itertools.product(args.algos, args.chunk_lengths)
+    )
+    eval_dirs = []
+    for algo, chunk_length in configurations:
+        endpoint_args = argparse.Namespace(**vars(generated_args))
+        if algo is not None:
+            endpoint_args.algos = [algo]
+            endpoint_args.chunk_lengths = [chunk_length]
+
+        existing = find_generated_clean_dataset(
+            dataset_root, trained_root, env_name, expert_path,
+            num_samples, endpoint_args,
+        )
+        if existing is None:
+            eval_dirs.extend(
+                run_generated_configuration(
+                    env_name, expert_path, dataset_root, trained_root, eval_root,
+                    num_samples, 0.0, 1.0, 0.0, endpoint_args,
+                )
+            )
+            continue
+
+        dataset_parent, dataset_tag, dataset_schema = existing
+        eval_dirs.extend(
+            train_algos(
+                env_name, trained_root, eval_root, dataset_parent,
+                dataset_tag, dataset_schema, endpoint_args,
+                lambda dataset_schema=dataset_schema: collect_generated_dataset(
+                    env_name, expert_path, num_samples,
+                    dataset_schema["noise_scale"], 1.0, 0.0, endpoint_args,
+                ),
             )
         )
     return eval_dirs
@@ -312,6 +444,137 @@ def collect_generated_dataset(
         deterministic=True,
         seed=args.seed,
     )
+
+
+def collect_clean_minari_dataset(
+    env_name: str,
+    expert_path: Path,
+    dataset_id: str,
+    num_samples: int,
+    minari_fraction: float,
+    args: argparse.Namespace,
+) -> tuple[dict[str, np.ndarray], dict]:
+    env = gym.make(env_name)
+    try:
+        trajectory_horizon = min(args.max_timesteps, env.spec.max_episode_steps)
+    finally:
+        env.close()
+
+    num_trajectories = max(2, math.ceil(num_samples / trajectory_horizon))
+    num_minari = max(1, int(round(num_trajectories * minari_fraction)))
+    num_clean = num_trajectories - num_minari
+
+    minari_dataset, minari_metadata = load_offline.load_minari_episode_subset(
+        dataset_id=dataset_id,
+        num_episodes=num_minari,
+        seed=args.seed,
+        episode_id_start=num_clean,
+    )
+    requested_minari_samples = num_minari * trajectory_horizon
+    if requested_minari_samples > minari_metadata["available_num_transitions"]:
+        raise ValueError(
+            f"Requested {requested_minari_samples} transitions from {dataset_id}, "
+            f"but it contains only {minari_metadata['available_num_transitions']} transitions."
+        )
+
+    clean_dataset = None
+    if num_clean:
+        if not expert_path.exists():
+            raise FileNotFoundError(f"Expert policy not found: {expert_path}")
+        clean_dataset = rollout.collect_expert(
+            env_name=env_name,
+            policy_path=str(expert_path),
+            num_trajectories=num_clean,
+            max_timesteps=args.max_timesteps,
+            deterministic=True,
+            rng=np.random.default_rng(args.seed),
+        )
+
+    components = [minari_dataset] if clean_dataset is None else [clean_dataset, minari_dataset]
+    dataset = load_offline.concat_datasets(components)
+    num_clean_transitions = 0 if clean_dataset is None else len(clean_dataset["rewards"])
+    num_minari_transitions = len(minari_dataset["rewards"])
+    num_transitions = num_clean_transitions + num_minari_transitions
+    if num_transitions < num_samples:
+        raise RuntimeError(
+            f"Complete trajectories produced {num_transitions} transitions, fewer than "
+            f"the requested minimum of {num_samples}."
+        )
+
+    return dataset, {
+        "source": "clean-minari",
+        "env_name": env_name,
+        "policy_path": str(expert_path),
+        "dataset_id": dataset_id,
+        "minari_env_id": minari_metadata["env_id"],
+        "max_timesteps": args.max_timesteps,
+        "requested_num_samples": num_samples,
+        "requested_minari_trajectory_fraction": minari_fraction,
+        "requested_clean_expert_trajectory_fraction": 1.0 - minari_fraction,
+        "num_trajectories": num_trajectories,
+        "num_clean_expert_trajectories": num_clean,
+        "num_minari_trajectories": num_minari,
+        "actual_minari_trajectory_fraction": num_minari / num_trajectories,
+        "num_transitions": num_transitions,
+        "num_clean_expert_transitions": num_clean_transitions,
+        "num_minari_transitions": num_minari_transitions,
+        "actual_minari_transition_fraction": num_minari_transitions / num_transitions,
+        "available_minari_episodes": minari_metadata["available_num_episodes"],
+        "available_minari_transitions": minari_metadata["available_num_transitions"],
+        "deterministic": True,
+        "seed": args.seed,
+    }
+
+
+def find_generated_clean_dataset(
+    dataset_root: Path,
+    trained_root: Path,
+    env_name: str,
+    expert_path: Path,
+    num_samples: int,
+    args: argparse.Namespace,
+) -> tuple[Path, str, dict] | None:
+    expected = {
+        "version": DATASET_SCHEMA_VERSION,
+        "source": "generated",
+        "env_name": env_name,
+        "expert_path": str(expert_path),
+        "max_timesteps": args.max_timesteps,
+        "num_samples": num_samples,
+        "prop_clean_expert": 1.0,
+        "prop_noisy_expert": 0.0,
+        "prop_random": 0.0,
+        "prop_expert": 1.0,
+        "deterministic": True,
+        "seed": args.seed,
+        "test_fraction": args.test_fraction,
+    }
+    candidates = []
+    for metadata_path in sorted(dataset_root.glob("*/*/metadata.json"), reverse=True):
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        schema = metadata.get("dataset_schema", {})
+        if {key: value for key, value in schema.items() if key != "noise_scale"} != expected:
+            continue
+        dataset_dir = metadata_path.parent
+        if all(
+            (dataset_dir / filename).exists()
+            for filename in ("full.npz", "train.npz", "test.npz")
+        ):
+            candidates.append((dataset_dir.parent, dataset_dir.parent.name, schema))
+    if not candidates or args.algos == ["none"]:
+        return None if not candidates else candidates[0]
+
+    def reusable_run_count(candidate: tuple[Path, str, dict]) -> int:
+        _, dataset_tag, schema = candidate
+        return sum(
+            find_trained_run(
+                trained_root / f"{algo}_chunk{chunk_length}_{dataset_tag}",
+                make_training_schema(algo, env_name, schema, chunk_length, args),
+            ) is not None
+            for algo, chunk_length in itertools.product(args.algos, args.chunk_lengths)
+        )
+
+    return max(candidates, key=reusable_run_count)
 
 
 def get_or_create_dataset(
@@ -865,6 +1128,19 @@ def checkpoint_manifest(run_dir: Path, algo: str, epochs: int, steps_per_epoch: 
             record["dynamics_path"] = str(dynamics_dir.resolve())
         records.append(record)
     return records
+
+
+def make_clean_minari_dataset_tag(
+    dataset_id: str,
+    num_samples: int,
+    minari_fraction: float,
+    seed: int,
+) -> str:
+    source = dataset_id.replace("/", "_")
+    return (
+        f"clean_minari_{source}_samples{num_samples}_"
+        f"minari{minari_fraction:g}_seed{seed}"
+    )
 
 
 def make_dataset_tag(

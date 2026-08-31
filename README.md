@@ -25,6 +25,19 @@ Robomimic Lift uses continuing-task semantics: success annotations are not Bellm
 
 Generated datasets can mix clean expert, noisy expert, and random-action episodes. Pass `--composition CLEAN_EXPERT NOISY_EXPERT`; random data fills the remaining proportion. Repeat the argument to sweep specified compositions without taking a Cartesian product between their two values. `--noise-scale` applies only to the noisy expert component, while clean expert actions use zero noise. The default composition is `1 0`.
 
+Use `--dataset-source clean-minari --dataset DATASET` to ablate between clean expert trajectories and one Minari quality dataset. `--minari-fraction` defaults to `0 0.25 0.5 0.75 1`; fractions allocate complete trajectories, and Minari episodes are selected from a seeded permutation without replacement. A request that needs more Minari episodes or transitions than the source contains fails instead of duplicating data. The 0% endpoint reuses an existing generated-clean dataset and model when its environment, expert, horizon, sample count, seed, split, and training settings match; the irrelevant historical clean-dataset `noise_scale` may differ.
+
+```bash
+python sweep.py \
+  --env Reacher-v5 \
+  --dataset-source clean-minari \
+  --dataset medium-v0 \
+  --num-samples 500000 \
+  --minari-fraction 0 0.25 0.5 0.75 1 \
+  --algos bc iql \
+  --eval
+```
+
 MOBILE on `Reacher-v5` uses a shifted zero clamp for its critic targets. `--mobile-return-shift D` defaults to `30`: the critics are initialized with `+D`, each macro reward receives `(1 - macro_discount) * D`, and clamping at zero in shifted units is equivalent to a target floor of `-D` in the original units. The option is ignored by other environments, whose MOBILE behavior is unchanged.
 
 `DATASET_SCHEMA_VERSION` and `TRAINING_SCHEMA_VERSION` in `sweep.py` invalidate cached artifacts when dataset conversion or training behavior changes without a corresponding CLI change. Increment the relevant value when making such a change; evaluation-only edits require neither increment.
@@ -70,7 +83,7 @@ The integration supports flat continuous-control environments, including Gymnasi
 
 Published CleanDiffuser defaults are used when available: Q-selection weight temperature 50 for HalfCheetah, 300 for Walker2d, 100 for Hopper medium/replay, and 8 for Hopper medium-expert, with `eta=1`. Other environments use 50 and record that it is a fallback. `--dql-weight-temperature` and `--dql-eta` override these choices.
 
-`--dql-reward-normalization auto` applies CleanDiffuser-style episodic return-range scaling to Minari training episodes. It leaves rewards unchanged for generated and robomimic datasets. Every resolved DQL setting and its source is saved in `run_manifest.json`.
+`--dql-reward-normalization auto` applies CleanDiffuser-style episodic return-range scaling to full Minari training datasets. It leaves rewards unchanged for generated, clean-Minari mixture, and robomimic datasets. Every resolved DQL setting and its source is saved in `run_manifest.json`.
 
 ```bash
 cd /home/shekhe/stable-offline-rl
@@ -95,7 +108,7 @@ Final-policy contraction pairs deterministic rollouts from the same simulator st
 
 State and state-action OOD ratios are evaluated over checkpoints. Each is the mean rollout-to-training k-nearest-neighbor distance divided by the corresponding held-out-to-training distance, so a ratio near one means rollout samples are about as far from training data as held-out samples are.
 
-For Robomimic datasets, final-policy plots compare task performance and contraction curves across action chunk lengths. For generated datasets, they compare those metrics against the realized fraction of complete trajectories collected from the noisy expert. A fixed random fraction gives the clean-expert/noisy-expert ablation; zero clean-expert fraction gives the random/noisy-expert ablation. Performance and OOD ratios are also plotted against training percent. Lines are exact means with shaded hierarchical-bootstrap 10th-90th percentile bands: seeds and episodes are resampled for performance, while seeds and trajectory pairs are resampled for contraction. A one-seed run still uses episode or trajectory-pair variability; milestone OOD bands require multiple seeds because only one OOD estimate is saved per seed and checkpoint. Raw arrays are saved under the matching `evals/<environment>/<run-name>/<training-timestamp>/` directory, and plots are written under `evals/<environment>/plots/`.
+For Robomimic datasets, final-policy plots compare task performance and contraction curves across action chunk lengths. For generated datasets, they compare those metrics against the realized fraction of complete trajectories collected from the noisy expert. A fixed random fraction gives the clean-expert/noisy-expert ablation; zero clean-expert fraction gives the random/noisy-expert ablation. Clean-Minari sweeps plot the same metrics against the realized Minari trajectory fraction, separately for each Minari dataset, sample count, and chunk length. Each plotter reads only its own source-specific metadata; generating one family no longer deletes unrelated existing plots. Performance and OOD ratios are also plotted against training percent. Lines are exact means with shaded hierarchical-bootstrap 10th-90th percentile bands: seeds and episodes are resampled for performance, while seeds and trajectory pairs are resampled for contraction. A one-seed run still uses episode or trajectory-pair variability; milestone OOD bands require multiple seeds because only one OOD estimate is saved per seed and checkpoint. Raw arrays are saved under the matching `evals/<environment>/<run-name>/<training-timestamp>/` directory, and plots are written under `evals/<environment>/plots/`.
 
 Pass `--reuse-eval` together with `--eval` to reuse a completed matching evaluation or matching per-checkpoint rollout caches. Without it, the run's evaluation directory is cleared before evaluation. Cached rollouts retain returns, task performance, decision-boundary observations and action chunks, initial simulator states, and primitive Cartesian position traces, so plotting and metric recomputation do not require another environment rollout.
 

@@ -102,6 +102,48 @@ def load_minari_dataset(dataset_id: str, seed: int | None = None) -> tuple[dict[
     }
 
 
+def load_minari_episode_subset(
+    dataset_id: str,
+    num_episodes: int,
+    seed: int,
+    episode_id_start: int,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Load a deterministic Minari episode subset without replacement."""
+    import minari
+
+    minari_dataset = minari.load_dataset(dataset_id, download=True)
+    available_episodes = int(minari_dataset.total_episodes)
+    if num_episodes > available_episodes:
+        raise ValueError(
+            f"Requested {num_episodes} episodes from {dataset_id}, but it contains only "
+            f"{available_episodes} episodes ({int(minari_dataset.total_steps)} transitions)."
+        )
+
+    rng = np.random.default_rng(seed)
+    episode_indices = rng.permutation(minari_dataset.episode_indices)[:num_episodes]
+    episodes = []
+    for episode_id, episode in enumerate(
+        minari_dataset.iterate_episodes(episode_indices), start=episode_id_start
+    ):
+        transitions = episode_to_transitions(episode)
+        transitions["episode_ids"] = np.full(
+            len(transitions["actions"]), episode_id, dtype=np.int64
+        )
+        episodes.append(transitions)
+
+    dataset = concat_datasets(episodes)
+    env_spec = getattr(minari_dataset, "env_spec", None)
+    return dataset, {
+        "dataset_id": dataset_id,
+        "env_id": getattr(env_spec, "id", None),
+        "available_num_episodes": available_episodes,
+        "available_num_transitions": int(minari_dataset.total_steps),
+        "num_episodes": num_episodes,
+        "num_transitions": int(len(dataset["rewards"])),
+        "seed": seed,
+    }
+
+
 def episode_to_transitions(episode: Any) -> dict[str, np.ndarray]:
     observations = np.asarray(episode.observations, dtype=np.float32)
     actions = np.asarray(episode.actions, dtype=np.float32)

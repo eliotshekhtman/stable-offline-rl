@@ -3,13 +3,13 @@
 # - Average matching results across the random seeds selected by the sweep.
 # - Plot final-policy performance and contraction against action chunk length.
 # - Plot task performance and contraction against generated noisy-trajectory fractions.
+# - Plot task performance and contraction against clean-expert/Minari fractions.
 # - Plot state and state-action conservativity over policy-training checkpoints.
 # - Plot task performance over policy-training checkpoints.
 # - Retain dormant learned-dynamics mismatch plotting for future use.
 
 import argparse
 import json
-import shutil
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -46,10 +46,9 @@ def plot_root(root: Path, out: Path | None = None, eval_dirs: list[Path] | None 
     histories = load_histories(eval_dirs, rows)
     rows = average_seed_rows(rows)
     histories = average_seed_histories(histories)
-    if out.exists():
-        shutil.rmtree(out)
-    out.mkdir(parents=True)
+    out.mkdir(parents=True, exist_ok=True)
     plot_generated_ablation(rows, out)
+    plot_clean_minari_ablation(rows, out)
 
     dataset_tags = sorted({row["plot_dataset_tag"] for row in rows} | {history["plot_dataset_tag"] for history in histories})
     for dataset_tag in dataset_tags:
@@ -114,6 +113,13 @@ def load_rows(eval_dirs: list[Path]) -> list[dict]:
                 f"noisy{dataset_schema['prop_noisy_expert']:g}_"
                 f"noise{dataset_schema['noise_scale']:g}"
             )
+        elif row["dataset_source"] == "clean-minari":
+            dataset_schema = manifest["training_schema"]["dataset"]
+            source = dataset_schema["dataset_id"].replace("/", "_")
+            row["seedless_dataset_tag"] = (
+                f"clean_minari_{source}_samples{dataset_schema['num_samples']}_"
+                f"minari{dataset_schema['minari_fraction']:g}"
+            )
         else:
             row["seedless_dataset_tag"] = row["dataset_tag"]
         row["label"] = policy_label(row)
@@ -139,8 +145,14 @@ def average_seed_rows(rows: list[dict]) -> list[dict]:
             row["noisy_trajectory_fraction"] = float(np.mean([
                 seed_row["noisy_trajectory_fraction"] for seed_row in seed_rows
             ]))
-            if len(seed_rows) > 1:
-                row["plot_dataset_tag"] = row["seedless_dataset_tag"]
+        elif row["dataset_source"] == "clean-minari":
+            row["minari_trajectory_fraction"] = float(np.mean([
+                seed_row["minari_trajectory_fraction"] for seed_row in seed_rows
+            ]))
+        if len(seed_rows) > 1 and row["dataset_source"] in {
+            "generated", "clean-minari"
+        }:
+            row["plot_dataset_tag"] = row["seedless_dataset_tag"]
         averaged.append(row)
     return averaged
 
@@ -150,6 +162,16 @@ def dataset_fields(metadata: dict) -> dict:
         return {
             "dataset_source": "minari",
             "minari_dataset": metadata["dataset_id"].split("/")[-1].removesuffix("-v0"),
+        }
+    if metadata.get("source") == "clean-minari":
+        dataset_schema = metadata["dataset_schema"]
+        return {
+            "dataset_source": "clean-minari",
+            "minari_dataset_id": metadata["dataset_id"],
+            "minari_dataset": metadata["dataset_id"].split("/")[-1].removesuffix("-v0"),
+            "num_samples": dataset_schema["num_samples"],
+            "requested_minari_trajectory_fraction": dataset_schema["minari_fraction"],
+            "minari_trajectory_fraction": metadata["actual_minari_trajectory_fraction"],
         }
     if metadata.get("source") == "robomimic":
         return {
@@ -384,7 +406,8 @@ def plot_generated_ablation(rows: list[dict], out: Path) -> None:
     experiment_out = out / family / "final"
     experiment_out.mkdir(parents=True, exist_ok=True)
     performance_ablation_plot(
-        generated, title, experiment_out / "performance_vs_noisy_fraction.png"
+        generated, title, experiment_out / "performance_vs_noisy_fraction.png",
+        "noisy_trajectory_fraction", "fraction of trajectories collected from the noisy expert",
     )
     contraction_curve_plot(
         generated, "noisy_trajectory_fraction", "noisy trajectory fraction",
@@ -393,14 +416,74 @@ def plot_generated_ablation(rows: list[dict], out: Path) -> None:
     )
 
 
-def performance_ablation_plot(rows: list[dict], title: str, path: Path) -> None:
+def plot_clean_minari_ablation(rows: list[dict], out: Path) -> None:
+    mixed = [row for row in rows if row["dataset_source"] == "clean-minari"]
+    if not mixed:
+        return
+    clean = [
+        row for row in rows
+        if row["dataset_source"] == "generated"
+        and row["requested_prop_clean_expert"] == 1.0
+        and row["requested_prop_noisy_expert"] == 0.0
+        and row["requested_prop_random"] == 0.0
+    ]
+
+    groups = {}
+    for row in mixed:
+        key = (row["minari_dataset_id"], row["num_samples"], row["chunk_length"])
+        groups.setdefault(key, []).append(row)
+
+    for (dataset_id, num_samples, chunk_length), mixture_rows in groups.items():
+        plot_rows = list(mixture_rows)
+        baselines = {}
+        for row in clean:
+            if row["num_samples"] == num_samples and row["chunk_length"] == chunk_length:
+                if row["algo"] not in baselines:
+                    baselines[row["algo"]] = {
+                        **row,
+                        "seed_rows": list(row["seed_rows"]),
+                        "minari_trajectory_fraction": 0.0,
+                    }
+                else:
+                    baselines[row["algo"]]["seed_rows"].extend(row["seed_rows"])
+        plot_rows.extend(baselines.values())
+        if len({row["minari_trajectory_fraction"] for row in plot_rows}) < 2:
+            continue
+
+        dataset_name = dataset_id.split("/")[-1].removesuffix("-v0")
+        experiment_out = (
+            out / "clean_minari" / dataset_name
+            / f"samples{num_samples}_chunk{chunk_length}" / "final"
+        )
+        experiment_out.mkdir(parents=True, exist_ok=True)
+        title = f"Clean-expert/{dataset_name} Minari trajectory ablation"
+        performance_ablation_plot(
+            plot_rows, title,
+            experiment_out / "performance_vs_minari_fraction.png",
+            "minari_trajectory_fraction",
+            "fraction of trajectories drawn from the Minari dataset",
+        )
+        contraction_curve_plot(
+            plot_rows, "minari_trajectory_fraction", "Minari trajectory fraction",
+            f"Final-policy {title.lower()}",
+            experiment_out / "contraction_vs_minari_fraction.png",
+        )
+
+
+def performance_ablation_plot(
+    rows: list[dict],
+    title: str,
+    path: Path,
+    value_key: str,
+    value_label: str,
+) -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
     for algo in sorted({row["algo"] for row in rows}):
         algo_rows = sorted(
             (row for row in rows if row["algo"] == algo),
-            key=lambda row: row["noisy_trajectory_fraction"],
+            key=lambda row: row[value_key],
         )
-        x = [row["noisy_trajectory_fraction"] for row in algo_rows]
+        x = [row[value_key] for row in algo_rows]
         intervals = [bootstrap_mean(final_performance_samples(row)) for row in algo_rows]
         center, low, high = map(np.asarray, zip(*intervals))
         line, = ax.plot(x, center, marker="o", label=algo)
@@ -410,7 +493,7 @@ def performance_ablation_plot(rows: list[dict], title: str, path: Path) -> None:
         color="black", linestyle=":", label="expert",
     )
     ax.set_xlim(-0.02, 1.02)
-    ax.set_xlabel("fraction of trajectories collected from the noisy expert")
+    ax.set_xlabel(value_label)
     ax.set_ylabel(rows[0]["performance_label"])
     ax.set_title(f"Final-policy {rows[0]['performance_label']}\n{title}")
     ax.legend()
