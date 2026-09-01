@@ -10,6 +10,11 @@ import gymnasium as gym
 import numpy as np
 import torch
 
+from chunked_dynamics import (
+    DIRECT_DYNAMICS_MODE,
+    RecursiveChunkDynamics,
+    resolve_dynamics_chunk_mode,
+)
 from offlinerlkit.buffer import ReplayBuffer
 from offlinerlkit.dynamics import EnsembleDynamics
 from offlinerlkit.modules import Actor, ActorProb, Critic, DiagGaussian, EnsembleCritic, EnsembleDynamicsModel, TanhDiagGaussian
@@ -18,11 +23,17 @@ from offlinerlkit.policy import BCPolicy, COMBOPolicy, CQLPolicy, EDACPolicy, IQ
 from offlinerlkit.utils.noise import GaussianNoise
 from offlinerlkit.utils.scaler import StandardScaler
 from offlinerlkit.utils.termination_fns import get_termination_fn, obs_unnormalization
-from dql import build_dql_policy
 
 
-MODEL_FREE_ALGOS = ("bc", "cql", "iql", "td3bc", "edac", "dql")
-MODEL_BASED_ALGOS = ("mopo", "combo", "mobile", "rambo")
+TRAINABLE_MODEL_FREE_ALGOS = ("bc", "cql", "iql", "td3bc", "edac")
+TRAINABLE_MODEL_BASED_ALGOS = ("mopo", "combo", "mobile")
+LOADABLE_MODEL_FREE_ALGOS = (*TRAINABLE_MODEL_FREE_ALGOS, "dql")
+LOADABLE_MODEL_BASED_ALGOS = (*TRAINABLE_MODEL_BASED_ALGOS, "rambo")
+
+# Backward-compatible aliases used when interpreting existing manifests. New
+# training entry points must use the explicit TRAINABLE_* registries instead.
+MODEL_FREE_ALGOS = LOADABLE_MODEL_FREE_ALGOS
+MODEL_BASED_ALGOS = LOADABLE_MODEL_BASED_ALGOS
 ROBOMIMIC_TASKS = {"can", "lift", "square", "transport", "toolhang"}
 
 MODEL_BASED_DEFAULTS = {
@@ -46,6 +57,10 @@ def build_model_free_policy(
     max_action = float(env.action_space.high[0])
 
     if algo == "dql":
+        # Keep old DQL checkpoints loadable without making CleanDiffuser a
+        # dependency of ordinary training, evaluation, or plotting imports.
+        from dql import build_dql_policy
+
         return build_dql_policy(
             buffer,
             action_low=env.action_space.low,
@@ -194,9 +209,50 @@ def build_model_based_policy(
     discount: float,
     obs_mean: np.ndarray | None = None,
     obs_std: np.ndarray | None = None,
+    chunk_length: int = 1,
+    base_discount: float = 0.99,
+    dynamics_chunk_mode: str = DIRECT_DYNAMICS_MODE,
+    primitive_action_dim: int | None = None,
 ):
     obs_dim = int(np.prod(env.observation_space.shape))
     action_dim = int(np.prod(env.action_space.shape))
+    effective_dynamics_mode = resolve_dynamics_chunk_mode(
+        dynamics_chunk_mode, chunk_length
+    )
+    if effective_dynamics_mode != DIRECT_DYNAMICS_MODE:
+        if algo == "rambo":
+            raise ValueError("RAMBO does not support recursive chunk dynamics")
+        if primitive_action_dim is None:
+            if action_dim % chunk_length:
+                raise ValueError(
+                    f"Chunk action dimension {action_dim} is not divisible by chunk length {chunk_length}"
+                )
+            primitive_action_dim = action_dim // chunk_length
+        if (
+            isinstance(primitive_action_dim, bool)
+            or not isinstance(primitive_action_dim, (int, np.integer))
+            or primitive_action_dim < 1
+            or int(primitive_action_dim) * chunk_length != action_dim
+        ):
+            raise ValueError(
+                f"Recursive primitive action dimension {primitive_action_dim!r} "
+                f"with chunk length {chunk_length} must reproduce macro action "
+                f"dimension {action_dim}"
+            )
+        expected_discount = base_discount**chunk_length
+        if not (
+            np.isfinite(discount)
+            and np.isfinite(expected_discount)
+            and np.isclose(discount, expected_discount, rtol=1e-9, atol=1e-12)
+        ):
+            raise ValueError(
+                f"Recursive macro discount must equal base_discount ** chunk_length "
+                f"({expected_discount!r}), got {discount!r}"
+            )
+        primitive_action_dim = int(primitive_action_dim)
+        dynamics_action_dim = primitive_action_dim
+    else:
+        dynamics_action_dim = action_dim
     max_action = float(env.action_space.high[0])
     defaults = MODEL_BASED_DEFAULTS[algo]
     manipulation_settings = args.model_manipulation_settings and algo in {"mopo", "mobile"}
@@ -209,13 +265,16 @@ def build_model_based_policy(
     dynamics_penalty_coef = args.mopo_penalty_coef if algo == "mopo" else defaults["dynamics_penalty_coef"]
     dynamics = build_dynamics(
         obs_dim,
-        action_dim,
+        dynamics_action_dim,
         env.spec.id,
         args,
         hidden_dims=dynamics_hidden_dims,
         penalty_coef=dynamics_penalty_coef,
         obs_mean=obs_mean,
         obs_std=obs_std,
+        chunk_length=chunk_length,
+        base_discount=base_discount,
+        dynamics_chunk_mode=effective_dynamics_mode,
     )
 
     if algo == "mobile":
@@ -335,7 +394,13 @@ def build_dynamics(
     penalty_coef: float,
     obs_mean: np.ndarray | None = None,
     obs_std: np.ndarray | None = None,
+    chunk_length: int = 1,
+    base_discount: float = 0.99,
+    dynamics_chunk_mode: str = DIRECT_DYNAMICS_MODE,
 ) -> EnsembleDynamics:
+    effective_dynamics_mode = resolve_dynamics_chunk_mode(
+        dynamics_chunk_mode, chunk_length
+    )
     dynamics_model = EnsembleDynamicsModel(
         obs_dim=obs_dim,
         action_dim=action_dim,
@@ -355,11 +420,22 @@ def build_dynamics(
         termination_fn = get_termination_fn(task)
     if obs_mean is not None and obs_std is not None:
         termination_fn = obs_unnormalization(termination_fn, obs_mean, obs_std)
-    return EnsembleDynamics(
+    if effective_dynamics_mode == DIRECT_DYNAMICS_MODE:
+        return EnsembleDynamics(
+            dynamics_model,
+            dynamics_optim,
+            StandardScaler(),
+            termination_fn,
+            penalty_coef=penalty_coef,
+        )
+    return RecursiveChunkDynamics(
         dynamics_model,
         dynamics_optim,
         StandardScaler(),
         termination_fn,
+        chunk_length=chunk_length,
+        primitive_action_dim=action_dim,
+        discount=base_discount,
         penalty_coef=penalty_coef,
     )
 

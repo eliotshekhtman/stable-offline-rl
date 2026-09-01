@@ -56,6 +56,10 @@ Windows never cross episode boundaries. Following robomimic's n-step convention,
 
 At execution time, all `l` predicted actions are applied open-loop. Execution stops early if the environment terminates or truncates, and reported episode returns remain the ordinary undiscounted sum of primitive rewards. Post-training contraction horizons and saved rollout timesteps are measured in primitive environment steps. Learned-dynamics `--rollout-length` and OOD state-action samples operate at chunk decision boundaries, so one learned-dynamics step represents up to `l` primitive steps.
 
+For MOPO, MOBILE, and COMBO, `--dynamics-chunk-mode direct` (the default) preserves the existing model that predicts one complete macro-transition from the flattened action chunk. With `--dynamics-chunk-mode recursive` and a chunk length greater than one, the learned model is instead fit to primitive one-step transitions. A synthetic macro-transition then applies the chunk's actions recursively and open-loop through that one-step model, discounts primitive rewards by the base discount within the chunk, and presents the resulting endpoint and macro reward to the unchanged macro policy and critics. `--rollout-length` remains a count of macro-transitions in both modes.
+
+Length one is always canonicalized to the exact legacy direct implementation: no adapter is inserted, no mode field is added to the training schema, and existing length-one runs remain reusable and loadable. Existing higher-length manifests without a mode field also continue to mean direct dynamics. Recursive higher-length runs carry an explicit versioned mode block in their training schema and are plotted separately. Recursive model rollouts cost roughly one dynamics call per primitive action, so they are expected to be slower as chunk length grows.
+
 ```bash
 python sweep.py \
   --env HalfCheetah-v5 \
@@ -65,42 +69,13 @@ python sweep.py \
   --eval
 ```
 
-## CleanDiffuser DQL
+## Legacy algorithms
 
-DQL uses CleanDiffuser commit `05f17fc9dbeae7c19a5e264632c9ae9aaac5994e`. Install it without dependency resolution because CleanDiffuser's package metadata pins old versions of Gym, MuJoCo, NumPy, and Torch that are incompatible with the `mujocold` environment:
-
-```bash
-conda activate mujocold
-python -m pip install --no-deps einops==0.8.1
-
-cd /home/shekhe
-git clone https://github.com/CleanDiffuserTeam/CleanDiffuser.git
-git -C /home/shekhe/CleanDiffuser checkout 05f17fc9dbeae7c19a5e264632c9ae9aaac5994e
-python -m pip install --editable /home/shekhe/CleanDiffuser --no-deps --no-build-isolation
-```
-
-The integration supports flat continuous-control environments, including Gymnasium MuJoCo tasks such as `HalfCheetah-v5` and `Humanoid-v5`. Actions are normalized to `[-1, 1]` inside DQL and converted back to the environment's native bounds for execution. It uses CleanDiffuser's five-step DDPM actor, twin critic, EMA updates, and 50-candidate inference defaults. Training length is `epoch * step_per_epoch`; the upstream two-million-step schedule corresponds to `--epoch 2000 --step-per-epoch 1000`.
-
-Published CleanDiffuser defaults are used when available: Q-selection weight temperature 50 for HalfCheetah, 300 for Walker2d, 100 for Hopper medium/replay, and 8 for Hopper medium-expert, with `eta=1`. Other environments use 50 and record that it is a fallback. `--dql-weight-temperature` and `--dql-eta` override these choices.
-
-`--dql-reward-normalization auto` applies CleanDiffuser-style episodic return-range scaling to full Minari training datasets. It leaves rewards unchanged for generated, clean-Minari mixture, and robomimic datasets. Every resolved DQL setting and its source is saved in `run_manifest.json`.
-
-```bash
-cd /home/shekhe/stable-offline-rl
-python sweep.py \
-  --env HalfCheetah-v5 \
-  --dataset-source minari \
-  --algos dql \
-  --device cuda \
-  --epoch 2000 \
-  --step-per-epoch 1000 \
-  --batch-size 256 \
-  --eval
-```
+DQL and RAMBO are retained only so existing manifests and checkpoints remain loadable; `sweep.py` no longer accepts either algorithm for new training. CleanDiffuser is imported only when loading a legacy DQL policy, so ordinary training and evaluation do not require it.
 
 ## Evaluation over training
 
-Every run saves policy checkpoints at approximately 0, 10, 20, ..., 100 percent of policy training. Milestones that fall in the same epoch are collapsed. Checkpoints live under `checkpoint/step_<gradient_step>/`; fixed model-based dynamics are stored once at step zero, while RAMBO saves its changing dynamics with each checkpoint.
+Every run saves policy checkpoints at approximately 0, 10, 20, ..., 100 percent of policy training. Milestones that fall in the same epoch are collapsed. Checkpoints live under `checkpoint/step_<gradient_step>/`; fixed model-based dynamics are stored once at step zero, while legacy RAMBO manifests reference their per-checkpoint dynamics.
 
 Passing `--eval` evaluates every policy checkpoint and then plots the selected sweep runs. The 0%-90% checkpoints use `--checkpoint-eval-episodes` (default 20) for training-history monitoring. The final checkpoint uses a separate reset-seed stream and `--final-eval-episodes` (default 100) for reported performance and generated-data expert evaluation. The final policy and 100-percent checkpoint are one logical policy and share one rollout. Performance uses task-native units: success rate for Can, Lift, and ToolHang, final fingertip-target distance for Reacher, balance duration for InvertedDoublePendulum, and forward displacement for HalfCheetah. Robomimic performance evaluation stops on first success; Gymnasium tasks retain their native termination and truncation behavior.
 

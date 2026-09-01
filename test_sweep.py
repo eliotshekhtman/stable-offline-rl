@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import numpy as np
 
+import chunking
 from policies import termination_fn_never
 import sweep
 
@@ -29,6 +30,70 @@ class MobileShiftArgumentTests(unittest.TestCase):
             self.parse("--mobile-return-shift", "17.5").mobile_return_shift,
             17.5,
         )
+
+    def test_dynamics_chunk_mode_default_and_override(self):
+        self.assertEqual(self.parse().dynamics_chunk_mode, "direct")
+        self.assertEqual(
+            self.parse("--dynamics-chunk-mode", "recursive").dynamics_chunk_mode,
+            "recursive",
+        )
+
+    def test_recursive_dynamics_is_schema_equivalent_at_chunk_length_one(self):
+        direct_args = self.parse()
+        direct_args.seed = 0
+        recursive_args = self.parse("--dynamics-chunk-mode", "recursive")
+        recursive_args.seed = 0
+
+        direct_schema = sweep.make_training_schema(
+            "mopo", "Lift", {"source": "test"}, 1, direct_args
+        )
+        recursive_schema = sweep.make_training_schema(
+            "mopo", "Lift", {"source": "test"}, 1, recursive_args
+        )
+
+        self.assertEqual(recursive_schema, direct_schema)
+        self.assertNotIn("chunk_dynamics", recursive_schema["model_based"])
+
+    def test_recursive_dynamics_only_changes_higher_chunk_schema(self):
+        direct_args = self.parse()
+        direct_args.seed = 0
+        recursive_args = self.parse("--dynamics-chunk-mode", "recursive")
+        recursive_args.seed = 0
+
+        direct_schema = sweep.make_training_schema(
+            "mopo", "Lift", {"source": "test"}, 4, direct_args
+        )
+        recursive_schema = sweep.make_training_schema(
+            "mopo", "Lift", {"source": "test"}, 4, recursive_args
+        )
+
+        recursive_block = recursive_schema["model_based"].pop("chunk_dynamics")
+        self.assertEqual(recursive_block, {"version": 1, "mode": "recursive"})
+        self.assertEqual(recursive_schema, direct_schema)
+
+    def test_old_chunk_one_schema_remains_discoverable(self):
+        direct_args = self.parse()
+        direct_args.seed = 0
+        recursive_args = self.parse("--dynamics-chunk-mode", "recursive")
+        recursive_args.seed = 0
+        old_schema = sweep.make_training_schema(
+            "mopo", "Lift", {"source": "test"}, 1, direct_args
+        )
+        requested_schema = sweep.make_training_schema(
+            "mopo", "Lift", {"source": "test"}, 1, recursive_args
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "old-run"
+            run_dir.mkdir()
+            (run_dir / "run_manifest.json").write_text(
+                json.dumps({"training_schema": old_schema}), encoding="utf-8"
+            )
+            with patch("sweep.run_is_complete", return_value=True):
+                self.assertEqual(
+                    sweep.find_trained_run(Path(directory), requested_schema),
+                    run_dir,
+                )
 
     def test_output_and_evaluation_defaults(self):
         args = self.parse()
@@ -138,6 +203,89 @@ class MobileShiftArgumentTests(unittest.TestCase):
             schema["model_based"]["manipulation_settings"]["reward_normalization"],
             "zscore",
         )
+
+    def test_recursive_manipulation_rewards_match_normalized_macro_rewards(self):
+        observations = np.arange(7, dtype=np.float32).reshape(-1, 1)
+        primitive_dataset = {
+            "observations": observations,
+            "actions": np.arange(7, dtype=np.float32).reshape(-1, 1),
+            "next_observations": observations + 1.0,
+            "rewards": np.arange(1, 8, dtype=np.float32),
+            "terminals": np.asarray([False] * 6 + [True]),
+            "timeouts": np.zeros(7, dtype=bool),
+            "episode_ids": np.zeros(7, dtype=np.int64),
+        }
+        chunk_dataset = chunking.make_action_chunk_dataset(
+            primitive_dataset, chunk_length=3, discount=0.99
+        )
+
+        policy_dataset, dynamics_dataset = sweep.prepare_model_based_datasets(
+            "mobile",
+            primitive_dataset,
+            chunk_dataset,
+            chunk_length=3,
+            base_discount=0.99,
+            dynamics_chunk_mode="recursive",
+            model_manipulation_settings=True,
+        )
+        transformed_primitive = {
+            key: value.copy() for key, value in primitive_dataset.items()
+        }
+        transformed_primitive["rewards"] = dynamics_dataset["rewards"].reshape(-1)
+        transformed_chunks = chunking.make_action_chunk_dataset(
+            transformed_primitive, chunk_length=3, discount=0.99
+        )
+
+        expected = (
+            chunk_dataset["rewards"] - chunk_dataset["rewards"].mean()
+        ) / (chunk_dataset["rewards"].std() + 1e-3)
+        np.testing.assert_allclose(policy_dataset["rewards"], expected, rtol=1e-6)
+        np.testing.assert_allclose(
+            transformed_chunks["rewards"],
+            policy_dataset["rewards"],
+            rtol=1e-5,
+            atol=2e-6,
+        )
+        self.assertEqual(dynamics_dataset["actions"].shape, (7, 1))
+        self.assertEqual(dynamics_dataset["rewards"].shape, (7, 1))
+
+    def test_direct_dynamics_preserves_existing_real_buffer_training_path(self):
+        dataset = {
+            "observations": np.zeros((2, 1), dtype=np.float32),
+            "actions": np.zeros((2, 1), dtype=np.float32),
+            "next_observations": np.ones((2, 1), dtype=np.float32),
+            "rewards": np.asarray([1.0, 2.0], dtype=np.float32),
+            "terminals": np.asarray([False, True]),
+            "timeouts": np.asarray([False, False]),
+            "episode_ids": np.asarray([0, 0]),
+        }
+
+        policy_dataset, dynamics_dataset = sweep.prepare_model_based_datasets(
+            "mopo",
+            dataset,
+            dataset,
+            chunk_length=1,
+            base_discount=0.99,
+            dynamics_chunk_mode="direct",
+            model_manipulation_settings=False,
+        )
+
+        self.assertIs(policy_dataset, dataset)
+        self.assertIsNone(dynamics_dataset)
+
+        requested_recursive_policy, requested_recursive_dynamics = (
+            sweep.prepare_model_based_datasets(
+                "mopo",
+                dataset,
+                dataset,
+                chunk_length=1,
+                base_discount=0.99,
+                dynamics_chunk_mode="recursive",
+                model_manipulation_settings=False,
+            )
+        )
+        self.assertIs(requested_recursive_policy, dataset)
+        self.assertIsNone(requested_recursive_dynamics)
 
     def test_lift_synthetic_transitions_never_terminate(self):
         next_obs = np.zeros((3, 19), dtype=np.float32)

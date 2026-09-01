@@ -205,6 +205,7 @@ def load_histories(eval_dirs: list[Path], rows: list[dict]) -> list[dict]:
         history["seed_group"] = row["seed_group"]
         history["plot_dataset_tag"] = row["plot_dataset_tag"]
         history["seedless_dataset_tag"] = row["seedless_dataset_tag"]
+        history["training_schema"] = row["training_schema"]
         history["label"] = policy_label(history)
         histories.append(history)
     return histories
@@ -246,7 +247,41 @@ def average_seed_histories(histories: list[dict]) -> list[dict]:
     return averaged
 
 
+def dynamics_chunk_mode(record: dict) -> str | None:
+    training_schema = record.get("training_schema", {})
+    model_based = training_schema.get("model_based")
+    if model_based is None:
+        return None
+    if record["chunk_length"] == 1:
+        return "direct"
+    return model_based.get("chunk_dynamics", {}).get("mode", "direct")
+
+
+def algorithm_group_key(record: dict) -> tuple[str, str]:
+    return record["algo"], dynamics_chunk_mode(record) or ""
+
+
+def algorithm_label(record: dict) -> str:
+    mode = dynamics_chunk_mode(record)
+    if mode is not None and mode != "direct":
+        return f"{record['algo']} ({mode} dynamics)"
+    return record["algo"]
+
+
+def algorithm_groups(records: list[dict]) -> list[tuple[str, list[dict]]]:
+    groups = {}
+    for record in records:
+        groups.setdefault(algorithm_group_key(record), []).append(record)
+    return [
+        (algorithm_label(group[0]), group)
+        for _, group in sorted(groups.items())
+    ]
+
+
 def policy_label(record: dict) -> str:
+    mode = dynamics_chunk_mode(record)
+    if mode is not None and mode != "direct":
+        return f"{record['algo']} (l={record['chunk_length']}, {mode} dynamics)"
     return f"{record['algo']} (l={record['chunk_length']})"
 
 
@@ -356,12 +391,12 @@ def plot_performance_vs_chunk_length(rows: list[dict], out: Path) -> None:
         return
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    for algo in sorted({row["algo"] for row in rows}):
-        algo_rows = sorted((row for row in rows if row["algo"] == algo), key=lambda row: row["chunk_length"])
+    for label, group_rows in algorithm_groups(rows):
+        algo_rows = sorted(group_rows, key=lambda row: row["chunk_length"])
         x = [row["chunk_length"] for row in algo_rows]
         intervals = [bootstrap_mean(final_performance_samples(row)) for row in algo_rows]
         center, low, high = map(np.asarray, zip(*intervals))
-        line, = ax.plot(x, center, marker="o", label=algo)
+        line, = ax.plot(x, center, marker="o", label=label)
         ax.fill_between(x, low, high, color=line.get_color(), alpha=0.2)
     ax.axhline(
         np.mean([row["expert_performance_mean"] for row in rows]),
@@ -438,14 +473,15 @@ def plot_clean_minari_ablation(rows: list[dict], out: Path) -> None:
         baselines = {}
         for row in clean:
             if row["num_samples"] == num_samples and row["chunk_length"] == chunk_length:
-                if row["algo"] not in baselines:
-                    baselines[row["algo"]] = {
+                group_key = algorithm_group_key(row)
+                if group_key not in baselines:
+                    baselines[group_key] = {
                         **row,
                         "seed_rows": list(row["seed_rows"]),
                         "minari_trajectory_fraction": 0.0,
                     }
                 else:
-                    baselines[row["algo"]]["seed_rows"].extend(row["seed_rows"])
+                    baselines[group_key]["seed_rows"].extend(row["seed_rows"])
         plot_rows.extend(baselines.values())
         if len({row["minari_trajectory_fraction"] for row in plot_rows}) < 2:
             continue
@@ -478,15 +514,12 @@ def performance_ablation_plot(
     value_label: str,
 ) -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
-    for algo in sorted({row["algo"] for row in rows}):
-        algo_rows = sorted(
-            (row for row in rows if row["algo"] == algo),
-            key=lambda row: row[value_key],
-        )
+    for label, group_rows in algorithm_groups(rows):
+        algo_rows = sorted(group_rows, key=lambda row: row[value_key])
         x = [row[value_key] for row in algo_rows]
         intervals = [bootstrap_mean(final_performance_samples(row)) for row in algo_rows]
         center, low, high = map(np.asarray, zip(*intervals))
-        line, = ax.plot(x, center, marker="o", label=algo)
+        line, = ax.plot(x, center, marker="o", label=label)
         ax.fill_between(x, low, high, color=line.get_color(), alpha=0.2)
     ax.axhline(
         np.mean([row["expert_performance_mean"] for row in rows]),
@@ -516,12 +549,10 @@ def contraction_curve_plot(
     ]
     if not available:
         return
-    algorithms = sorted({row["algo"] for row in available})
+    algorithms = algorithm_groups(available)
     fig, axes = plt.subplots(1, len(algorithms), figsize=(5 * len(algorithms), 4), squeeze=False)
-    for axis, algo in zip(axes[0], algorithms):
-        for row in sorted(
-            (row for row in available if row["algo"] == algo), key=lambda row: row[value_key]
-        ):
+    for axis, (label, group_rows) in zip(axes[0], algorithms):
+        for row in sorted(group_rows, key=lambda row: row[value_key]):
             seed_curves = []
             for seed_row in row["seed_rows"]:
                 contraction_path = Path(seed_row["eval_dir"]) / filename
@@ -534,7 +565,7 @@ def contraction_curve_plot(
             axis.fill_between(
                 timesteps, low, high, color=line.get_color(), alpha=0.2
             )
-        axis.set_title(algo)
+        axis.set_title(label)
         axis.set_xlabel("primitive timestep")
         axis.legend(fontsize=8)
     axes[0, 0].set_ylabel("agent Cartesian-position distance (m)")

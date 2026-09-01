@@ -22,6 +22,7 @@ import chunking
 import metrics
 import load_offline
 import rollout
+from chunked_dynamics import DIRECT_DYNAMICS_MODE, resolve_dynamics_chunk_mode
 from policies import MODEL_BASED_ALGOS, build_model_based_policy, build_model_free_policy
 from sweep import build_buffer
 
@@ -260,9 +261,6 @@ def load_policy_and_dynamics(
         device=device,
         epoch=manifest["epoch"],
         step_per_epoch=manifest["step_per_epoch"],
-        adv_weight=manifest["adv_weight"],
-        rollout_length=manifest["rollout_length"],
-        adv_batch_size=manifest["adv_batch_size"],
     )
     if manifest["algo"] in MODEL_BASED_ALGOS:
         model_based = manifest["training_schema"]["model_based"]
@@ -271,6 +269,10 @@ def load_policy_and_dynamics(
         build_args.model_critic_learning_rate = model_based.get("critic_learning_rate", 3e-4)
         build_args.mopo_penalty_coef = manifest["training_schema"].get("mopo", {}).get("penalty_coef", 0.5)
         build_args.mobile_penalty_coef = manifest["training_schema"].get("mobile", {}).get("penalty_coef", 1.5)
+        if manifest["algo"] == "rambo":
+            build_args.adv_weight = manifest["adv_weight"]
+            build_args.rollout_length = manifest["rollout_length"]
+            build_args.adv_batch_size = manifest["adv_batch_size"]
     if manifest["algo"] == "mobile":
         mobile = manifest["training_schema"].get("mobile", {})
         build_args.mobile_return_shift = mobile.get("return_shift", 0.0)
@@ -291,9 +293,20 @@ def load_policy_and_dynamics(
     if manifest["algo"] in MODEL_BASED_ALGOS:
         if manifest["algo"] == "rambo":
             obs_mean, obs_std = buffer.normalize_obs()
+        chunk_length = manifest["chunk_length"]
+        action_dim = int(np.prod(env.action_space.shape))
+        if action_dim % chunk_length:
+            raise ValueError(
+                f"Chunk action dimension {action_dim} is not divisible by "
+                f"chunk length {chunk_length}"
+            )
         policy, dynamics, _ = build_model_based_policy(
             manifest["algo"], env, build_args, discount=manifest["macro_discount"],
             obs_mean=obs_mean, obs_std=obs_std,
+            chunk_length=chunk_length,
+            base_discount=manifest["base_discount"],
+            dynamics_chunk_mode=manifest_dynamics_chunk_mode(manifest),
+            primitive_action_dim=action_dim // chunk_length,
         )
         if dynamics_path is not None:
             dynamics.load(str(dynamics_path))
@@ -308,6 +321,22 @@ def load_policy_and_dynamics(
     policy.load_state_dict(torch.load(policy_path, map_location=device, weights_only=True))
     policy.eval()
     return policy, dynamics, obs_mean, obs_std
+
+
+def manifest_dynamics_chunk_mode(manifest: dict) -> str:
+    chunk_dynamics = manifest["training_schema"]["model_based"].get(
+        "chunk_dynamics"
+    )
+    if chunk_dynamics is None:
+        requested_mode = DIRECT_DYNAMICS_MODE
+    else:
+        if chunk_dynamics.get("version") != 1:
+            raise ValueError(
+                "Unsupported chunk dynamics schema version: "
+                f"{chunk_dynamics.get('version')!r}"
+            )
+        requested_mode = chunk_dynamics["mode"]
+    return resolve_dynamics_chunk_mode(requested_mode, manifest["chunk_length"])
 
 
 def load_policy_checkpoint(policy, path: Path, device: str) -> None:
@@ -1019,12 +1048,17 @@ def predict_next_obs(
     obs_std: np.ndarray | None = None,
 ) -> np.ndarray:
     model_obs = obs if obs_mean is None else (obs - obs_mean) / obs_std
-    model_input = dynamics.scaler.transform(np.concatenate([model_obs, action_chunks], axis=-1))
-    with torch.no_grad():
-        mean, _ = dynamics.model(model_input)
-    elite_indices = dynamics.model.elites.detach().cpu().numpy()
-    elite_mean = mean[elite_indices].mean(dim=0).cpu().numpy()
-    pred_model_next_obs = model_obs + elite_mean[:, : obs.shape[1]]
+    if hasattr(dynamics, "mean_next_obss"):
+        pred_model_next_obs = dynamics.mean_next_obss(model_obs, action_chunks)
+    else:
+        model_input = dynamics.scaler.transform(
+            np.concatenate([model_obs, action_chunks], axis=-1)
+        )
+        with torch.no_grad():
+            mean, _ = dynamics.model(model_input)
+        elite_indices = dynamics.model.elites.detach().cpu().numpy()
+        elite_mean = mean[elite_indices].mean(dim=0).cpu().numpy()
+        pred_model_next_obs = model_obs + elite_mean[:, : obs.shape[1]]
     if obs_mean is not None:
         return pred_model_next_obs * obs_std + obs_mean
     return pred_model_next_obs

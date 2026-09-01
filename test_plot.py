@@ -54,6 +54,149 @@ class EvaluationDiscoveryTests(unittest.TestCase):
             self.assertEqual(plot.latest_eval_dirs(root), sorted(expected))
 
 
+class DynamicsChunkModePlotTests(unittest.TestCase):
+    @staticmethod
+    def record(algo="mopo", chunk_length=4, mode=None):
+        model_based = {}
+        if mode is not None:
+            model_based["chunk_dynamics"] = {"version": 1, "mode": mode}
+        return {
+            "algo": algo,
+            "chunk_length": chunk_length,
+            "training_schema": {
+                "algo": algo,
+                "chunk_length": chunk_length,
+                "model_based": model_based,
+            },
+        }
+
+    def test_old_model_based_schema_is_direct_and_keeps_old_labels(self):
+        record = self.record()
+
+        self.assertEqual(plot.dynamics_chunk_mode(record), "direct")
+        self.assertEqual(plot.algorithm_label(record), "mopo")
+        self.assertEqual(plot.policy_label(record), "mopo (l=4)")
+
+    def test_recursive_mode_has_distinct_algorithm_and_policy_labels(self):
+        record = self.record(mode="recursive")
+
+        self.assertEqual(plot.dynamics_chunk_mode(record), "recursive")
+        self.assertEqual(plot.algorithm_label(record), "mopo (recursive dynamics)")
+        self.assertEqual(
+            plot.policy_label(record), "mopo (l=4, recursive dynamics)"
+        )
+
+    def test_chunk_length_one_is_always_labeled_as_direct(self):
+        record = self.record(chunk_length=1, mode="recursive")
+
+        self.assertEqual(plot.dynamics_chunk_mode(record), "direct")
+        self.assertEqual(plot.algorithm_label(record), "mopo")
+        self.assertEqual(plot.policy_label(record), "mopo (l=1)")
+
+    def test_model_free_label_is_unchanged(self):
+        record = {
+            "algo": "iql",
+            "chunk_length": 4,
+            "training_schema": {"algo": "iql", "chunk_length": 4},
+        }
+
+        self.assertIsNone(plot.dynamics_chunk_mode(record))
+        self.assertEqual(plot.algorithm_label(record), "iql")
+        self.assertEqual(plot.policy_label(record), "iql (l=4)")
+
+    def test_algorithm_groups_separate_direct_and_recursive(self):
+        direct = self.record(mode="direct")
+        recursive = self.record(mode="recursive")
+
+        groups = plot.algorithm_groups([recursive, direct])
+
+        self.assertEqual(
+            [(label, rows) for label, rows in groups],
+            [("mopo", [direct]), ("mopo (recursive dynamics)", [recursive])],
+        )
+
+    def test_seed_averaging_keeps_modes_separate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            metadata_path = root / "metadata.json"
+            metadata_path.write_text(json.dumps({
+                "source": "robomimic",
+                "task": "Lift",
+                "dataset_type": "mg_dense",
+            }))
+            eval_dirs = []
+            for mode in ("direct", "recursive"):
+                for seed in (1, 2):
+                    eval_dir = root / mode / str(seed)
+                    eval_dir.mkdir(parents=True)
+                    model_based = {}
+                    if mode == "recursive":
+                        model_based["chunk_dynamics"] = {
+                            "version": 1,
+                            "mode": "recursive",
+                        }
+                    manifest_path = eval_dir / "run_manifest.json"
+                    manifest_path.write_text(json.dumps({
+                        "algo": "mobile",
+                        "chunk_length": 4,
+                        "dataset_source": "robomimic",
+                        "dataset_tag": f"lift_seed{seed}",
+                        "dataset_metadata_path": str(metadata_path),
+                        "training_schema": {
+                            "algo": "mobile",
+                            "chunk_length": 4,
+                            "seed": seed,
+                            "dataset": {"seed": seed, "source": "robomimic"},
+                            "model_based": model_based,
+                        },
+                    }))
+                    (eval_dir / "results.json").write_text(json.dumps({
+                        "run_manifest_path": str(manifest_path),
+                        "evaluation_config": {
+                            "schema_version": plot.EVALUATION_SCHEMA_VERSION,
+                        },
+                        "last_policy_performance_mean": float(seed),
+                        "expert_performance_mean": 1.0,
+                    }))
+                    eval_dirs.append(eval_dir)
+
+            averaged = plot.average_seed_rows(plot.load_rows(eval_dirs))
+
+        self.assertEqual(len(averaged), 2)
+        self.assertEqual(sorted(len(row["seed_rows"]) for row in averaged), [2, 2])
+        self.assertEqual(
+            {row["label"] for row in averaged},
+            {"mobile (l=4)", "mobile (l=4, recursive dynamics)"},
+        )
+
+    @patch("plot.final_performance_samples", return_value=[np.ones(2)])
+    def test_performance_plot_renders_separate_mode_series(self, _samples):
+        direct = {
+            **self.record(mode="direct"),
+            "fraction": 0.5,
+            "expert_performance_mean": 1.0,
+            "performance_label": "success rate",
+        }
+        recursive = {**direct, **self.record(mode="recursive")}
+        figure, axis = plot.plt.subplots()
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "plot.plt.subplots", return_value=(figure, axis)
+        ), patch("plot.plt.close"):
+            plot.performance_ablation_plot(
+                [recursive, direct],
+                "mode separation",
+                Path(directory) / "plot.png",
+                "fraction",
+                "fraction",
+            )
+
+        self.assertEqual(
+            axis.get_legend_handles_labels()[1],
+            ["mopo", "mopo (recursive dynamics)", "expert"],
+        )
+        plot.plt.close(figure)
+
+
 class CleanMinariPlotTests(unittest.TestCase):
     def test_dataset_fields_only_reads_clean_minari_markers_for_mixture(self):
         fields = plot.dataset_fields({

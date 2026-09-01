@@ -20,11 +20,18 @@ import torch
 import chunking
 import load_offline
 import rollout
+from chunked_dynamics import DYNAMICS_CHUNK_MODES, resolve_dynamics_chunk_mode
 from offlinerlkit.buffer import ReplayBuffer
 from offlinerlkit.policy_trainer import MBPolicyTrainer, MFPolicyTrainer
 from offlinerlkit.utils.logger import Logger
-from dql import CLEANDIFFUSER_COMMIT, resolve_dql_config, train_dql
-from policies import MODEL_BASED_ALGOS, MODEL_FREE_ALGOS, build_model_based_policy, build_model_free_policy
+from policies import (
+    LOADABLE_MODEL_BASED_ALGOS,
+    LOADABLE_MODEL_FREE_ALGOS,
+    TRAINABLE_MODEL_BASED_ALGOS,
+    TRAINABLE_MODEL_FREE_ALGOS,
+    build_model_based_policy,
+    build_model_free_policy,
+)
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -76,7 +83,9 @@ def parse_args() -> argparse.Namespace:
 
     training = parser.add_argument_group("policy training")
     training.add_argument(
-        "--algos", nargs="+", choices=("none", *MODEL_FREE_ALGOS, *MODEL_BASED_ALGOS),
+        "--algos", nargs="+", choices=(
+            "none", *TRAINABLE_MODEL_FREE_ALGOS, *TRAINABLE_MODEL_BASED_ALGOS,
+        ),
         default=["cql"], help="Algorithms to train, or none to collect the dataset without training",
     )
     training.add_argument(
@@ -86,11 +95,6 @@ def parse_args() -> argparse.Namespace:
     training.add_argument("--epoch", type=int, default=1000, help="Number of policy-training epochs")
     training.add_argument("--step-per-epoch", type=int, default=1000, help="Gradient-update steps per policy-training epoch")
     training.add_argument("--batch-size", type=int, default=512, help="Policy-training batch size")
-
-    dql = parser.add_argument_group("DQL options")
-    dql.add_argument("--dql-eta", type=float, default=None, help="Override the DQL Q-guidance loss weight; defaults to CleanDiffuser's locomotion value of 1")
-    dql.add_argument("--dql-weight-temperature", type=float, default=None, help="Override the DQL candidate-action softmax weight; defaults to a CleanDiffuser task value when available")
-    dql.add_argument("--dql-reward-normalization", choices=["auto", "none", "episode-range"], default="auto", help="DQL reward scaling: auto uses CleanDiffuser episode-return-range scaling for full Minari datasets and no scaling otherwise")
 
     iql = parser.add_argument_group("IQL options")
     iql.add_argument("--iql-temperature", type=float, default=3.0, help="IQL advantage-weighting temperature; larger values favor higher-advantage dataset actions more strongly")
@@ -118,6 +122,12 @@ def parse_args() -> argparse.Namespace:
     model_based.add_argument("--model-actor-learning-rate", type=float, default=None, help="Override the actor learning rate for model-based algorithms; defaults to 1e-4, or 3e-5 with --model-manipulation-settings")
     model_based.add_argument("--model-critic-learning-rate", type=float, default=3e-4, help="Learning rate for model-based critics; the default preserves the existing 3e-4 setting")
     model_based.add_argument("--dynamics-max-epochs", type=int, default=30, help="Maximum epochs for fitting the learned dynamics model before policy training")
+    model_based.add_argument(
+        "--dynamics-chunk-mode",
+        choices=DYNAMICS_CHUNK_MODES,
+        default="direct",
+        help="Model action chunks directly, or fit primitive one-step dynamics and recursively execute each chunk; length one always uses the legacy direct path",
+    )
     model_based.add_argument("--rollout-freq", type=int, default=1000, help="Policy-training step interval between learned-dynamics rollout generation")
     model_based.add_argument("--rollout-batch-size", type=int, default=10000, help="Number of initial real states used when generating model rollouts")
     model_based.add_argument("--rollout-length", type=int, default=5, help="Number of learned macro-transitions per synthetic rollout")
@@ -127,11 +137,6 @@ def parse_args() -> argparse.Namespace:
     model_based.add_argument("--mopo-penalty-coef", type=float, default=0.5, help="MOPO coefficient multiplying learned-dynamics uncertainty in synthetic rewards")
     model_based.add_argument("--mobile-penalty-coef", type=float, default=1.5, help="MOBILE coefficient multiplying model-Bellman inconsistency on synthetic targets")
     model_based.add_argument("--mobile-return-shift", type=float, default=30.0, help="Reacher-only MOBILE return/Q shift D used to place the clamped target floor at -D")
-    model_based.add_argument("--dynamics-update-freq", type=int, default=1000, help="RAMBO dynamics-adversary update interval; ignored by other model-based algorithms")
-    model_based.add_argument("--adv-batch-size", type=int, default=256, help="RAMBO adversarial dynamics rollout batch size")
-    model_based.add_argument("--adv-weight", type=float, default=3e-4, help="RAMBO adversarial dynamics loss weight")
-    model_based.add_argument("--bc-epoch", type=int, default=5, help="RAMBO behavior-cloning pretraining epochs")
-    model_based.add_argument("--bc-batch-size", type=int, default=256, help="RAMBO behavior-cloning pretraining batch size")
     args = parser.parse_args()
     if any(chunk_length <= 0 for chunk_length in args.chunk_lengths):
         parser.error("--chunk-lengths values must be positive")
@@ -715,12 +720,6 @@ def make_training_schema(
         "step_per_epoch": args.step_per_epoch,
         "batch_size": args.batch_size,
     }
-    if algo == "dql":
-        schema["dql"] = {
-            "eta": args.dql_eta,
-            "weight_temperature": args.dql_weight_temperature,
-            "reward_normalization": args.dql_reward_normalization,
-        }
     if algo == "iql":
         schema["iql"] = {
             "temperature": args.iql_temperature,
@@ -752,7 +751,7 @@ def make_training_schema(
             schema["mobile"] = mobile_schema
     if algo in {"cql", "combo"}:
         schema["implementation_version"] = 2
-    if algo in MODEL_BASED_ALGOS:
+    if algo in TRAINABLE_MODEL_BASED_ALGOS:
         schema["model_based"] = {
             "dynamics_max_epochs": args.dynamics_max_epochs,
             "rollout_freq": args.rollout_freq,
@@ -761,6 +760,14 @@ def make_training_schema(
             "model_retain_epochs": args.model_retain_epochs,
             "real_ratio": args.real_ratio,
         }
+        dynamics_chunk_mode = resolve_dynamics_chunk_mode(
+            getattr(args, "dynamics_chunk_mode", "direct"), chunk_length
+        )
+        if dynamics_chunk_mode == "recursive":
+            schema["model_based"]["chunk_dynamics"] = {
+                "version": 1,
+                "mode": "recursive",
+            }
         if args.model_actor_learning_rate is not None:
             schema["model_based"]["actor_learning_rate"] = args.model_actor_learning_rate
         if args.model_critic_learning_rate != 3e-4:
@@ -774,14 +781,6 @@ def make_training_schema(
                 "actor_learning_rate": args.model_actor_learning_rate or 3e-5,
                 "reward_normalization": "zscore",
             }
-    if algo == "rambo":
-        schema["rambo"] = {
-            "dynamics_update_freq": args.dynamics_update_freq,
-            "adv_batch_size": args.adv_batch_size,
-            "adv_weight": args.adv_weight,
-            "bc_epoch": args.bc_epoch,
-            "bc_batch_size": args.bc_batch_size,
-        }
     return schema
 
 
@@ -806,7 +805,7 @@ def run_is_complete(manifest: dict) -> bool:
         if "dynamics_path" in checkpoint:
             dynamics_dir = Path(checkpoint["dynamics_path"])
             paths.extend((dynamics_dir / "dynamics.pth", dynamics_dir / "mu.npy", dynamics_dir / "std.npy"))
-    if manifest["algo"] in MODEL_BASED_ALGOS:
+    if manifest["algo"] in LOADABLE_MODEL_BASED_ALGOS:
         model_dir = Path(manifest["model_dir"])
         paths.extend((model_dir / "dynamics.pth", model_dir / "mu.npy", model_dir / "std.npy"))
     return all(path.exists() for path in paths)
@@ -868,63 +867,60 @@ def train_algo(
     training_schema: dict,
     args: argparse.Namespace,
 ) -> None:
-    if algo not in MODEL_FREE_ALGOS and algo not in MODEL_BASED_ALGOS:
+    trainable_algos = (*TRAINABLE_MODEL_FREE_ALGOS, *TRAINABLE_MODEL_BASED_ALGOS)
+    loadable_algos = (*LOADABLE_MODEL_FREE_ALGOS, *LOADABLE_MODEL_BASED_ALGOS)
+    if algo in loadable_algos and algo not in trainable_algos:
+        raise ValueError(
+            f"Algorithm {algo!r} is retained only for loading legacy runs and cannot be trained."
+        )
+    if algo not in trainable_algos:
         raise ValueError(f"Unsupported algorithm: {algo}")
 
     run_dir.mkdir(parents=True)
     seed_everything(args.seed)
 
-    dql_config = None
-    if algo == "dql":
-        dql_config = resolve_dql_config(
-            env_name=env_name,
-            dataset_tag=split_paths["dataset_tag"],
-            dataset=primitive_dataset,
-            dataset_source=args.dataset_source,
-            eta_override=args.dql_eta,
-            weight_temperature_override=args.dql_weight_temperature,
-            reward_normalization=args.dql_reward_normalization,
-        )
     macro_discount = training_schema["macro_discount"]
     eval_env = chunking.ActionChunkWrapper(make_env(env_name, split_paths, args), chunk_length)
     eval_env.reset(seed=args.seed)
     eval_env.action_space.seed(args.seed)
     logger = build_logger(
-        run_dir, args, algo, env_name, chunk_length, macro_discount, dql_config
+        run_dir, args, algo, env_name, chunk_length, macro_discount
     )
 
     try:
-        if algo in MODEL_FREE_ALGOS:
+        if algo in TRAINABLE_MODEL_FREE_ALGOS:
             buffer = build_buffer(chunk_dataset, eval_env, args.device)
             policy, lr_scheduler = build_model_free_policy(
                 algo, eval_env, buffer, args,
                 discount=macro_discount,
-                dql_config=dql_config,
+                dql_config=None,
             )
-            if algo != "dql":
-                trainer = MFPolicyTrainer(
-                    policy=policy,
-                    buffer=buffer,
-                    logger=logger,
-                    epoch=args.epoch,
-                    step_per_epoch=args.step_per_epoch,
-                    batch_size=args.batch_size,
-                    lr_scheduler=lr_scheduler,
-                    checkpoint_epochs=checkpoint_epochs(args.epoch),
-                    show_progress=not args.quiet,
-                )
+            trainer = MFPolicyTrainer(
+                policy=policy,
+                buffer=buffer,
+                logger=logger,
+                epoch=args.epoch,
+                step_per_epoch=args.step_per_epoch,
+                batch_size=args.batch_size,
+                lr_scheduler=lr_scheduler,
+                checkpoint_epochs=checkpoint_epochs(args.epoch),
+                show_progress=not args.quiet,
+            )
         else:
-            model_dataset = chunk_dataset
-            if args.model_manipulation_settings and algo in {"mopo", "mobile"}:
-                model_dataset = dict(chunk_dataset)
-                rewards = chunk_dataset["rewards"]
-                model_dataset["rewards"] = (
-                    (rewards - rewards.mean()) / (rewards.std() + 1e-3)
-                ).astype(np.float32)
-            real_buffer = build_buffer(model_dataset, eval_env, args.device)
+            dynamics_chunk_mode = resolve_dynamics_chunk_mode(
+                getattr(args, "dynamics_chunk_mode", "direct"), chunk_length
+            )
+            policy_dataset, dynamics_dataset = prepare_model_based_datasets(
+                algo,
+                primitive_dataset,
+                chunk_dataset,
+                chunk_length,
+                BASE_DISCOUNT,
+                dynamics_chunk_mode,
+                args.model_manipulation_settings,
+            )
+            real_buffer = build_buffer(policy_dataset, eval_env, args.device)
             obs_mean = obs_std = None
-            if algo == "rambo":
-                obs_mean, obs_std = real_buffer.normalize_obs()
             fake_buffer = ReplayBuffer(
                 buffer_size=args.rollout_batch_size * args.rollout_length * args.model_retain_epochs,
                 obs_shape=eval_env.observation_space.shape,
@@ -938,17 +934,20 @@ def train_algo(
                 discount=macro_discount,
                 obs_mean=obs_mean,
                 obs_std=obs_std,
+                chunk_length=chunk_length,
+                base_discount=BASE_DISCOUNT,
+                dynamics_chunk_mode=dynamics_chunk_mode,
+                primitive_action_dim=int(np.prod(eval_env.env.action_space.shape)),
             )
 
-            dynamics.train(real_buffer.sample_all(), logger, max_epochs=args.dynamics_max_epochs, max_epochs_since_update=5)
-            if algo == "rambo":
-                policy.pretrain(
-                    real_buffer.sample_all(),
-                    args.bc_epoch,
-                    min(args.bc_batch_size, len(chunk_dataset["observations"])),
-                    1e-4,
-                    logger,
-                )
+            if dynamics_dataset is None:
+                dynamics_dataset = real_buffer.sample_all()
+            dynamics.train(
+                dynamics_dataset,
+                logger,
+                max_epochs=args.dynamics_max_epochs,
+                max_epochs_since_update=5,
+            )
 
             trainer = MBPolicyTrainer(
                 policy=policy,
@@ -961,7 +960,7 @@ def train_algo(
                 batch_size=args.batch_size,
                 real_ratio=args.real_ratio,
                 lr_scheduler=lr_scheduler,
-                dynamics_update_freq=args.dynamics_update_freq if algo == "rambo" else 0,
+                dynamics_update_freq=0,
                 checkpoint_epochs=checkpoint_epochs(args.epoch),
                 show_progress=not args.quiet,
             )
@@ -969,23 +968,64 @@ def train_algo(
         initial_checkpoint = Path(logger.checkpoint_dir) / "step_0"
         initial_checkpoint.mkdir(exist_ok=True)
         torch.save(policy.state_dict(), initial_checkpoint / "policy.pth")
-        if algo in MODEL_BASED_ALGOS:
+        if algo in TRAINABLE_MODEL_BASED_ALGOS:
             dynamics.save(initial_checkpoint)
 
-        if algo == "dql":
-            train_dql(
-                policy, buffer, logger, args.epoch, args.step_per_epoch,
-                args.batch_size, checkpoint_epochs(args.epoch),
-                show_progress=not args.quiet,
-            )
-        else:
-            trainer.train()
+        trainer.train()
         save_run_manifest(
             run_dir, eval_dir, algo, env_name, split_paths,
-            training_schema, chunk_length, macro_discount, args, dql_config,
+            training_schema, chunk_length, macro_discount, args,
         )
     finally:
         eval_env.close()
+
+
+def prepare_model_based_datasets(
+    algo: str,
+    primitive_dataset: dict[str, np.ndarray],
+    chunk_dataset: dict[str, np.ndarray],
+    chunk_length: int,
+    base_discount: float,
+    dynamics_chunk_mode: str,
+    model_manipulation_settings: bool,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray] | None]:
+    """Prepare macro policy data and, when recursive, primitive dynamics data."""
+    dynamics_chunk_mode = resolve_dynamics_chunk_mode(
+        dynamics_chunk_mode, chunk_length
+    )
+
+    manipulation_settings = model_manipulation_settings and algo in {"mopo", "mobile"}
+    policy_dataset = chunk_dataset
+    reward_mean = reward_scale = None
+    if manipulation_settings:
+        macro_rewards = np.asarray(chunk_dataset["rewards"], dtype=np.float32)
+        reward_mean = float(macro_rewards.mean())
+        reward_scale = float(macro_rewards.std()) + 1e-3
+        policy_dataset = dict(chunk_dataset)
+        policy_dataset["rewards"] = (
+            (macro_rewards - reward_mean) / reward_scale
+        ).astype(np.float32)
+
+    # The direct path must continue training on real_buffer.sample_all() so H=1
+    # uses the exact legacy arrays, shapes, and RNG sequence.
+    if dynamics_chunk_mode == "direct":
+        return policy_dataset, None
+
+    dynamics_dataset = {
+        key: np.asarray(primitive_dataset[key]).copy()
+        for key in ("observations", "actions", "next_observations", "rewards", "terminals")
+    }
+    primitive_rewards = np.asarray(primitive_dataset["rewards"], dtype=np.float32)
+    if manipulation_settings:
+        discount_mass = float(np.sum(base_discount ** np.arange(chunk_length)))
+        primitive_rewards = (
+            (primitive_rewards - reward_mean / discount_mass) / reward_scale
+        ).astype(np.float32)
+    dynamics_dataset["rewards"] = primitive_rewards.reshape(-1, 1)
+    dynamics_dataset["terminals"] = np.asarray(
+        primitive_dataset["terminals"], dtype=np.float32
+    ).reshape(-1, 1)
+    return policy_dataset, dynamics_dataset
 
 
 def build_buffer(dataset: dict[str, np.ndarray], env: gym.Env, device: str) -> ReplayBuffer:
@@ -1019,7 +1059,6 @@ def save_run_manifest(
     chunk_length: int,
     macro_discount: float,
     args: argparse.Namespace,
-    dql_config: dict | None,
 ) -> None:
     manifest = {
         "created_at": datetime.now().astimezone().isoformat(),
@@ -1040,16 +1079,11 @@ def save_run_manifest(
         "epoch": args.epoch,
         "step_per_epoch": args.step_per_epoch,
         "batch_size": args.batch_size,
-        "adv_weight": args.adv_weight,
-        "adv_batch_size": args.adv_batch_size,
         "rollout_length": args.rollout_length,
         "expert": str(resolve_expert_path(args.expert, env_name)),
         "checkpoints": checkpoint_manifest(run_dir, algo, args.epoch, args.step_per_epoch),
         **split_paths,
     }
-    if algo == "dql":
-        manifest["cleandiffuser_commit"] = CLEANDIFFUSER_COMMIT
-        manifest["dql_config"] = dql_config
     with (run_dir / "run_manifest.json").open("w", encoding="utf-8") as file:
         json.dump(manifest, file, indent=2, sort_keys=True)
 
@@ -1061,7 +1095,6 @@ def build_logger(
     env_name: str,
     chunk_length: int,
     macro_discount: float,
-    dql_config: dict | None,
 ) -> Logger:
     output_config = {
         "consoleout_backup": "stdout",
@@ -1081,8 +1114,6 @@ def build_logger(
         "step_per_epoch": args.step_per_epoch,
         "batch_size": args.batch_size,
     }
-    if dql_config is not None:
-        hyperparameters["dql"] = dql_config
     logger.log_hyperparameters(hyperparameters)
     return logger
 
@@ -1123,8 +1154,8 @@ def checkpoint_manifest(run_dir: Path, algo: str, epochs: int, steps_per_epoch: 
             "step": step,
             "policy_path": str((checkpoint_dir / "policy.pth").resolve()),
         }
-        if algo in MODEL_BASED_ALGOS:
-            dynamics_dir = checkpoint_dir if algo == "rambo" else run_dir / "checkpoint" / "step_0"
+        if algo in TRAINABLE_MODEL_BASED_ALGOS:
+            dynamics_dir = run_dir / "checkpoint" / "step_0"
             record["dynamics_path"] = str(dynamics_dir.resolve())
         records.append(record)
     return records
