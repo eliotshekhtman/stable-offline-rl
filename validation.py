@@ -13,6 +13,7 @@ import torch
 
 import chunking
 import rollout
+import task_support
 
 
 VALIDATION_SCHEMA_VERSION = 1
@@ -25,6 +26,9 @@ def validate_run(run_dir: Path, device: str) -> Path:
 
     run_dir = Path(run_dir)
     manifest = json.loads((run_dir / "run_manifest.json").read_text(encoding="utf-8"))
+    task_support.require_supported_task(
+        manifest["env_name"], manifest["dataset_source"]
+    )
     output_path = run_dir / "record" / "validation.csv"
     checkpoints = manifest["checkpoints"]
     if validation_is_complete(output_path, checkpoints):
@@ -46,7 +50,7 @@ def validate_run(run_dir: Path, device: str) -> Path:
     first_checkpoint = checkpoints[0]
 
     try:
-        policy, dynamics, obs_mean, obs_std = evaluation.load_policy_and_dynamics(
+        policy, dynamics = evaluation.load_policy_and_dynamics(
             manifest,
             device,
             Path(first_checkpoint["policy_path"]),
@@ -55,7 +59,7 @@ def validate_run(run_dir: Path, device: str) -> Path:
             chunk_env,
         )
         policy_dataset = prepare_policy_dataset(
-            manifest, policy, train_dataset, heldout_dataset, obs_mean, obs_std
+            manifest, policy, train_dataset, heldout_dataset
         )
         loaded_dynamics_path = first_checkpoint.get("dynamics_path")
         dynamics_errors = {}
@@ -86,7 +90,7 @@ def validate_run(run_dir: Path, device: str) -> Path:
             if dynamics is not None:
                 if dynamics_path not in dynamics_errors:
                     errors = evaluation.evaluate_dynamics_on_dataset(
-                        dynamics, heldout_dataset, obs_mean=obs_mean, obs_std=obs_std
+                        dynamics, heldout_dataset
                     )
                     dynamics_errors[dynamics_path] = float(errors.mean())
                 metrics["heldout/dynamics_next_obs_mse"] = dynamics_errors[dynamics_path]
@@ -125,8 +129,6 @@ def prepare_policy_dataset(
     policy,
     train_dataset: dict[str, np.ndarray],
     heldout_dataset: dict[str, np.ndarray],
-    obs_mean: np.ndarray | None,
-    obs_std: np.ndarray | None,
 ) -> dict[str, np.ndarray]:
     dataset = {
         key: np.asarray(heldout_dataset[key], dtype=np.float32).copy()
@@ -137,9 +139,6 @@ def prepare_policy_dataset(
     if manifest["algo"] == "td3bc":
         dataset["observations"] = policy.scaler.transform(dataset["observations"])
         dataset["next_observations"] = policy.scaler.transform(dataset["next_observations"])
-    elif manifest["algo"] == "rambo":
-        dataset["observations"] = (dataset["observations"] - obs_mean) / obs_std
-        dataset["next_observations"] = (dataset["next_observations"] - obs_mean) / obs_std
 
     model_based = manifest["training_schema"].get("model_based", {})
     manipulation = model_based.get("manipulation_settings")
@@ -189,8 +188,6 @@ def validation_batch(algo: str, policy, batch: dict[str, torch.Tensor]):
         return td3bc_metrics(policy, batch)
     if algo == "iql":
         return iql_metrics(policy, batch)
-    if algo == "dql":
-        return dql_metrics(policy, batch)
     if algo == "edac":
         return ensemble_sac_metrics(policy, batch)
     if algo == "mobile":
@@ -253,27 +250,6 @@ def iql_metrics(policy, batch):
         "heldout/advantage_weight_max": weights.max(),
         "heldout/q_abs_max": torch.maximum(q1.abs().max(), q2.abs().max()),
     }
-
-
-def dql_metrics(policy, batch):
-    obs = policy._normalize(batch["observations"])
-    next_obs = policy._normalize(batch["next_observations"])
-    actions = policy._normalize_action(batch["actions"])
-    q1, q2 = policy.critic(obs, actions)
-    next_actions = policy._sample(
-        next_obs, len(next_obs), use_ema=True, temperature=1.0
-    )
-    target = batch["rewards"] * policy.reward_scale
-    target = target + (1.0 - batch["terminals"]) * policy.discount * torch.minimum(
-        *policy.critic_target(next_obs, next_actions)
-    )
-    return {
-        "heldout/diffusion_bc_loss": policy.actor.loss(actions, obs),
-        "heldout/q1_td_mse": (q1 - target).square().mean(),
-        "heldout/q2_td_mse": (q2 - target).square().mean(),
-        "heldout/q_data_mean": torch.minimum(q1, q2).mean(),
-        "heldout/target_q_mean": target.mean(),
-    }, {"heldout/q_abs_max": torch.maximum(q1.abs().max(), q2.abs().max())}
 
 
 def twin_sac_metrics(policy, batch):

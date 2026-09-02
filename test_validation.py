@@ -91,7 +91,7 @@ class ValidationTests(unittest.TestCase):
                 "identity": "unchanged",
             }
             manifest = {
-                "env_name": "Pendulum-v1",
+                "env_name": "Reacher-v5",
                 "algo": "bc",
                 "dataset_source": "minari",
                 "chunk_length": 1,
@@ -128,7 +128,7 @@ class ValidationTests(unittest.TestCase):
             with patch.object(
                 evaluation,
                 "load_policy_and_dynamics",
-                return_value=(policy, None, None, None),
+                return_value=(policy, None),
             ):
                 output_path = validation.validate_run(run_dir, "cpu")
 
@@ -153,6 +153,17 @@ class ValidationTests(unittest.TestCase):
             ):
                 self.assertEqual(validation.validate_run(run_dir, "cpu"), output_path)
 
+    def test_standalone_validation_rejects_unsupported_task(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            (run_dir / "run_manifest.json").write_text(json.dumps({
+                "env_name": "Ant-v5",
+                "dataset_source": "minari",
+            }), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "Unsupported task 'Ant-v5'"):
+                validation.validate_run(run_dir, "cpu")
+
     def test_policy_dataset_uses_column_targets_and_training_reward_statistics(self):
         train_dataset = {
             "observations": np.zeros((2, 2), dtype=np.float32),
@@ -175,7 +186,7 @@ class ValidationTests(unittest.TestCase):
         }
 
         prepared = validation.prepare_policy_dataset(
-            manifest, None, train_dataset, heldout_dataset, None, None
+            manifest, None, train_dataset, heldout_dataset
         )
 
         self.assertEqual(prepared["rewards"].shape, (2, 1))

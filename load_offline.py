@@ -15,19 +15,12 @@ import h5py
 import numpy as np
 
 from rollout import DATASET_KEYS
+from task_support import require_supported_task
 
 
 MINARI_PREFIXES = {
-    "Ant-v5": "mujoco/ant",
     "HalfCheetah-v5": "mujoco/halfcheetah",
-    "Hopper-v5": "mujoco/hopper",
-    "Humanoid-v5": "mujoco/humanoid",
-    "InvertedDoublePendulum-v5": "mujoco/inverteddoublependulum",
-    "InvertedPendulum-v5": "mujoco/invertedpendulum",
-    "Pusher-v5": "mujoco/pusher",
     "Reacher-v5": "mujoco/reacher",
-    "Swimmer-v5": "mujoco/swimmer",
-    "Walker2d-v5": "mujoco/walker2d",
 }
 
 ROBOMIMIC_HF_REPO_ID = "robomimic/robomimic_datasets"
@@ -48,24 +41,13 @@ ROBOMIMIC_LOW_DIM_DATASETS = {
         ("mg_sparse", "v1.5/lift/mg/low_dim_sparse_v15.hdf5", 400),
         ("mg_dense", "v1.5/lift/mg/low_dim_dense_v15.hdf5", 400),
     ],
-    "Square": [
-        ("ph", "v1.5/square/ph/low_dim_v15.hdf5", 400),
-        ("mh", "v1.5/square/mh/low_dim_v15.hdf5", 500),
-    ],
-    "Transport": [
-        ("ph", "v1.5/transport/ph/low_dim_v15.hdf5", 700),
-        ("mh", "v1.5/transport/mh/low_dim_v15.hdf5", 1100),
-    ],
-    "ToolHang": [
-        ("ph", "v1.5/tool_hang/ph/low_dim_v15.hdf5", 700),
-    ],
 }
-
 
 def list_minari_dataset_ids(env_name: str, dataset_name: str | None = None) -> list[str]:
     """Return all matching Minari datasets, or one requested dataset."""
     import minari
 
+    require_supported_task(env_name, "minari")
     prefix = MINARI_PREFIXES[env_name]
     datasets = minari.list_remote_datasets(prefix=prefix)
     dataset_ids = sorted(dataset_id for dataset_id in datasets if dataset_id.startswith(prefix + "/"))
@@ -87,6 +69,7 @@ def list_minari_dataset_ids(env_name: str, dataset_name: str | None = None) -> l
 
 def load_minari_dataset(dataset_id: str, seed: int | None = None) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     """Download/load one Minari dataset and convert it to this project's transition schema."""
+    require_supported_minari_dataset(dataset_id)
     import minari
 
     minari_dataset = minari.load_dataset(dataset_id, download=True)
@@ -107,20 +90,28 @@ def load_minari_episode_subset(
     num_episodes: int,
     seed: int,
     episode_id_start: int,
+    episode_offset: int = 0,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
-    """Load a deterministic Minari episode subset without replacement."""
+    """Load one slice of a deterministic Minari episode permutation."""
+    require_supported_minari_dataset(dataset_id)
     import minari
 
     minari_dataset = minari.load_dataset(dataset_id, download=True)
     available_episodes = int(minari_dataset.total_episodes)
-    if num_episodes > available_episodes:
+    if num_episodes <= 0 or episode_offset < 0:
+        raise ValueError("num_episodes must be positive and episode_offset nonnegative.")
+    selection_stop = episode_offset + num_episodes
+    if selection_stop > available_episodes:
         raise ValueError(
-            f"Requested {num_episodes} episodes from {dataset_id}, but it contains only "
-            f"{available_episodes} episodes ({int(minari_dataset.total_steps)} transitions)."
+            f"Requested {selection_stop} unique episodes from {dataset_id}, but it contains "
+            f"only {available_episodes} episodes "
+            f"({int(minari_dataset.total_steps)} transitions); cannot top up without repetition."
         )
 
     rng = np.random.default_rng(seed)
-    episode_indices = rng.permutation(minari_dataset.episode_indices)[:num_episodes]
+    episode_indices = rng.permutation(minari_dataset.episode_indices)[
+        episode_offset:selection_stop
+    ]
     episodes = []
     for episode_id, episode in enumerate(
         minari_dataset.iterate_episodes(episode_indices), start=episode_id_start
@@ -140,6 +131,7 @@ def load_minari_episode_subset(
         "available_num_transitions": int(minari_dataset.total_steps),
         "num_episodes": num_episodes,
         "num_transitions": int(len(dataset["rewards"])),
+        "episode_offset": episode_offset,
         "seed": seed,
     }
 
@@ -184,7 +176,20 @@ def concat_datasets(datasets: list[dict[str, np.ndarray]]) -> dict[str, np.ndarr
 
 
 def make_minari_dataset_tag(dataset_id: str) -> str:
+    require_supported_minari_dataset(dataset_id)
     return "minari_" + dataset_id.replace("/", "_")
+
+
+def require_supported_minari_dataset(dataset_id: str) -> str:
+    for env_name, prefix in MINARI_PREFIXES.items():
+        if dataset_id.startswith(prefix + "/"):
+            require_supported_task(env_name, "minari")
+            return env_name
+    prefixes = ", ".join(sorted(MINARI_PREFIXES.values()))
+    raise ValueError(
+        f"Unsupported Minari dataset {dataset_id!r}; supported prefixes are: "
+        f"{prefixes}."
+    )
 
 
 def list_robomimic_dataset_specs(
@@ -192,6 +197,7 @@ def list_robomimic_dataset_specs(
     dataset_name: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return all low-dimensional dataset specs, or one requested type."""
+    require_supported_task(env_name, "robomimic")
     specs = ROBOMIMIC_LOW_DIM_DATASETS[env_name]
     if dataset_name is not None:
         matches = [spec for spec in specs if spec[0] == dataset_name]
@@ -219,6 +225,7 @@ def list_robomimic_dataset_specs(
 
 def load_robomimic_dataset(spec: dict[str, Any], seed: int | None = None) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     """Download/load one robomimic low-dimensional HDF5 dataset."""
+    require_supported_task(spec.get("task"), "robomimic")
     from huggingface_hub import hf_hub_download
 
     dataset_path = hf_hub_download(repo_id=ROBOMIMIC_HF_REPO_ID, filename=spec["repo_path"], repo_type="dataset")
@@ -251,6 +258,7 @@ def robomimic_demo_to_transitions(
     episode_id: int,
     task: str,
 ) -> dict[str, np.ndarray]:
+    require_supported_task(task, "robomimic")
     observations = np.concatenate([np.asarray(demo["obs"][key], dtype=np.float32) for key in ROBOMIMIC_OBS_KEYS], axis=1)
     next_observations = np.concatenate([
         np.asarray(demo["next_obs"][key], dtype=np.float32) for key in ROBOMIMIC_OBS_KEYS
@@ -277,6 +285,7 @@ def robomimic_demo_to_transitions(
 
 
 def make_robomimic_dataset_tag(spec: dict[str, Any]) -> str:
+    require_supported_task(spec.get("task"), "robomimic")
     tag = f"robomimic_{spec['task'].lower()}_{spec['dataset_type']}"
     return f"{tag}_continuing" if spec["task"] == "Lift" else tag
 
@@ -288,6 +297,7 @@ def load_metadata(metadata_path: str | Path) -> dict[str, Any]:
 
 def make_robomimic_env(metadata: dict[str, Any]):
     """Build a flat Gymnasium-compatible robosuite env matching a robomimic low-dim dataset."""
+    require_supported_task(metadata.get("task"), "robomimic")
     import robosuite
     from robosuite.wrappers import GymWrapper
 

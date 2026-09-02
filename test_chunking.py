@@ -43,8 +43,19 @@ class ActionChunkDatasetTests(unittest.TestCase):
 
     def test_length_one_is_identity(self):
         chunk_dataset = chunking.make_action_chunk_dataset(self.dataset, 1, 0.99)
+        self.assertIs(chunk_dataset, self.dataset)
         for key in DATASET_KEYS:
             np.testing.assert_array_equal(chunk_dataset[key], self.dataset[key])
+
+    def test_length_one_preserves_legacy_reward_coercion_for_noncanonical_input(self):
+        dataset = {key: value.copy() for key, value in self.dataset.items()}
+        dataset["rewards"] = dataset["rewards"].astype(np.float64)
+
+        chunk_dataset = chunking.make_action_chunk_dataset(dataset, 1, 0.99)
+
+        self.assertIsNot(chunk_dataset, dataset)
+        self.assertEqual(chunk_dataset["rewards"].dtype, np.float32)
+        np.testing.assert_array_equal(chunk_dataset["rewards"], dataset["rewards"])
 
     def test_stride_one_windows_stay_within_episodes(self):
         chunk_dataset = chunking.make_action_chunk_dataset(self.dataset, 2, 0.99)

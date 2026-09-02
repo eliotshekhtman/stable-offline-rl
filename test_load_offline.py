@@ -9,6 +9,15 @@ import load_offline
 
 
 class RobomimicDatasetTests(unittest.TestCase):
+    def test_only_lift_and_can_are_supported(self):
+        self.assertEqual(set(load_offline.ROBOMIMIC_LOW_DIM_DATASETS), {"Lift", "Can"})
+        with self.assertRaisesRegex(ValueError, "Unsupported task 'Square'"):
+            load_offline.list_robomimic_dataset_specs("Square")
+        with self.assertRaisesRegex(ValueError, "Unsupported task 'Square'"):
+            load_offline.make_robomimic_dataset_tag({
+                "task": "Square", "dataset_type": "ph",
+            })
+
     def test_selects_one_robomimic_dataset(self):
         self.assertEqual(len(load_offline.list_robomimic_dataset_specs("Can")), 5)
         specs = load_offline.list_robomimic_dataset_specs("Can", "mh")
@@ -48,6 +57,21 @@ class RobomimicDatasetTests(unittest.TestCase):
 
 
 class MinariDatasetTests(unittest.TestCase):
+    def test_only_reacher_and_halfcheetah_are_supported(self):
+        self.assertEqual(
+            set(load_offline.MINARI_PREFIXES), {"Reacher-v5", "HalfCheetah-v5"}
+        )
+        with self.assertRaisesRegex(ValueError, "Unsupported task 'Ant-v5'"):
+            load_offline.list_minari_dataset_ids("Ant-v5")
+        with self.assertRaisesRegex(ValueError, "Unsupported Minari dataset"):
+            load_offline.make_minari_dataset_tag("mujoco/ant/expert-v0")
+
+    @patch("minari.load_dataset")
+    def test_direct_minari_loader_rejects_unsupported_prefix(self, load_dataset):
+        with self.assertRaisesRegex(ValueError, "Unsupported Minari dataset"):
+            load_offline.load_minari_dataset("mujoco/ant/expert-v0")
+        load_dataset.assert_not_called()
+
     @patch("minari.list_remote_datasets")
     def test_selects_one_minari_dataset_by_leaf_or_full_id(self, list_remote_datasets):
         list_remote_datasets.return_value = {
@@ -94,7 +118,8 @@ class MinariDatasetTests(unittest.TestCase):
         dataset, metadata = load_offline.load_minari_episode_subset(
             "mujoco/reacher/medium-v0", num_episodes=3, seed=7, episode_id_start=10
         )
-        expected_indices = np.random.default_rng(7).permutation(4)[:3]
+        permutation = np.random.default_rng(7).permutation(4)
+        expected_indices = permutation[:3]
         np.testing.assert_array_equal(
             dataset["observations"][::2, 0] // 10, expected_indices
         )
@@ -104,9 +129,26 @@ class MinariDatasetTests(unittest.TestCase):
         self.assertEqual(metadata["available_num_episodes"], 4)
         self.assertEqual(metadata["available_num_transitions"], 8)
 
+        continuation, _ = load_offline.load_minari_episode_subset(
+            "mujoco/reacher/medium-v0", num_episodes=1, seed=7,
+            episode_id_start=20, episode_offset=3,
+        )
+        np.testing.assert_array_equal(
+            continuation["observations"][::2, 0] // 10, permutation[3:]
+        )
+        self.assertNotIn(
+            continuation["observations"][0, 0] // 10,
+            dataset["observations"][::2, 0] // 10,
+        )
+
         with self.assertRaisesRegex(ValueError, "contains only 4 episodes"):
             load_offline.load_minari_episode_subset(
                 "mujoco/reacher/medium-v0", num_episodes=5, seed=7, episode_id_start=0
+            )
+        with self.assertRaisesRegex(ValueError, "cannot top up without repetition"):
+            load_offline.load_minari_episode_subset(
+                "mujoco/reacher/medium-v0", num_episodes=2, seed=7,
+                episode_id_start=20, episode_offset=3,
             )
 
 

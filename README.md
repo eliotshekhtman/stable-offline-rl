@@ -2,14 +2,22 @@
 
 ## Saved artifacts
 
-Runs are independent of the working directory and are saved inside this repository:
+Runs are independent of the working directory. `--storage-root` is the common
+parent of all datasets, trained runs, and evaluations; it defaults to
+`/data/shekhe/stable-offline-rl`:
 
 ```text
-datasets/<environment>/<dataset-name>/<dataset-timestamp>/
-trained/<environment>/<algorithm>_chunk<length>_<dataset-name>/<training-timestamp>/
-evals/<environment>/<algorithm>_chunk<length>_<dataset-name>/<training-timestamp>/
-evals/<environment>/plots/
+<storage-root>/datasets/<environment>/<dataset-name>/<dataset-timestamp>/
+<storage-root>/trained/<environment>/<algorithm>_chunk<length>_<dataset-name>/<training-timestamp>/
+<storage-root>/evals/<environment>/<algorithm>_chunk<length>_<dataset-name>/<training-timestamp>/
+<storage-root>/evals/<environment>/plots/
 ```
+
+Pass an absolute override such as `--storage-root /scratch/shekhe/stable-offline-rl`
+when another server uses a different large-data filesystem. Sweep discovery and
+writes use only the selected root; there is no fallback search of repository-local
+`datasets/`, `trained/`, or `evals/`. The expert path and the Minari and Hugging
+Face caches are independent of this option and remain unchanged.
 
 Each training manifest records the dataset identity and all algorithm-relevant training arguments. Before training, `sweep.py` searches the timestamped variants under the corresponding run name and reuses the newest complete run with an identical training schema. Evaluation arguments are not part of that schema, so adding `--eval` or changing an evaluation setting reloads the existing model instead of retraining it. A different training schema creates another timestamped variant and leaves prior variants intact. Dataset reuse is automatic; `--output-dir`, `--reuse-datasets`, and `--overwrite` are no longer used.
 
@@ -18,6 +26,8 @@ Training normally displays one progress bar over policy-training epochs. Pass `-
 Dataset splits are reused by the same rule. Paths in new metadata and manifests are absolute. Runs previously written under `/home/shekhe/train_dir` are not searched or modified.
 
 Premade-data sweeps use every matching dataset by default. Pass `--dataset mh` for one Robomimic dataset type, or `--dataset medium-v0` (equivalently its full ID, such as `mujoco/halfcheetah/medium-v0`) for one Minari dataset.
+
+The supported tasks are exactly `Reacher-v5`, `HalfCheetah-v5`, `Lift`, and `Can`. Reacher and HalfCheetah support generated, Minari, and clean-Minari data; Lift and Can support Robomimic data. Other tasks and incompatible task/source combinations fail during argument validation before creating artifacts.
 
 All datasets are split by complete episode. Minari episodes, robomimic demonstrations, and generated rollouts share the same ordered transition schema: every `episode_id` occupies one contiguous block, and consecutive entries within that block are consecutive environment transitions. Generated `--num-samples` values are minimum transition counts. Source proportions allocate whole trajectories, and complete trajectories are added until that minimum is reached. Metadata records requested proportions plus realized trajectory and transition counts and fractions.
 
@@ -69,22 +79,33 @@ python sweep.py \
   --eval
 ```
 
-## Legacy algorithms
-
-DQL and RAMBO are retained only so existing manifests and checkpoints remain loadable; `sweep.py` no longer accepts either algorithm for new training. CleanDiffuser is imported only when loading a legacy DQL policy, so ordinary training and evaluation do not require it.
-
 ## Evaluation over training
 
-Every run saves policy checkpoints at approximately 0, 10, 20, ..., 100 percent of policy training. Milestones that fall in the same epoch are collapsed. Checkpoints live under `checkpoint/step_<gradient_step>/`; fixed model-based dynamics are stored once at step zero, while legacy RAMBO manifests reference their per-checkpoint dynamics.
+Every run saves policy checkpoints at approximately 0, 10, 20, ..., 100 percent of policy training. Milestones that fall in the same epoch are collapsed. Checkpoints live under `checkpoint/step_<gradient_step>/`; fixed model-based dynamics are stored once at step zero.
 
-Passing `--eval` evaluates every policy checkpoint and then plots the selected sweep runs. The 0%-90% checkpoints use `--checkpoint-eval-episodes` (default 20) for training-history monitoring. The final checkpoint uses a separate reset-seed stream and `--final-eval-episodes` (default 100) for reported performance and generated-data expert evaluation. The final policy and 100-percent checkpoint are one logical policy and share one rollout. Performance uses task-native units: success rate for Can, Lift, and ToolHang, final fingertip-target distance for Reacher, balance duration for InvertedDoublePendulum, and forward displacement for HalfCheetah. Robomimic performance evaluation stops on first success; Gymnasium tasks retain their native termination and truncation behavior.
+Passing `--eval` first validates the trained run, evaluates its policy checkpoints, and then plots the selected sweep runs. Training without `--eval` does not run validation or true-environment evaluation rollouts; training still constructs the task environment because policy and replay-buffer construction require its observation and action spaces. The 0%-90% checkpoints use `--checkpoint-eval-episodes` (default 20) for diagnostic training-history monitoring; set it to `0` to skip all non-final rollouts and retain only the rigorous final evaluation. The final checkpoint uses a separate reset-seed stream and `--final-eval-episodes` (default 100) for reported performance and generated-data expert evaluation. The final policy and 100-percent checkpoint are one logical policy and share one rollout. Performance uses task-native units: success rate for Can and Lift, final fingertip-target distance for Reacher, and forward displacement for HalfCheetah. Robomimic performance evaluation stops on first success; Gymnasium tasks retain their native termination and truncation behavior.
 
 Final-policy contraction pairs deterministic rollouts from the same simulator state. One copy receives a fixed-norm perturbation only in controlled-agent `qpos/qvel`; goals and manipulated objects are unchanged. Continuing-Lift pairs are rerun through success until the contraction horizon; other tasks reuse the unperturbed final-performance trajectory and retain their existing termination behavior. Distance is the Euclidean norm over Cartesian positions of the controlled agent's bodies: robot and gripper bodies for Robomimic, arm bodies excluding the target for Reacher, and all HalfCheetah bodies. Every coordinate is measured in meters; joint angles and velocities are excluded from the distance. Curves have no phase alignment, fitted `(C, rho)`, or support-fraction report. `--contraction-trajectories` cannot exceed `--final-eval-episodes`.
 
 State and state-action OOD ratios are evaluated over checkpoints. Each is the mean rollout-to-training k-nearest-neighbor distance divided by the corresponding held-out-to-training distance, so a ratio near one means rollout samples are about as far from training data as held-out samples are.
 
-For Robomimic datasets, final-policy plots compare task performance and contraction curves across action chunk lengths. For generated datasets, they compare those metrics against the realized fraction of complete trajectories collected from the noisy expert. A fixed random fraction gives the clean-expert/noisy-expert ablation; zero clean-expert fraction gives the random/noisy-expert ablation. Clean-Minari sweeps plot the same metrics against the realized Minari trajectory fraction, separately for each Minari dataset, sample count, and chunk length. Each plotter reads only its own source-specific metadata; generating one family no longer deletes unrelated existing plots. Performance and OOD ratios are also plotted against training percent. Lines are exact means with shaded hierarchical-bootstrap 10th-90th percentile bands: seeds and episodes are resampled for performance, while seeds and trajectory pairs are resampled for contraction. A one-seed run still uses episode or trajectory-pair variability; milestone OOD bands require multiple seeds because only one OOD estimate is saved per seed and checkpoint. Raw arrays are saved under the matching `evals/<environment>/<run-name>/<training-timestamp>/` directory, and plots are written under `evals/<environment>/plots/`.
+For Robomimic datasets, final-policy plots compare task performance and contraction curves across action chunk lengths. For generated datasets, they compare those metrics against the realized fraction of complete trajectories collected from the noisy expert. A fixed random fraction gives the clean-expert/noisy-expert ablation; zero clean-expert fraction gives the random/noisy-expert ablation. Clean-Minari sweeps plot the same metrics against the realized Minari trajectory fraction, separately for each Minari dataset, sample count, and chunk length. Each plotter reads only its own source-specific metadata; generating one family no longer deletes unrelated existing plots. Performance and OOD ratios are also plotted against training percent. Lines are exact means with shaded hierarchical-bootstrap 10th-90th percentile bands: seeds and episodes are resampled for performance, while seeds and trajectory pairs are resampled for contraction. A one-seed run still uses episode or trajectory-pair variability; milestone OOD bands require multiple seeds because only one OOD estimate is saved per seed and checkpoint. Raw arrays are saved under the matching `<storage-root>/evals/<environment>/<run-name>/<training-timestamp>/` directory, and plots are written under `<storage-root>/evals/<environment>/plots/`.
 
-Pass `--reuse-eval` together with `--eval` to reuse a completed matching evaluation or matching per-checkpoint rollout caches. Without it, the run's evaluation directory is cleared before evaluation. Cached rollouts retain returns, task performance, decision-boundary observations and action chunks, initial simulator states, and primitive Cartesian position traces, so plotting and metric recomputation do not require another environment rollout.
+When plotting an environment's full result history, pass `python plot.py --root /data/shekhe/stable-offline-rl/evals/<environment> --cohort <cohort.json>` to select explicit series. Each `match` key is a dotted path within `training_schema`; matched parameters are appended to the plot label. For example, this cohort deliberately plots two MOBILE variants as `mobile (real ratio=0.00)` and `mobile (real ratio=0.50)`:
 
-The learned-dynamics and finite-difference Jacobian evaluation functions remain in `eval.py` for possible future use, but `--eval` does not invoke them or generate mismatch plots.
+```json
+{
+  "version": 1,
+  "series": [
+    {"algo": "mobile", "match": {"model_based.real_ratio": 0.0}},
+    {"algo": "mobile", "match": {"model_based.real_ratio": 0.5}},
+    {"algo": "mopo", "match": {"epoch": 300}}
+  ]
+}
+```
+
+Algorithms may use different match parameters. Within each series, every plotted x-value must resolve to exactly one seed-averaged training configuration, and every non-axis training parameter must remain constant across x-values. An underspecified selector that mixes configurations therefore fails instead of combining or silently splitting them; select direct and recursive dynamics, different epochs, or other parameter variants as separate series. Automatically generated plots from one coherent sweep need no cohort file and retain their existing labels.
+
+Pass `--reuse-eval` together with `--eval` to reuse a completed matching evaluation or matching per-checkpoint rollout caches. Without it, the run's evaluation directory is cleared before evaluation. New non-final rollout caches retain only returns, task performance, decision-boundary observations, and action chunks; contraction-only initial simulator states and primitive Cartesian position traces are retained only for the final policy. Existing larger rollout caches remain readable. Gym expert references are shared by task, expert path, episode budget, and rollout seed under `<storage-root>/evals/<environment>/_expert_cache/`; Robomimic references are shared by task and official PH source. Matching legacy per-run `expert.npz` caches are still reused and promoted to the shared cache.
+
+With `--eval`, validation evaluates learned dynamics on held-out transitions for model-based runs. The unused finite-difference Jacobian and mismatch-plot implementations have been removed.

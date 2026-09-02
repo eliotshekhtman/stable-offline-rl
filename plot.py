@@ -6,7 +6,6 @@
 # - Plot task performance and contraction against clean-expert/Minari fractions.
 # - Plot state and state-action conservativity over policy-training checkpoints.
 # - Plot task performance over policy-training checkpoints.
-# - Retain dormant learned-dynamics mismatch plotting for future use.
 
 import argparse
 import json
@@ -15,9 +14,11 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
+import task_support
 
-EPS = 1e-12
+
 EVALUATION_SCHEMA_VERSION = 2
+PLOT_COHORT_VERSION = 1
 BOOTSTRAP_REPLICATES = 10000
 BOOTSTRAP_PERCENTILES = (10.0, 90.0)
 BOOTSTRAP_SEED = 0
@@ -25,20 +26,35 @@ BOOTSTRAP_SEED = 0
 
 def main() -> None:
     args = parse_args()
-    plot_root(args.root, args.out)
+    plot_root(args.root, args.out, cohort=args.cohort)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot stable-offline-rl sweep and evaluation results.")
-    parser.add_argument("--root", type=Path, required=True, help="Environment directory under stable-offline-rl/evals")
+    parser.add_argument("--root", type=Path, required=True, help="Evaluation environment directory, normally <storage-root>/evals/<environment>")
     parser.add_argument("--out", type=Path, default=None, help="Directory for saved plots; defaults to <root>/plots")
+    parser.add_argument(
+        "--cohort",
+        type=Path,
+        default=None,
+        help=(
+            "JSON cohort selecting one or more explicitly matched algorithm series; "
+            "required when historical runs contain multiple configurations of the "
+            "same algorithm at one plotted x-value"
+        ),
+    )
     args = parser.parse_args()
     if args.out is None:
         args.out = args.root / "plots"
     return args
 
 
-def plot_root(root: Path, out: Path | None = None, eval_dirs: list[Path] | None = None) -> None:
+def plot_root(
+    root: Path,
+    out: Path | None = None,
+    eval_dirs: list[Path] | None = None,
+    cohort: Path | dict | None = None,
+) -> None:
     out = root / "plots" if out is None else out
     if eval_dirs is None:
         eval_dirs = latest_eval_dirs(root)
@@ -46,6 +62,13 @@ def plot_root(root: Path, out: Path | None = None, eval_dirs: list[Path] | None 
     histories = load_histories(eval_dirs, rows)
     rows = average_seed_rows(rows)
     histories = average_seed_histories(histories)
+    if cohort is not None:
+        cohort_config = (
+            load_plot_cohort(cohort) if isinstance(cohort, Path)
+            else validate_plot_cohort(cohort)
+        )
+        rows = select_plot_cohort(rows, cohort_config)
+        histories = select_cohort_histories(histories, rows)
     out.mkdir(parents=True, exist_ok=True)
     plot_generated_ablation(rows, out)
     plot_clean_minari_ablation(rows, out)
@@ -95,6 +118,9 @@ def load_rows(eval_dirs: list[Path]) -> list[dict]:
             "run_dir": str(manifest_path.parent),
             "eval_dir": str(eval_dir.resolve()),
         }
+        task_support.require_supported_task(
+            row["env_name"], row["dataset_source"]
+        )
         training_schema = {
             key: value for key, value in manifest["training_schema"].items()
             if key != "seed"
@@ -247,6 +273,145 @@ def average_seed_histories(histories: list[dict]) -> list[dict]:
     return averaged
 
 
+def load_plot_cohort(path: Path) -> dict:
+    return validate_plot_cohort(load_json(path))
+
+
+def validate_plot_cohort(cohort: dict) -> dict:
+    if not isinstance(cohort, dict):
+        raise ValueError("Plot cohort must be a JSON object")
+    if cohort.get("version") != PLOT_COHORT_VERSION:
+        raise ValueError(
+            f"Plot cohort version must be {PLOT_COHORT_VERSION}"
+        )
+    if set(cohort) != {"version", "series"}:
+        raise ValueError("Plot cohort supports only 'version' and 'series'")
+
+    series = cohort["series"]
+    if not isinstance(series, list) or not series:
+        raise ValueError("Plot cohort 'series' must be a non-empty list")
+    validated_series = []
+    for index, item in enumerate(series):
+        if not isinstance(item, dict):
+            raise ValueError(f"Plot cohort series {index} must be an object")
+        unknown = set(item) - {"algo", "match", "label"}
+        if unknown:
+            raise ValueError(
+                f"Plot cohort series {index} has unsupported fields: "
+                f"{sorted(unknown)}"
+            )
+        algo = item.get("algo")
+        if not isinstance(algo, str) or not algo:
+            raise ValueError(
+                f"Plot cohort series {index} requires a non-empty 'algo'"
+            )
+        match = item.get("match", {})
+        if not isinstance(match, dict):
+            raise ValueError(
+                f"Plot cohort series {index} 'match' must be an object"
+            )
+        for path in match:
+            if (
+                not isinstance(path, str)
+                or not path
+                or any(not component for component in path.split("."))
+            ):
+                raise ValueError(
+                    f"Plot cohort series {index} has an invalid match path"
+                )
+            if "seed" in path.split("."):
+                raise ValueError(
+                    "Plot cohorts select seed-averaged configurations; "
+                    f"series {index} cannot match '{path}'"
+                )
+        label = item.get("label")
+        if label is not None and (not isinstance(label, str) or not label):
+            raise ValueError(
+                f"Plot cohort series {index} 'label' must be non-empty"
+            )
+        validated = {"algo": algo, "match": dict(match)}
+        if label is not None:
+            validated["label"] = label
+        validated_series.append(validated)
+    return {"version": PLOT_COHORT_VERSION, "series": validated_series}
+
+
+def training_schema_value(record: dict, path: str):
+    value = record["training_schema"]
+    for component in path.split("."):
+        if not isinstance(value, dict) or component not in value:
+            return None, False
+        value = value[component]
+    return value, True
+
+
+def cohort_series_matches(record: dict, series: dict) -> bool:
+    if record["algo"] != series["algo"]:
+        return False
+    for path, expected in series["match"].items():
+        actual, present = training_schema_value(record, path)
+        if not present and expected is None:
+            continue
+        if not present or actual != expected:
+            return False
+    return True
+
+
+def select_plot_cohort(rows: list[dict], cohort: dict) -> list[dict]:
+    selected = []
+    owners = {}
+    for series_index, series in enumerate(cohort["series"]):
+        matches = [
+            (row_index, row) for row_index, row in enumerate(rows)
+            if cohort_series_matches(row, series)
+        ]
+        if not matches:
+            raise ValueError(
+                f"Plot cohort series {series_index} ({series['algo']}) "
+                "matched no seed-averaged configurations"
+            )
+        for row_index, row in matches:
+            if row_index in owners:
+                raise ValueError(
+                    f"Plot cohort series {owners[row_index]} and {series_index} "
+                    "select the same seed-averaged configuration"
+                )
+            owners[row_index] = series_index
+            selected.append({
+                **row,
+                "_plot_cohort_series": series_index,
+                "_plot_cohort_spec": series,
+            })
+    return selected
+
+
+def select_cohort_histories(
+    histories: list[dict], selected_rows: list[dict]
+) -> list[dict]:
+    selections = {
+        row["seed_group"]: (
+            row["_plot_cohort_series"], row["_plot_cohort_spec"]
+        )
+        for row in selected_rows
+    }
+    selected = []
+    for history in histories:
+        selection = selections.get(history["seed_group"])
+        if selection is None:
+            continue
+        series_index, series = selection
+        selected_history = {
+            **history,
+            "_plot_cohort_series": series_index,
+            "_plot_cohort_spec": series,
+        }
+        selected_history["label"] = cohort_policy_label(
+            selected_history, series
+        )
+        selected.append(selected_history)
+    return selected
+
+
 def dynamics_chunk_mode(record: dict) -> str | None:
     training_schema = record.get("training_schema", {})
     model_based = training_schema.get("model_based")
@@ -268,14 +433,212 @@ def algorithm_label(record: dict) -> str:
     return record["algo"]
 
 
-def algorithm_groups(records: list[dict]) -> list[tuple[str, list[dict]]]:
+def parameter_value_label(path: str, value) -> str:
+    name = {
+        "model_based.real_ratio": "real ratio",
+    }.get(path, path.replace("_", " "))
+    if path == "model_based.real_ratio" and isinstance(value, (int, float)):
+        rendered = f"{value:.2f}"
+    elif isinstance(value, float):
+        rendered = f"{value:g}"
+    elif isinstance(value, (dict, list)):
+        rendered = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    else:
+        rendered = str(value)
+    return f"{name}={rendered}"
+
+
+def cohort_parameter_labels(series: dict) -> list[str]:
+    return [
+        parameter_value_label(path, value)
+        for path, value in sorted(series["match"].items())
+    ]
+
+
+def cohort_policy_label(record: dict, series: dict) -> str:
+    qualifiers = [f"l={record['chunk_length']}"]
+    mode = dynamics_chunk_mode(record)
+    if mode is not None and mode != "direct":
+        qualifiers.append(f"{mode} dynamics")
+    qualifiers.extend(cohort_parameter_labels(series))
+    return f"{series.get('label', record['algo'])} ({', '.join(qualifiers)})"
+
+
+def plot_series_key(record: dict) -> tuple[int, str, str]:
+    series_index = record.get("_plot_cohort_series")
+    if series_index is not None:
+        return series_index, record["algo"], ""
+    return -1, *algorithm_group_key(record)
+
+
+AXIS_SCHEMA_PATHS = {
+    "chunk_length": {
+        ("chunk_length",),
+        ("macro_discount",),
+    },
+    "noisy_trajectory_fraction": {
+        ("dataset", "prop_clean_expert"),
+        ("dataset", "prop_noisy_expert"),
+        ("dataset", "prop_random"),
+        ("dataset", "prop_expert"),
+    },
+    "minari_trajectory_fraction": {
+        ("dataset", "source"),
+        ("dataset", "dataset_id"),
+        ("dataset", "minari_fraction"),
+        ("dataset", "noise_scale"),
+        ("dataset", "prop_clean_expert"),
+        ("dataset", "prop_noisy_expert"),
+        ("dataset", "prop_random"),
+        ("dataset", "prop_expert"),
+    },
+}
+
+
+def line_training_schema(record: dict, value_key: str) -> dict:
+    excluded = AXIS_SCHEMA_PATHS.get(value_key, set())
+
+    def keep_fields(value, path=()):
+        if isinstance(value, dict):
+            return {
+                key: keep_fields(item, path + (key,))
+                for key, item in value.items()
+                if key != "seed" and path + (key,) not in excluded
+            }
+        if isinstance(value, list):
+            return [keep_fields(item, path) for item in value]
+        return value
+
+    return keep_fields(record["training_schema"])
+
+
+def schema_leaf_values(schema: dict, prefix=()) -> dict:
+    values = {}
+    for key, value in schema.items():
+        path = prefix + (key,)
+        if isinstance(value, dict):
+            values.update(schema_leaf_values(value, path))
+        else:
+            values[".".join(path)] = json.dumps(value, sort_keys=True)
+    return values
+
+
+def inconsistent_schema_paths(records: list[dict], value_key: str) -> list[str]:
+    flattened = [
+        schema_leaf_values(line_training_schema(record, value_key))
+        for record in records
+    ]
+    paths = set().union(*(values.keys() for values in flattened))
+    return sorted(
+        path for path in paths
+        if len({values.get(path, "<missing>") for values in flattened}) > 1
+    )
+
+
+def seed_row_identity(row: dict):
+    schema = row.get("training_schema", {})
+    if "seed" in schema:
+        return "seed", schema["seed"]
+    if "seed" in row:
+        return "seed", row["seed"]
+    return "eval_dir", row.get("eval_dir", row.get("run_dir", id(row)))
+
+
+def seed_row_recency(row: dict) -> tuple[str, str]:
+    return row.get("created_at", ""), row.get("eval_dir", "")
+
+
+def coalesce_clean_minari_baselines(rows: list[dict]) -> list[dict]:
+    groups = {}
+    for row in rows:
+        schema = json.dumps(
+            line_training_schema(row, "minari_trajectory_fraction"),
+            sort_keys=True,
+        )
+        groups.setdefault((plot_series_key(row), schema), []).append(row)
+
+    coalesced = []
+    for group in groups.values():
+        representative = max(group, key=seed_row_recency)
+        by_seed = {}
+        for row in group:
+            for seed_row in row["seed_rows"]:
+                identity = seed_row_identity(seed_row)
+                previous = by_seed.get(identity)
+                if (
+                    previous is None
+                    or seed_row_recency(seed_row) > seed_row_recency(previous)
+                ):
+                    by_seed[identity] = seed_row
+        seed_rows = [by_seed[key] for key in sorted(by_seed, key=repr)]
+        baseline = {
+            **representative,
+            "seed_rows": seed_rows,
+            "minari_trajectory_fraction": 0.0,
+        }
+        for key in (
+            "last_policy_performance_mean",
+            "expert_performance_mean",
+        ):
+            if seed_rows and all(key in seed_row for seed_row in seed_rows):
+                baseline[key] = float(np.mean([
+                    seed_row[key] for seed_row in seed_rows
+                ]))
+        coalesced.append(baseline)
+    return coalesced
+
+
+def plot_series_label(record: dict) -> str:
+    series = record.get("_plot_cohort_spec")
+    if series is None:
+        return algorithm_label(record)
+
+    qualifiers = []
+    mode = dynamics_chunk_mode(record)
+    if mode is not None and mode != "direct":
+        qualifiers.append(f"{mode} dynamics")
+    qualifiers.extend(cohort_parameter_labels(series))
+    label = series.get("label", record["algo"])
+    if qualifiers:
+        return f"{label} ({', '.join(qualifiers)})"
+    return label
+
+
+def algorithm_groups(
+    records: list[dict], value_key: str | None = None
+) -> list[tuple[str, list[dict]]]:
     groups = {}
     for record in records:
-        groups.setdefault(algorithm_group_key(record), []).append(record)
-    return [
-        (algorithm_label(group[0]), group)
-        for _, group in sorted(groups.items())
-    ]
+        groups.setdefault(plot_series_key(record), []).append(record)
+
+    result = []
+    for _, group in sorted(groups.items()):
+        label = plot_series_label(group[0])
+        if value_key is not None:
+            by_value = {}
+            for record in group:
+                by_value.setdefault(record[value_key], []).append(record)
+            duplicates = {
+                value: matching for value, matching in by_value.items()
+                if len(matching) > 1
+            }
+            if duplicates:
+                values = ", ".join(f"{value:g}" for value in duplicates)
+                raise ValueError(
+                    f"Plot series '{label}' has multiple seed-averaged "
+                    f"configurations at {value_key}={values}. Select each "
+                    "intended variant as a separate --cohort series."
+                )
+            inconsistent = inconsistent_schema_paths(group, value_key)
+            if inconsistent:
+                paths = ", ".join(inconsistent)
+                raise ValueError(
+                    f"Plot series '{label}' changes non-axis training "
+                    f"parameters across {value_key}: {paths}. Add these "
+                    "paths to separate cohort series match objects."
+                )
+        result.append((label, group))
+    return result
 
 
 def policy_label(record: dict) -> str:
@@ -391,7 +754,7 @@ def plot_performance_vs_chunk_length(rows: list[dict], out: Path) -> None:
         return
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    for label, group_rows in algorithm_groups(rows):
+    for label, group_rows in algorithm_groups(rows, "chunk_length"):
         algo_rows = sorted(group_rows, key=lambda row: row["chunk_length"])
         x = [row["chunk_length"] for row in algo_rows]
         intervals = [bootstrap_mean(final_performance_samples(row)) for row in algo_rows]
@@ -470,19 +833,12 @@ def plot_clean_minari_ablation(rows: list[dict], out: Path) -> None:
 
     for (dataset_id, num_samples, chunk_length), mixture_rows in groups.items():
         plot_rows = list(mixture_rows)
-        baselines = {}
-        for row in clean:
-            if row["num_samples"] == num_samples and row["chunk_length"] == chunk_length:
-                group_key = algorithm_group_key(row)
-                if group_key not in baselines:
-                    baselines[group_key] = {
-                        **row,
-                        "seed_rows": list(row["seed_rows"]),
-                        "minari_trajectory_fraction": 0.0,
-                    }
-                else:
-                    baselines[group_key]["seed_rows"].extend(row["seed_rows"])
-        plot_rows.extend(baselines.values())
+        matching_clean = [
+            row for row in clean
+            if row["num_samples"] == num_samples
+            and row["chunk_length"] == chunk_length
+        ]
+        plot_rows.extend(coalesce_clean_minari_baselines(matching_clean))
         if len({row["minari_trajectory_fraction"] for row in plot_rows}) < 2:
             continue
 
@@ -514,7 +870,7 @@ def performance_ablation_plot(
     value_label: str,
 ) -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
-    for label, group_rows in algorithm_groups(rows):
+    for label, group_rows in algorithm_groups(rows, value_key):
         algo_rows = sorted(group_rows, key=lambda row: row[value_key])
         x = [row[value_key] for row in algo_rows]
         intervals = [bootstrap_mean(final_performance_samples(row)) for row in algo_rows]
@@ -549,7 +905,7 @@ def contraction_curve_plot(
     ]
     if not available:
         return
-    algorithms = algorithm_groups(available)
+    algorithms = algorithm_groups(available, value_key)
     fig, axes = plt.subplots(1, len(algorithms), figsize=(5 * len(algorithms), 4), squeeze=False)
     for axis, (label, group_rows) in zip(axes[0], algorithms):
         for row in sorted(group_rows, key=lambda row: row[value_key]):
@@ -573,58 +929,6 @@ def contraction_curve_plot(
     fig.tight_layout()
     fig.savefig(path, dpi=200)
     plt.close(fig)
-
-
-def plot_mismatch_ratios(rows: list[dict], out: Path) -> None:
-    next_obs_rows = [
-        row for row in rows
-        if "dataset_next_obs_mse" in row and "rollout_next_obs_mse" in row
-    ]
-    for row in next_obs_rows:
-        row["next_obs_ratio"] = row["dataset_next_obs_mse"] / (row["rollout_next_obs_mse"] + EPS)
-
-    if next_obs_rows:
-        scatter(
-            next_obs_rows,
-            x_key="next_obs_ratio",
-            y_key="policy_return_mean",
-            color_key="expert_return_mean",
-            xlabel="dataset macro next-state MSE / rollout macro next-state MSE",
-            ylabel="policy return",
-            color_label="expert return",
-            path=out / "reward_vs_next_obs_ratio.png",
-        )
-
-    jacobian_rows = [
-        row for row in rows
-        if "dataset_next_obs_mse" in row and "dataset_closed_loop_jacobian_mse" in row
-    ]
-    if not jacobian_rows:
-        return
-
-    for row in jacobian_rows:
-        row["jacobian_ratio"] = row["dataset_closed_loop_jacobian_mse"] / (row["rollout_closed_loop_jacobian_mse"] + EPS)
-
-    scatter(
-        jacobian_rows,
-        x_key="next_obs_ratio",
-        y_key="jacobian_ratio",
-        color_key="policy_return_mean",
-        xlabel="dataset macro next-state MSE / rollout macro next-state MSE",
-        ylabel="dataset Jacobian MSE / rollout Jacobian MSE",
-        color_label="policy return",
-        path=out / "mismatch_ratio_reward_scatter.png",
-    )
-    scatter(
-        jacobian_rows,
-        x_key="jacobian_ratio",
-        y_key="policy_return_mean",
-        color_key="next_obs_ratio",
-        xlabel="dataset Jacobian MSE / rollout Jacobian MSE",
-        ylabel="policy return",
-        color_label="next-state mismatch ratio",
-        path=out / "reward_vs_jacobian_ratio.png",
-    )
 
 
 def plot_training_histories(histories: list[dict], out: Path) -> None:
@@ -684,24 +988,6 @@ def history_line_plot(histories: list[dict], keys: tuple[str, ...], names: tuple
         axis.set_ylabel(name)
     axes[0, 0].legend(fontsize=8)
     axes[-1, 0].set_xlabel("training completed (%)")
-    fig.tight_layout()
-    fig.savefig(path, dpi=200)
-    plt.close(fig)
-
-
-def scatter(rows: list[dict], x_key: str, y_key: str, color_key: str, xlabel: str, ylabel: str, color_label: str, path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(7, 5))
-    points = ax.scatter(
-        [row[x_key] for row in rows],
-        [row[y_key] for row in rows],
-        c=[row[color_key] for row in rows],
-        cmap="viridis",
-    )
-    for row in rows:
-        ax.annotate(row["label"], (row[x_key], row[y_key]), fontsize=8, xytext=(4, 4), textcoords="offset points")
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    fig.colorbar(points, ax=ax, label=color_label)
     fig.tight_layout()
     fig.savefig(path, dpi=200)
     plt.close(fig)

@@ -4,16 +4,19 @@
 # - Execute learned action chunks open-loop while retaining primitive-step metrics.
 # - Measure final-policy contraction after perturbing only controlled-agent coordinates.
 # - Measure policy conservativity over training checkpoints.
-# - Retain dormant learned-dynamics and Jacobian evaluation implementations for future use.
+# - Evaluate learned dynamics on held-out transitions for validation reports.
 
 import argparse
+import fcntl
+import hashlib
+import inspect
 import json
 import shutil
+import tempfile
 from pathlib import Path
 
 import gymnasium as gym
 import h5py
-import mujoco
 import numpy as np
 import torch
 from scipy.spatial import cKDTree
@@ -22,13 +25,14 @@ import chunking
 import metrics
 import load_offline
 import rollout
+import task_support
 from chunked_dynamics import DIRECT_DYNAMICS_MODE, resolve_dynamics_chunk_mode
-from policies import MODEL_BASED_ALGOS, build_model_based_policy, build_model_free_policy
-from sweep import build_buffer
+from policies import MODEL_BASED_ALGOS, MODEL_FREE_ALGOS, build_model_based_policy, build_model_free_policy
 
 
 EVALUATION_SCHEMA_VERSION = 2
 ROLLOUT_CACHE_VERSION = 1
+EXPERT_CACHE_VERSION = 1
 FINAL_EVAL_SEED_OFFSET = 1_000_000
 
 
@@ -48,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     run.add_argument("--reuse-eval", action="store_true", help="Reuse matching cached checkpoint rollouts and completed evaluation results")
 
     rollout_eval = parser.add_argument_group("rollout evaluation")
-    rollout_eval.add_argument("--checkpoint-eval-episodes", type=int, default=20, help="Number of true-environment episodes used to monitor each non-final training checkpoint")
+    rollout_eval.add_argument("--checkpoint-eval-episodes", type=int, default=20, help="Number of true-environment episodes used to monitor each non-final training checkpoint; use 0 to evaluate only the final policy")
     rollout_eval.add_argument("--final-eval-episodes", type=int, default=100, help="Number of true-environment episodes used for the final policy and Gymnasium expert report")
 
     behavior = parser.add_argument_group("contraction and conservativity evaluation")
@@ -57,8 +61,11 @@ def parse_args() -> argparse.Namespace:
     behavior.add_argument("--perturbation-scale", type=float, default=0.01, help="Euclidean norm of the initial perturbation applied to controlled-agent qpos/qvel coordinates")
     behavior.add_argument("--ood-samples", type=int, default=10000, help="Maximum held-out and policy decision-boundary samples used for OOD metrics")
     args = parser.parse_args()
-    if args.checkpoint_eval_episodes <= 0 or args.final_eval_episodes <= 0:
-        parser.error("checkpoint and final evaluation episode counts must be positive")
+    if args.checkpoint_eval_episodes < 0 or args.final_eval_episodes <= 0:
+        parser.error(
+            "checkpoint evaluation episodes must be nonnegative and final "
+            "evaluation episodes must be positive"
+        )
     if args.contraction_trajectories <= 0 or args.contraction_horizon <= 0:
         parser.error("evaluation episode, trajectory, and horizon counts must be positive")
     if args.contraction_trajectories > args.final_eval_episodes:
@@ -69,12 +76,30 @@ def parse_args() -> argparse.Namespace:
 
 
 def evaluate_run(run_dir: Path, args: argparse.Namespace) -> Path:
+    manifest_path = (Path(run_dir) / "run_manifest.json").resolve()
+    with manifest_path.open("r", encoding="utf-8") as file:
+        manifest = json.load(file)
+    task_support.require_supported_task(
+        manifest["env_name"], manifest["dataset_source"]
+    )
+    eval_dir = Path(manifest["eval_dir"])
+    eval_dir.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = eval_dir.parent / f".{eval_dir.name}.evaluation.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        return _evaluate_run_locked(run_dir, args)
+
+
+def _evaluate_run_locked(run_dir: Path, args: argparse.Namespace) -> Path:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     manifest_path = (run_dir / "run_manifest.json").resolve()
     with manifest_path.open("r", encoding="utf-8") as file:
         manifest = json.load(file)
+    task_support.require_supported_task(
+        manifest["env_name"], manifest["dataset_source"]
+    )
     if args.expert is not None:
         expert_path = Path(args.expert).expanduser()
         if expert_path.suffix != ".zip":
@@ -87,6 +112,8 @@ def evaluate_run(run_dir: Path, args: argparse.Namespace) -> Path:
         return eval_dir
     if eval_dir.exists() and not args.reuse_eval:
         shutil.rmtree(eval_dir)
+    elif eval_dir.exists():
+        (eval_dir / "results.json").unlink(missing_ok=True)
     eval_dir.mkdir(parents=True, exist_ok=True)
 
     train_dataset = chunking.make_action_chunk_dataset(
@@ -101,39 +128,44 @@ def evaluate_run(run_dir: Path, args: argparse.Namespace) -> Path:
     )
     checkpoints = manifest["checkpoints"]
     last_checkpoint = checkpoints[-1]
-    env = make_eval_env(manifest)
-    chunk_env = chunking.ActionChunkWrapper(env, manifest["chunk_length"])
-    policy, _, _, _ = load_policy_and_dynamics(
-        manifest, args.device, Path(last_checkpoint["policy_path"]),
-        None, train_dataset, chunk_env,
-    )
-    body_ids, body_names = agent_position_bodies(env, manifest)
     conservativity_reference = prepare_conservativity(
         train_dataset, test_dataset, args.ood_samples, args.seed
     )
-
     rollout_infos = {}
     records = []
-    last_loaded_path = Path(last_checkpoint["policy_path"])
+    last_conservativity = None
     final_rollout_seed = args.seed + FINAL_EVAL_SEED_OFFSET
+    env = make_eval_env(manifest)
     try:
+        chunk_env = chunking.ActionChunkWrapper(env, manifest["chunk_length"])
+        policy, _ = load_policy_and_dynamics(
+            manifest, args.device, Path(last_checkpoint["policy_path"]),
+            None, train_dataset, chunk_env,
+        )
+        body_ids, body_names = agent_position_bodies(env, manifest)
+        last_loaded_path = Path(last_checkpoint["policy_path"])
         for checkpoint in checkpoints:
             is_final = checkpoint["step"] == last_checkpoint["step"]
+            if not is_final and args.checkpoint_eval_episodes == 0:
+                continue
             episodes = args.final_eval_episodes if is_final else args.checkpoint_eval_episodes
             rollout_seed = final_rollout_seed if is_final else args.seed
             checkpoint_path = Path(checkpoint["policy_path"])
             rollout_info = load_cached_rollout(
-                eval_dir, manifest, checkpoint, args, episodes, rollout_seed
+                eval_dir, manifest, checkpoint, args, episodes, rollout_seed,
+                include_contraction_state=is_final,
             )
             if rollout_info is None:
                 if checkpoint_path != last_loaded_path:
                     load_policy_checkpoint(policy, checkpoint_path, args.device)
                     last_loaded_path = checkpoint_path
                 rollout_info = evaluate_policy_rollouts(
-                    policy, env, manifest, episodes, rollout_seed, body_ids
+                    policy, env, manifest, episodes, rollout_seed, body_ids,
+                    include_contraction_state=is_final,
                 )
                 save_cached_rollout(
-                    eval_dir, manifest, checkpoint, episodes, rollout_seed, rollout_info
+                    eval_dir, manifest, checkpoint, episodes, rollout_seed,
+                    rollout_info, include_contraction_state=is_final,
                 )
             rollout_infos[checkpoint["step"]] = rollout_info
             conservativity = evaluate_conservativity(
@@ -146,6 +178,8 @@ def evaluate_run(run_dir: Path, args: argparse.Namespace) -> Path:
             records.append(
                 checkpoint_record(checkpoint, rollout_info, conservativity, episodes, rollout_seed)
             )
+            if is_final:
+                last_conservativity = conservativity
 
         contraction = load_cached_contraction(
             eval_dir, manifest, last_checkpoint, args, final_rollout_seed
@@ -162,14 +196,11 @@ def evaluate_run(run_dir: Path, args: argparse.Namespace) -> Path:
                 eval_dir, manifest, last_checkpoint, args, final_rollout_seed, contraction
             )
     finally:
-        chunk_env.close()
+        env.close()
 
     last_info = rollout_infos[last_checkpoint["step"]]
-    last_conservativity = evaluate_conservativity(
-        conservativity_reference,
-        last_info["decision_observations"], last_info["action_chunks"],
-        args.ood_samples, args.seed,
-    )
+    if last_conservativity is None:
+        raise RuntimeError("Final-checkpoint conservativity was not evaluated.")
     expert_info = load_or_evaluate_expert(eval_dir, manifest, args, final_rollout_seed)
 
     results = {
@@ -199,21 +230,20 @@ def evaluate_run(run_dir: Path, args: argparse.Namespace) -> Path:
         "expert_performance_mean": expert_info["performance_mean"],
         "expert_performance_std": expert_info["performance_std"],
     }
-    np.savez_compressed(
+    atomic_save_npz(
         eval_dir / "returns_last.npz",
         policy_episode_returns=last_info["returns"],
         expert_episode_returns=expert_info["returns"],
         policy_episode_performance=last_info["performance"],
         expert_episode_performance=expert_info["performance"],
     )
-    np.savez_compressed(eval_dir / "conservativity.npz", **last_conservativity)
+    atomic_save_npz(eval_dir / "conservativity.npz", **last_conservativity)
     results.update(
         last_state_ood_ratio=float(last_conservativity["state_ood_ratio"]),
         last_state_action_ood_ratio=float(last_conservativity["state_action_ood_ratio"]),
     )
     save_history(manifest, expert_info, records, eval_dir)
-    with (eval_dir / "results.json").open("w", encoding="utf-8") as file:
-        json.dump(results, file, indent=2, sort_keys=True)
+    atomic_write_json(eval_dir / "results.json", results)
     return eval_dir
 
 
@@ -244,8 +274,15 @@ def evaluation_is_complete(eval_dir: Path, config: dict) -> bool:
     results_path = eval_dir / "results.json"
     if not results_path.exists() or not all((eval_dir / name).exists() for name in required):
         return False
-    with results_path.open("r", encoding="utf-8") as file:
-        return json.load(file).get("evaluation_config") == config
+    try:
+        with results_path.open("r", encoding="utf-8") as file:
+            results = json.load(file)
+        return (
+            isinstance(results, dict)
+            and results.get("evaluation_config") == config
+        )
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return False
 
 
 def load_policy_and_dynamics(
@@ -256,7 +293,6 @@ def load_policy_and_dynamics(
     train_dataset: dict[str, np.ndarray],
     env: gym.Env,
 ):
-    buffer = build_buffer(train_dataset, env, device)
     build_args = argparse.Namespace(
         device=device,
         epoch=manifest["epoch"],
@@ -269,10 +305,6 @@ def load_policy_and_dynamics(
         build_args.model_critic_learning_rate = model_based.get("critic_learning_rate", 3e-4)
         build_args.mopo_penalty_coef = manifest["training_schema"].get("mopo", {}).get("penalty_coef", 0.5)
         build_args.mobile_penalty_coef = manifest["training_schema"].get("mobile", {}).get("penalty_coef", 1.5)
-        if manifest["algo"] == "rambo":
-            build_args.adv_weight = manifest["adv_weight"]
-            build_args.rollout_length = manifest["rollout_length"]
-            build_args.adv_batch_size = manifest["adv_batch_size"]
     if manifest["algo"] == "mobile":
         mobile = manifest["training_schema"].get("mobile", {})
         build_args.mobile_return_shift = mobile.get("return_shift", 0.0)
@@ -289,10 +321,7 @@ def load_policy_and_dynamics(
         build_args.td3bc_alpha = td3bc["alpha"]
         build_args.td3bc_hidden_dims = td3bc["hidden_dims"]
 
-    obs_mean = obs_std = None
     if manifest["algo"] in MODEL_BASED_ALGOS:
-        if manifest["algo"] == "rambo":
-            obs_mean, obs_std = buffer.normalize_obs()
         chunk_length = manifest["chunk_length"]
         action_dim = int(np.prod(env.action_space.shape))
         if action_dim % chunk_length:
@@ -300,27 +329,49 @@ def load_policy_and_dynamics(
                 f"Chunk action dimension {action_dim} is not divisible by "
                 f"chunk length {chunk_length}"
             )
-        policy, dynamics, _ = build_model_based_policy(
-            manifest["algo"], env, build_args, discount=manifest["macro_discount"],
-            obs_mean=obs_mean, obs_std=obs_std,
+        builder_kwargs = dict(
+            discount=manifest["macro_discount"],
             chunk_length=chunk_length,
             base_discount=manifest["base_discount"],
             dynamics_chunk_mode=manifest_dynamics_chunk_mode(manifest),
             primitive_action_dim=action_dim // chunk_length,
         )
+        builder_parameters = inspect.signature(
+            build_model_based_policy
+        ).parameters
+        if (
+            "build_dynamics_model" in builder_parameters
+            or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in builder_parameters.values()
+            )
+        ):
+            builder_kwargs["build_dynamics_model"] = dynamics_path is not None
+        policy, dynamics, _ = build_model_based_policy(
+            manifest["algo"], env, build_args, **builder_kwargs
+        )
         if dynamics_path is not None:
             dynamics.load(str(dynamics_path))
-    else:
-        dql_config = manifest["dql_config"] if manifest["algo"] == "dql" else None
+    elif manifest["algo"] in MODEL_FREE_ALGOS:
+        buffer = None
+        if manifest["algo"] == "td3bc":
+            observations = np.asarray(train_dataset["observations"])
+            obs_mean = observations.mean(axis=0, keepdims=True)
+            obs_std = observations.std(axis=0, keepdims=True) + 1e-3
+            buffer = argparse.Namespace(
+                normalize_obs=lambda: (obs_mean, obs_std)
+            )
         policy, _ = build_model_free_policy(
             manifest["algo"], env, buffer, build_args,
-            discount=manifest["macro_discount"], dql_config=dql_config,
+            discount=manifest["macro_discount"],
         )
         dynamics = None
+    else:
+        raise ValueError(f"Unsupported algorithm: {manifest['algo']}")
 
     policy.load_state_dict(torch.load(policy_path, map_location=device, weights_only=True))
     policy.eval()
-    return policy, dynamics, obs_mean, obs_std
+    return policy, dynamics
 
 
 def manifest_dynamics_chunk_mode(manifest: dict) -> str:
@@ -357,11 +408,13 @@ def robomimic_expert_metadata(manifest: dict) -> dict:
     metadata = load_offline.load_metadata(metadata_path)
     if metadata["dataset_type"] == "ph":
         return metadata
-    ph_dataset_dir = metadata_path.parents[2] / f"robomimic_{metadata['task'].lower()}_ph"
+    ph_spec = load_offline.list_robomimic_dataset_specs(metadata["task"], "ph")[0]
+    ph_dataset_dir = metadata_path.parents[2] / load_offline.make_robomimic_dataset_tag(
+        ph_spec
+    )
     ph_metadata_paths = sorted(ph_dataset_dir.glob("*/metadata.json"), reverse=True)
     if ph_metadata_paths:
         return load_offline.load_metadata(ph_metadata_paths[0])
-    ph_spec = load_offline.list_robomimic_dataset_specs(metadata["task"], "ph")[0]
     _, ph_metadata = load_offline.load_robomimic_dataset(ph_spec)
     return ph_metadata
 
@@ -404,12 +457,11 @@ def save_history(manifest: dict, expert_info: dict, records: list[dict], eval_di
         "expert_performance_mean": expert_info["performance_mean"],
         "records": records,
     }
-    with (eval_dir / "history.json").open("w", encoding="utf-8") as file:
-        json.dump(history, file, indent=2, sort_keys=True)
-    np.savez_compressed(
+    atomic_save_npz(
         eval_dir / "history.npz",
         **{key: np.asarray([record[key] for record in records]) for key in records[0]},
     )
+    atomic_write_json(eval_dir / "history.json", history)
 
 
 def evaluate_policy_rollouts(
@@ -419,27 +471,29 @@ def evaluate_policy_rollouts(
     episodes: int,
     seed: int,
     body_ids: np.ndarray,
+    include_contraction_state: bool = True,
 ) -> dict:
     env_name = manifest["env_name"]
     returns, performance = [], []
-    decision_observations, action_chunks, decision_episode_ids = [], [], []
+    decision_observations, action_chunks = [], []
     position_trajectories, initial_qpos, initial_qvel = [], [], []
 
     for episode in range(episodes):
         episode_info = rollout_policy_episode(
-            env, policy, manifest, seed + episode, body_ids
+            env, policy, manifest, seed + episode, body_ids,
+            collect_positions=include_contraction_state,
         )
         returns.append(episode_info["return"])
         performance.append(episode_info["performance"])
         decision_observations.extend(episode_info["decision_observations"])
         action_chunks.extend(episode_info["action_chunks"])
-        decision_episode_ids.extend([episode] * len(episode_info["decision_observations"]))
-        position_trajectories.append(episode_info["positions"])
-        initial_qpos.append(episode_info["initial_qpos"])
-        initial_qvel.append(episode_info["initial_qvel"])
+        if include_contraction_state:
+            position_trajectories.append(episode_info["positions"])
+            initial_qpos.append(episode_info["initial_qpos"])
+            initial_qvel.append(episode_info["initial_qvel"])
 
     performance_metric, performance_label, higher_is_better = performance_definition(env_name)
-    return {
+    result = {
         "returns": np.asarray(returns, dtype=np.float32),
         "performance": np.asarray(performance, dtype=np.float32),
         "performance_metric": performance_metric,
@@ -447,12 +501,17 @@ def evaluate_policy_rollouts(
         "performance_higher_is_better": higher_is_better,
         "decision_observations": np.asarray(decision_observations, dtype=np.float32),
         "action_chunks": np.asarray(action_chunks, dtype=np.float32),
-        "decision_episode_ids": np.asarray(decision_episode_ids, dtype=np.int64),
-        "position_trajectories": pad_trajectories(position_trajectories),
-        "position_lengths": np.asarray([len(item) for item in position_trajectories], dtype=np.int64),
-        "initial_qpos": np.asarray(initial_qpos, dtype=np.float64),
-        "initial_qvel": np.asarray(initial_qvel, dtype=np.float64),
     }
+    if include_contraction_state:
+        result.update(
+            position_trajectories=pad_trajectories(position_trajectories),
+            position_lengths=np.asarray(
+                [len(item) for item in position_trajectories], dtype=np.int64
+            ),
+            initial_qpos=np.asarray(initial_qpos, dtype=np.float64),
+            initial_qvel=np.asarray(initial_qvel, dtype=np.float64),
+        )
+    return result
 
 
 def rollout_policy_episode(
@@ -465,6 +524,7 @@ def rollout_policy_episode(
     initial_qpos: np.ndarray | None = None,
     initial_qvel: np.ndarray | None = None,
     stop_on_success: bool = True,
+    collect_positions: bool = True,
 ) -> dict:
     if initial_qpos is None:
         _, reset_info = env.reset(seed=reset_seed)
@@ -472,8 +532,9 @@ def rollout_policy_episode(
     else:
         _, reset_info = env.reset(seed=reset_seed)
         obs = set_simulator_state(env, manifest, initial_qpos, initial_qvel)
-    start_qpos, start_qvel = simulator_state(env, manifest)
-    positions = [agent_positions(env, manifest, body_ids)]
+    if collect_positions:
+        start_qpos, start_qvel = simulator_state(env, manifest)
+        positions = [agent_positions(env, manifest, body_ids)]
     decision_observations, action_chunks = [], []
     episode_return = 0.0
     primitive_steps = 0
@@ -491,7 +552,8 @@ def rollout_policy_episode(
             obs, reward, terminated, truncated, final_info = env.step(action)
             episode_return += float(reward)
             primitive_steps += 1
-            positions.append(agent_positions(env, manifest, body_ids))
+            if collect_positions:
+                positions.append(agent_positions(env, manifest, body_ids))
             task_succeeded = (
                 manifest["dataset_source"] == "robomimic"
                 and bool(env.unwrapped._check_success())
@@ -501,7 +563,7 @@ def rollout_policy_episode(
             if done or (horizon is not None and primitive_steps == horizon):
                 break
 
-    return {
+    result = {
         "return": episode_return,
         "performance": episode_performance(
             manifest["env_name"], env, episode_return, primitive_steps,
@@ -509,10 +571,14 @@ def rollout_policy_episode(
         ),
         "decision_observations": decision_observations,
         "action_chunks": action_chunks,
-        "positions": np.asarray(positions, dtype=np.float32),
-        "initial_qpos": start_qpos,
-        "initial_qvel": start_qvel,
     }
+    if collect_positions:
+        result.update(
+            positions=np.asarray(positions, dtype=np.float32),
+            initial_qpos=start_qpos,
+            initial_qvel=start_qvel,
+        )
+    return result
 
 
 def rollout_cache_config(
@@ -520,6 +586,7 @@ def rollout_cache_config(
     checkpoint: dict,
     episodes: int,
     rollout_seed: int,
+    include_contraction_state: bool = True,
 ) -> dict:
     return {
         "version": ROLLOUT_CACHE_VERSION,
@@ -530,6 +597,7 @@ def rollout_cache_config(
         "policy_path": checkpoint["policy_path"],
         "episodes": episodes,
         "seed": rollout_seed,
+        "contraction_state": include_contraction_state,
     }
 
 
@@ -540,6 +608,7 @@ def load_cached_rollout(
     args: argparse.Namespace,
     episodes: int,
     rollout_seed: int,
+    include_contraction_state: bool = True,
 ) -> dict | None:
     if not args.reuse_eval:
         return None
@@ -547,13 +616,26 @@ def load_cached_rollout(
     config_path = path.with_suffix(".json")
     if not path.exists() or not config_path.exists():
         return None
-    with config_path.open("r", encoding="utf-8") as file:
-        if json.load(file) != rollout_cache_config(
-            manifest, checkpoint, episodes, rollout_seed
-        ):
-            return None
-    with np.load(path) as data:
-        rollout_info = {key: data[key] for key in data.files}
+    expected_config = rollout_cache_config(
+        manifest, checkpoint, episodes, rollout_seed, include_contraction_state
+    )
+    legacy_config = dict(expected_config)
+    legacy_config.pop("contraction_state")
+    try:
+        with config_path.open("r", encoding="utf-8") as file:
+            if json.load(file) not in (expected_config, legacy_config):
+                return None
+        with np.load(path) as data:
+            rollout_info = {key: data[key] for key in data.files}
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return None
+    required = {"returns", "performance", "decision_observations", "action_chunks"}
+    if include_contraction_state:
+        required.update({
+            "position_trajectories", "position_lengths", "initial_qpos", "initial_qvel",
+        })
+    if not required.issubset(rollout_info):
+        return None
     metric, label, higher_is_better = performance_definition(manifest["env_name"])
     rollout_info.update(
         performance_metric=metric,
@@ -570,16 +652,29 @@ def save_cached_rollout(
     episodes: int,
     rollout_seed: int,
     rollout_info: dict,
+    include_contraction_state: bool = True,
 ) -> None:
     path = eval_dir / "rollouts" / f"step_{checkpoint['step']}.npz"
     path.parent.mkdir(exist_ok=True)
-    arrays = {key: value for key, value in rollout_info.items() if isinstance(value, np.ndarray)}
-    np.savez_compressed(path, **arrays)
-    with path.with_suffix(".json").open("w", encoding="utf-8") as file:
-        json.dump(
-            rollout_cache_config(manifest, checkpoint, episodes, rollout_seed),
-            file, indent=2, sort_keys=True,
-        )
+    arrays = {
+        key: value for key, value in rollout_info.items()
+        if isinstance(value, np.ndarray) and key != "decision_episode_ids"
+    }
+    if not include_contraction_state:
+        for key in (
+            "position_trajectories", "position_lengths", "initial_qpos", "initial_qvel",
+        ):
+            arrays.pop(key, None)
+    config_path = path.with_suffix(".json")
+    config_path.unlink(missing_ok=True)
+    atomic_save_npz(path, **arrays)
+    atomic_write_json(
+        config_path,
+        rollout_cache_config(
+            manifest, checkpoint, episodes, rollout_seed,
+            include_contraction_state,
+        ),
+    )
 
 
 def contraction_cache_config(
@@ -615,11 +710,16 @@ def load_cached_contraction(
     config_path = eval_dir / "contraction_last.json"
     if not path.exists() or not config_path.exists():
         return None
-    with config_path.open("r", encoding="utf-8") as file:
-        if json.load(file) != contraction_cache_config(manifest, checkpoint, args, rollout_seed):
-            return None
-    with np.load(path) as data:
-        return {key: data[key] for key in data.files}
+    try:
+        with config_path.open("r", encoding="utf-8") as file:
+            if json.load(file) != contraction_cache_config(
+                manifest, checkpoint, args, rollout_seed
+            ):
+                return None
+        with np.load(path) as data:
+            return {key: data[key] for key in data.files}
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return None
 
 
 def save_cached_contraction(
@@ -630,12 +730,13 @@ def save_cached_contraction(
     rollout_seed: int,
     contraction: dict,
 ) -> None:
-    np.savez_compressed(eval_dir / "contraction_last.npz", **contraction)
-    with (eval_dir / "contraction_last.json").open("w", encoding="utf-8") as file:
-        json.dump(
-            contraction_cache_config(manifest, checkpoint, args, rollout_seed),
-            file, indent=2, sort_keys=True,
-        )
+    config_path = eval_dir / "contraction_last.json"
+    config_path.unlink(missing_ok=True)
+    atomic_save_npz(eval_dir / "contraction_last.npz", **contraction)
+    atomic_write_json(
+        config_path,
+        contraction_cache_config(manifest, checkpoint, args, rollout_seed),
+    )
 
 
 def load_or_evaluate_expert(
@@ -644,33 +745,150 @@ def load_or_evaluate_expert(
     args: argparse.Namespace,
     rollout_seed: int,
 ) -> dict:
-    path = eval_dir / "expert.npz"
-    config_path = eval_dir / "expert.json"
-    config = {
+    shared_config = expert_cache_config(manifest, args, rollout_seed)
+    shared_path, shared_config_path, lock_path = shared_expert_cache_paths(
+        eval_dir, shared_config
+    )
+    cached = load_expert_cache(shared_path, shared_config_path, shared_config)
+    if cached is not None:
+        return cached
+
+    legacy_path = eval_dir / "expert.npz"
+    legacy_config_path = eval_dir / "expert.json"
+    legacy_config = {
         "version": EVALUATION_SCHEMA_VERSION,
         "env_name": manifest["env_name"],
         "expert": manifest["expert"],
         "episodes": args.final_eval_episodes,
         "seed": rollout_seed,
     }
-    if args.reuse_eval and path.exists() and config_path.exists():
+    legacy = None
+    if args.reuse_eval:
+        legacy = load_expert_cache(
+            legacy_path, legacy_config_path, legacy_config
+        )
+
+    shared_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        cached = load_expert_cache(
+            shared_path, shared_config_path, shared_config
+        )
+        if cached is not None:
+            return cached
+        expert_info = legacy or evaluate_expert(
+            manifest, args.final_eval_episodes, rollout_seed
+        )
+        save_expert_cache(
+            shared_path, shared_config_path, shared_config, expert_info
+        )
+        return expert_info
+
+
+def expert_cache_config(
+    manifest: dict,
+    args: argparse.Namespace,
+    rollout_seed: int,
+) -> dict:
+    config = {
+        "version": EXPERT_CACHE_VERSION,
+        "env_name": manifest["env_name"],
+    }
+    if manifest["dataset_source"] == "robomimic":
+        ph_spec = load_offline.list_robomimic_dataset_specs(
+            manifest["env_name"], "ph"
+        )[0]
+        config.update(
+            baseline="robomimic_ph_demonstrations",
+            dataset_source="robomimic",
+            repo_id=load_offline.ROBOMIMIC_HF_REPO_ID,
+            repo_path=ph_spec["repo_path"],
+        )
+    else:
+        config.update(
+            expert=manifest["expert"],
+            episodes=args.final_eval_episodes,
+            seed=rollout_seed,
+        )
+    return config
+
+
+def shared_expert_cache_paths(
+    eval_dir: Path,
+    config: dict,
+) -> tuple[Path, Path, Path]:
+    encoded = json.dumps(
+        config, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    cache_key = hashlib.sha256(encoded).hexdigest()
+    cache_dir = eval_dir.parents[1] / "_expert_cache"
+    path = cache_dir / f"{cache_key}.npz"
+    return path, path.with_suffix(".json"), path.with_suffix(".lock")
+
+
+def load_expert_cache(
+    path: Path,
+    config_path: Path,
+    expected_config: dict,
+) -> dict | None:
+    if not path.exists() or not config_path.exists():
+        return None
+    try:
         with config_path.open("r", encoding="utf-8") as file:
-            matches = json.load(file) == config
-        if matches:
-            with np.load(path) as data:
-                arrays = {key: data[key] for key in data.files}
-            return {
-                **arrays,
-                "return_mean": float(arrays["returns"].mean()),
-                "return_std": float(arrays["returns"].std()),
-                "performance_mean": float(arrays["performance"].mean()),
-                "performance_std": float(arrays["performance"].std()),
-            }
-    expert_info = evaluate_expert(manifest, args.final_eval_episodes, rollout_seed)
-    np.savez_compressed(path, returns=expert_info["returns"], performance=expert_info["performance"])
-    with config_path.open("w", encoding="utf-8") as file:
-        json.dump(config, file, indent=2, sort_keys=True)
-    return expert_info
+            if json.load(file) != expected_config:
+                return None
+        with np.load(path) as data:
+            arrays = {key: data[key] for key in data.files}
+        returns = arrays["returns"]
+        performance = arrays["performance"]
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return None
+    return {
+        "returns": returns,
+        "return_mean": float(returns.mean()),
+        "return_std": float(returns.std()),
+        "performance": performance,
+        "performance_mean": float(performance.mean()),
+        "performance_std": float(performance.std()),
+    }
+
+
+def save_expert_cache(
+    path: Path,
+    config_path: Path,
+    config: dict,
+    expert_info: dict,
+) -> None:
+    atomic_save_npz(
+        path,
+        returns=expert_info["returns"],
+        performance=expert_info["performance"],
+    )
+    atomic_write_json(config_path, config)
+
+
+def atomic_save_npz(path: Path, **arrays: np.ndarray) -> None:
+    with tempfile.NamedTemporaryFile(
+        dir=path.parent, suffix=".npz", delete=False
+    ) as temporary_file:
+        temporary_path = Path(temporary_file.name)
+    try:
+        np.savez_compressed(temporary_path, **arrays)
+        temporary_path.replace(path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def atomic_write_json(path: Path, data: dict) -> None:
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, delete=False
+    ) as temporary_file:
+        temporary_config_path = Path(temporary_file.name)
+        json.dump(data, temporary_file, indent=2, sort_keys=True)
+    try:
+        temporary_config_path.replace(path)
+    finally:
+        temporary_config_path.unlink(missing_ok=True)
 
 
 def evaluate_expert(manifest: dict, episodes: int, seed: int) -> dict:
@@ -738,15 +956,13 @@ def evaluate_expert(manifest: dict, episodes: int, seed: int) -> dict:
 
 
 def performance_definition(env_name: str) -> tuple[str, str, bool]:
-    if env_name in {"Can", "Lift", "ToolHang"}:
+    if env_name in {"Can", "Lift"}:
         return "success_rate", "task success rate", True
     if env_name == "Reacher-v5":
         return "final_target_distance", "final fingertip-target distance (m)", False
-    if env_name == "InvertedDoublePendulum-v5":
-        return "balance_duration", "balance duration (primitive steps)", True
     if env_name == "HalfCheetah-v5":
         return "forward_displacement", "forward displacement (m)", True
-    return "episode_return", "episode return", True
+    raise ValueError(f"Unsupported task {env_name!r}.")
 
 
 def episode_performance(
@@ -758,17 +974,15 @@ def episode_performance(
     reset_info: dict,
     final_info: dict,
 ) -> float:
-    if env_name in {"Can", "Lift", "ToolHang"}:
+    if env_name in {"Can", "Lift"}:
         return float(succeeded)
     if env_name == "Reacher-v5":
         fingertip = env.unwrapped.get_body_com("fingertip")
         target = env.unwrapped.get_body_com("target")
         return float(np.linalg.norm(fingertip - target))
-    if env_name == "InvertedDoublePendulum-v5":
-        return float(primitive_steps)
     if env_name == "HalfCheetah-v5":
         return float(final_info["x_position"] - reset_info["x_position"])
-    return episode_return
+    raise ValueError(f"Unsupported task {env_name!r}.")
 
 
 def evaluate_contraction(
@@ -1025,17 +1239,13 @@ def pad_trajectories(trajectories: list[np.ndarray]) -> np.ndarray:
 def evaluate_dynamics_on_dataset(
     dynamics,
     dataset: dict[str, np.ndarray],
-    obs_mean: np.ndarray | None = None,
-    obs_std: np.ndarray | None = None,
 ) -> np.ndarray:
     errors = []
     for start in range(0, len(dataset["observations"]), 8192):
         end = start + 8192
         obs = dataset["observations"][start:end]
         action_chunks = dataset["actions"][start:end]
-        pred_next_obs = predict_next_obs(
-            dynamics, obs, action_chunks, obs_mean=obs_mean, obs_std=obs_std
-        )
+        pred_next_obs = predict_next_obs(dynamics, obs, action_chunks)
         errors.append(np.mean((pred_next_obs - dataset["next_observations"][start:end]) ** 2, axis=1))
     return np.concatenate(errors, axis=0).astype(np.float32)
 
@@ -1044,139 +1254,19 @@ def predict_next_obs(
     dynamics,
     obs: np.ndarray,
     action_chunks: np.ndarray,
-    obs_mean: np.ndarray | None = None,
-    obs_std: np.ndarray | None = None,
 ) -> np.ndarray:
-    model_obs = obs if obs_mean is None else (obs - obs_mean) / obs_std
     if hasattr(dynamics, "mean_next_obss"):
-        pred_model_next_obs = dynamics.mean_next_obss(model_obs, action_chunks)
+        return dynamics.mean_next_obss(obs, action_chunks)
     else:
         model_input = dynamics.scaler.transform(
-            np.concatenate([model_obs, action_chunks], axis=-1)
+            np.concatenate([obs, action_chunks], axis=-1)
         )
         with torch.no_grad():
             mean, _ = dynamics.model(model_input)
         elite_indices = dynamics.model.elites.detach().cpu().numpy()
         elite_mean = mean[elite_indices].mean(dim=0).cpu().numpy()
-        pred_model_next_obs = model_obs + elite_mean[:, : obs.shape[1]]
-    if obs_mean is not None:
-        return pred_model_next_obs * obs_std + obs_mean
-    return pred_model_next_obs
+        return obs + elite_mean[:, : obs.shape[1]]
 
-
-def evaluate_jacobians_on_observations(
-    policy,
-    dynamics,
-    env_name: str,
-    observations: np.ndarray,
-    sample_count: int,
-    seed: int,
-    fd_eps: float,
-    chunk_length: int,
-    obs_mean: np.ndarray | None = None,
-    obs_std: np.ndarray | None = None,
-) -> dict[str, np.ndarray]:
-    env = gym.make(env_name)
-    env.reset(seed=seed)
-    columns = reconstructible_observation_columns(env)
-    sample_count = min(sample_count, len(observations))
-    indices = np.random.default_rng(seed).choice(len(observations), size=sample_count, replace=False)
-    errors = []
-
-    try:
-        for sample_index, index in enumerate(indices):
-            finite_difference_seed = seed + sample_index * len(columns)
-            true_jacobian = closed_loop_jacobian(
-                lambda obs: true_next_obs(env, policy, obs, chunk_length),
-                env,
-                observations[index],
-                columns,
-                fd_eps,
-                finite_difference_seed,
-            )
-            learned_jacobian = closed_loop_jacobian(
-                lambda obs: learned_next_obs(policy, dynamics, obs, obs_mean, obs_std),
-                env,
-                observations[index],
-                columns,
-                fd_eps,
-                finite_difference_seed,
-            )
-            errors.append(float(np.mean((learned_jacobian - true_jacobian) ** 2)))
-    finally:
-        env.close()
-
-    return {
-        "closed_loop_jacobian_mse": np.asarray(errors, dtype=np.float32),
-        "sample_indices": indices.astype(np.int64),
-        "columns": columns.astype(np.int64),
-    }
-
-
-def closed_loop_jacobian(
-    next_obs_fn,
-    env: gym.Env,
-    obs: np.ndarray,
-    columns: np.ndarray,
-    fd_eps: float,
-    seed: int,
-) -> np.ndarray:
-    jacobian = np.empty((len(obs), len(columns)), dtype=np.float32)
-    for column_index, obs_index in enumerate(columns):
-        obs_plus = np.asarray(obs, dtype=np.float32).copy()
-        obs_minus = np.asarray(obs, dtype=np.float32).copy()
-        obs_plus[obs_index] += fd_eps
-        obs_minus[obs_index] -= fd_eps
-        set_env_from_obs(env, obs_plus)
-        physical_obs_plus = env.unwrapped._get_obs().astype(np.float32)
-        set_env_from_obs(env, obs_minus)
-        physical_obs_minus = env.unwrapped._get_obs().astype(np.float32)
-        seed_policy_randomness(seed + column_index)
-        next_obs_plus = next_obs_fn(physical_obs_plus)
-        seed_policy_randomness(seed + column_index)
-        next_obs_minus = next_obs_fn(physical_obs_minus)
-        jacobian[:, column_index] = (next_obs_plus - next_obs_minus) / (2.0 * fd_eps)
-    return jacobian
-
-
-def true_next_obs(env: gym.Env, policy, obs: np.ndarray, chunk_length: int) -> np.ndarray:
-    set_env_from_obs(env, obs)
-    action_chunk = policy.select_action(obs.reshape(1, -1), deterministic=True).reshape(-1)
-    next_obs, *_ = chunking.execute_action_chunk(env.unwrapped, action_chunk, chunk_length)
-    return np.asarray(next_obs, dtype=np.float32)
-
-
-def learned_next_obs(
-    policy,
-    dynamics,
-    obs: np.ndarray,
-    obs_mean: np.ndarray | None,
-    obs_std: np.ndarray | None,
-) -> np.ndarray:
-    action_chunk = policy.select_action(obs.reshape(1, -1), deterministic=True).reshape(1, -1)
-    return predict_next_obs(
-        dynamics, obs.reshape(1, -1), action_chunk,
-        obs_mean=obs_mean, obs_std=obs_std,
-    )[0]
-
-
-def reconstructible_observation_columns(env: gym.Env) -> np.ndarray:
-    structure = env.unwrapped.observation_structure
-    return np.arange(structure["qpos"] + structure["qvel"], dtype=np.int64)
-
-
-def set_env_from_obs(env: gym.Env, obs: np.ndarray) -> None:
-    unwrapped = env.unwrapped
-    structure = unwrapped.observation_structure
-    skipped_qpos = structure["skipped_qpos"]
-    qpos = np.zeros(unwrapped.model.nq, dtype=np.float64)
-    qvel = np.zeros(unwrapped.model.nv, dtype=np.float64)
-    offset = 0
-    qpos[skipped_qpos:] = obs[offset : offset + structure["qpos"]]
-    offset += structure["qpos"]
-    qvel[:] = obs[offset : offset + structure["qvel"]]
-    mujoco.mj_normalizeQuat(unwrapped.model, qpos)
-    unwrapped.set_state(qpos, qvel)
 
 if __name__ == "__main__":
     main()

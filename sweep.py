@@ -6,10 +6,15 @@
 # - Own experiment directories, milestone checkpoints, logging, seeding, and run naming.
 
 import argparse
+import filecmp
+import fcntl
 import itertools
 import json
 import math
+import os
 import random
+import tempfile
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -20,40 +25,58 @@ import torch
 import chunking
 import load_offline
 import rollout
+import task_support
 from chunked_dynamics import DYNAMICS_CHUNK_MODES, resolve_dynamics_chunk_mode
 from offlinerlkit.buffer import ReplayBuffer
 from offlinerlkit.policy_trainer import MBPolicyTrainer, MFPolicyTrainer
 from offlinerlkit.utils.logger import Logger
 from policies import (
-    LOADABLE_MODEL_BASED_ALGOS,
-    LOADABLE_MODEL_FREE_ALGOS,
-    TRAINABLE_MODEL_BASED_ALGOS,
-    TRAINABLE_MODEL_FREE_ALGOS,
+    MODEL_BASED_ALGOS,
+    MODEL_FREE_ALGOS,
     build_model_based_policy,
     build_model_free_policy,
 )
 
 
-PROJECT_DIR = Path(__file__).resolve().parent
-DATASET_ROOT = PROJECT_DIR / "datasets"
-TRAINED_ROOT = PROJECT_DIR / "trained"
-EVAL_ROOT = PROJECT_DIR / "evals"
+DEFAULT_STORAGE_ROOT = Path("/data/shekhe/stable-offline-rl")
 DATASET_SCHEMA_VERSION = 4
 TRAINING_SCHEMA_VERSION = 3
 BASE_DISCOUNT = 0.99
 
 
+def prepare_storage_root(storage_root: Path) -> None:
+    for name in ("datasets", "trained", "evals"):
+        directory = storage_root / name
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                prefix=".storage-write-test-",
+                dir=directory,
+            ):
+                pass
+        except OSError as error:
+            raise OSError(
+                f"Cannot use storage directory {directory}: {error}"
+            ) from error
+
+
 def main() -> None:
     args = parse_args()
+    prepare_storage_root(args.storage_root)
     expert_path = resolve_expert_path(args.expert, args.env)
     eval_dirs = []
     for seed in args.seeds:
         seed_args = argparse.Namespace(**vars(args))
         seed_args.seed = seed
         eval_dirs.extend(
-            run_sweep(env_name=args.env, expert_path=expert_path, args=seed_args)
+            run_sweep(
+                env_name=args.env,
+                expert_path=expert_path,
+                storage_root=args.storage_root,
+                args=seed_args,
+            )
         )
-    maybe_plot(EVAL_ROOT / args.env, eval_dirs, args)
+    maybe_plot(args.storage_root / "evals" / args.env, eval_dirs, args)
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,6 +87,15 @@ def parse_args() -> argparse.Namespace:
     experiment.add_argument("--seed", dest="seeds", type=int, nargs="+", default=[0], help="Random seeds used for dataset splitting, generated rollouts, training, and evaluation")
     experiment.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Torch device used for OfflineRL-Kit policies and dynamics")
     experiment.add_argument("--quiet", action="store_true", help="Suppress routine output, including the epoch-level training progress bar; warnings and errors remain visible")
+    experiment.add_argument(
+        "--storage-root",
+        type=Path,
+        default=DEFAULT_STORAGE_ROOT,
+        help=(
+            "Parent directory containing datasets, trained runs, and evaluations "
+            f"(default: {DEFAULT_STORAGE_ROOT})"
+        ),
+    )
 
     dataset = parser.add_argument_group("dataset source and split")
     dataset.add_argument("--dataset-source", choices=["generated", "minari", "clean-minari", "robomimic"], default="generated", help="Use generated rollouts, full Minari datasets, clean-expert/Minari mixtures, or low-dimensional robomimic datasets")
@@ -84,7 +116,7 @@ def parse_args() -> argparse.Namespace:
     training = parser.add_argument_group("policy training")
     training.add_argument(
         "--algos", nargs="+", choices=(
-            "none", *TRAINABLE_MODEL_FREE_ALGOS, *TRAINABLE_MODEL_BASED_ALGOS,
+            "none", *MODEL_FREE_ALGOS, *MODEL_BASED_ALGOS,
         ),
         default=["cql"], help="Algorithms to train, or none to collect the dataset without training",
     )
@@ -111,7 +143,7 @@ def parse_args() -> argparse.Namespace:
     evaluation = parser.add_argument_group("post-training evaluation")
     evaluation.add_argument("--eval", action="store_true", help="After training, run full evaluation for each trained policy and then generate plots")
     evaluation.add_argument("--reuse-eval", action="store_true", help="With --eval, reuse matching cached checkpoint rollouts and completed evaluation results")
-    evaluation.add_argument("--checkpoint-eval-episodes", type=int, default=20, help="Number of true-environment episodes used to monitor each non-final training checkpoint")
+    evaluation.add_argument("--checkpoint-eval-episodes", type=int, default=20, help="Number of true-environment episodes used to monitor each non-final training checkpoint; use 0 to evaluate only the final policy")
     evaluation.add_argument("--final-eval-episodes", type=int, default=100, help="Number of true-environment episodes used for the final policy and generated-data expert report")
     evaluation.add_argument("--contraction-trajectories", type=int, default=16, help="Number of matched unperturbed and agent-state-perturbed trajectories for the final policy")
     evaluation.add_argument("--contraction-horizon", type=int, default=300, help="Maximum primitive steps in each final-policy contraction trajectory")
@@ -138,6 +170,11 @@ def parse_args() -> argparse.Namespace:
     model_based.add_argument("--mobile-penalty-coef", type=float, default=1.5, help="MOBILE coefficient multiplying model-Bellman inconsistency on synthetic targets")
     model_based.add_argument("--mobile-return-shift", type=float, default=30.0, help="Reacher-only MOBILE return/Q shift D used to place the clamped target floor at -D")
     args = parser.parse_args()
+    args.storage_root = args.storage_root.expanduser().resolve()
+    try:
+        task_support.require_supported_task(args.env, args.dataset_source)
+    except ValueError as error:
+        parser.error(str(error))
     if any(chunk_length <= 0 for chunk_length in args.chunk_lengths):
         parser.error("--chunk-lengths values must be positive")
     if args.iql_temperature <= 0.0:
@@ -183,8 +220,11 @@ def parse_args() -> argparse.Namespace:
         parser.error("--dataset applies only to premade dataset sources")
     if args.dataset_source == "clean-minari" and args.dataset is None:
         parser.error("--dataset is required with --dataset-source clean-minari")
-    if args.checkpoint_eval_episodes <= 0 or args.final_eval_episodes <= 0:
-        parser.error("checkpoint and final evaluation episode counts must be positive")
+    if args.checkpoint_eval_episodes < 0 or args.final_eval_episodes <= 0:
+        parser.error(
+            "checkpoint evaluation episodes must be nonnegative and final "
+            "evaluation episodes must be positive"
+        )
     if args.contraction_trajectories <= 0 or args.contraction_horizon <= 0:
         parser.error("evaluation episode, trajectory, and horizon counts must be positive")
     if args.contraction_trajectories > args.final_eval_episodes:
@@ -196,10 +236,16 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def run_sweep(env_name: str, expert_path: Path, args: argparse.Namespace) -> list[Path]:
-    dataset_root = DATASET_ROOT / env_name
-    trained_root = TRAINED_ROOT / env_name
-    eval_root = EVAL_ROOT / env_name
+def run_sweep(
+    env_name: str,
+    expert_path: Path,
+    storage_root: Path,
+    args: argparse.Namespace,
+) -> list[Path]:
+    task_support.require_supported_task(env_name, args.dataset_source)
+    dataset_root = storage_root / "datasets" / env_name
+    trained_root = storage_root / "trained" / env_name
+    eval_root = storage_root / "evals" / env_name
     dataset_root.mkdir(parents=True, exist_ok=True)
     trained_root.mkdir(parents=True, exist_ok=True)
     eval_dirs = []
@@ -465,46 +511,70 @@ def collect_clean_minari_dataset(
     finally:
         env.close()
 
-    num_trajectories = max(2, math.ceil(num_samples / trajectory_horizon))
-    num_minari = max(1, int(round(num_trajectories * minari_fraction)))
-    num_clean = num_trajectories - num_minari
-
-    minari_dataset, minari_metadata = load_offline.load_minari_episode_subset(
-        dataset_id=dataset_id,
-        num_episodes=num_minari,
-        seed=args.seed,
-        episode_id_start=num_clean,
+    target_num_trajectories = max(2, math.ceil(num_samples / trajectory_horizon))
+    initial_num_minari = max(1, int(round(target_num_trajectories * minari_fraction)))
+    target_counts = np.asarray(
+        [target_num_trajectories - initial_num_minari, initial_num_minari],
+        dtype=np.int64,
     )
-    requested_minari_samples = num_minari * trajectory_horizon
-    if requested_minari_samples > minari_metadata["available_num_transitions"]:
-        raise ValueError(
-            f"Requested {requested_minari_samples} transitions from {dataset_id}, "
-            f"but it contains only {minari_metadata['available_num_transitions']} transitions."
-        )
+    proportions = np.asarray([1.0 - minari_fraction, minari_fraction])
+    trajectory_counts = np.zeros(2, dtype=np.int64)
+    transition_counts = np.zeros(2, dtype=np.int64)
+    components = []
+    next_episode_id = 0
+    clean_rng = np.random.default_rng(args.seed)
+    minari_metadata = None
 
-    clean_dataset = None
-    if num_clean:
-        if not expert_path.exists():
-            raise FileNotFoundError(f"Expert policy not found: {expert_path}")
-        clean_dataset = rollout.collect_expert(
-            env_name=env_name,
-            policy_path=str(expert_path),
-            num_trajectories=num_clean,
-            max_timesteps=args.max_timesteps,
-            deterministic=True,
-            rng=np.random.default_rng(args.seed),
-        )
+    while transition_counts.sum() < num_samples:
+        additions = target_counts - trajectory_counts
+        num_clean, num_minari = (int(value) for value in additions)
+        if num_clean:
+            if not expert_path.exists():
+                raise FileNotFoundError(f"Expert policy not found: {expert_path}")
+            clean_dataset = rollout.collect_expert(
+                env_name=env_name,
+                policy_path=str(expert_path),
+                num_trajectories=num_clean,
+                max_timesteps=args.max_timesteps,
+                deterministic=True,
+                rng=clean_rng,
+                episode_id_start=next_episode_id,
+            )
+            components.append(clean_dataset)
+            trajectory_counts[0] += num_clean
+            transition_counts[0] += len(clean_dataset["rewards"])
+            next_episode_id += num_clean
 
-    components = [minari_dataset] if clean_dataset is None else [clean_dataset, minari_dataset]
+        if num_minari:
+            minari_dataset, minari_metadata = load_offline.load_minari_episode_subset(
+                dataset_id=dataset_id,
+                num_episodes=num_minari,
+                seed=args.seed,
+                episode_id_start=next_episode_id,
+                episode_offset=int(trajectory_counts[1]),
+            )
+            components.append(minari_dataset)
+            trajectory_counts[1] += num_minari
+            transition_counts[1] += len(minari_dataset["rewards"])
+            next_episode_id += num_minari
+
+        if transition_counts.sum() < num_samples:
+            mean_length = transition_counts.sum() / trajectory_counts.sum()
+            shortfall = num_samples - transition_counts.sum()
+            target_num_trajectories = int(trajectory_counts.sum()) + max(
+                1, math.ceil(shortfall / mean_length)
+            )
+            target_counts = grow_source_counts(
+                trajectory_counts, target_num_trajectories, proportions
+            )
+
     dataset = load_offline.concat_datasets(components)
-    num_clean_transitions = 0 if clean_dataset is None else len(clean_dataset["rewards"])
-    num_minari_transitions = len(minari_dataset["rewards"])
+    num_clean = int(trajectory_counts[0])
+    num_minari = int(trajectory_counts[1])
+    num_trajectories = num_clean + num_minari
+    num_clean_transitions = int(transition_counts[0])
+    num_minari_transitions = int(transition_counts[1])
     num_transitions = num_clean_transitions + num_minari_transitions
-    if num_transitions < num_samples:
-        raise RuntimeError(
-            f"Complete trajectories produced {num_transitions} transitions, fewer than "
-            f"the requested minimum of {num_samples}."
-        )
 
     return dataset, {
         "source": "clean-minari",
@@ -529,6 +599,20 @@ def collect_clean_minari_dataset(
         "deterministic": True,
         "seed": args.seed,
     }
+
+
+def grow_source_counts(
+    current_counts: np.ndarray,
+    target_total: int,
+    proportions: np.ndarray,
+) -> np.ndarray:
+    """Grow source counts while staying closest to requested proportions."""
+    counts = np.asarray(current_counts, dtype=np.int64).copy()
+    while counts.sum() < target_total:
+        next_total = int(counts.sum()) + 1
+        deficits = next_total * proportions - counts
+        counts[int(np.argmax(deficits))] += 1
+    return counts
 
 
 def find_generated_clean_dataset(
@@ -556,15 +640,15 @@ def find_generated_clean_dataset(
     }
     candidates = []
     for metadata_path in sorted(dataset_root.glob("*/*/metadata.json"), reverse=True):
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
         schema = metadata.get("dataset_schema", {})
         if {key: value for key, value in schema.items() if key != "noise_scale"} != expected:
             continue
         dataset_dir = metadata_path.parent
-        if all(
-            (dataset_dir / filename).exists()
-            for filename in ("full.npz", "train.npz", "test.npz")
-        ):
+        if dataset_cache_is_complete(dataset_dir):
             candidates.append((dataset_dir.parent, dataset_dir.parent.name, schema))
     if not candidates or args.algos == ["none"]:
         return None if not candidates else candidates[0]
@@ -588,17 +672,47 @@ def get_or_create_dataset(
     create_dataset,
     args: argparse.Namespace,
 ) -> tuple[dict[str, np.ndarray], dict]:
-    for metadata_path in sorted(dataset_parent.glob("*/metadata.json"), reverse=True):
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        dataset_dir = metadata_path.parent
-        if metadata.get("dataset_schema") == dataset_schema and all(
-            (dataset_dir / filename).exists() for filename in ("full.npz", "train.npz", "test.npz")
-        ):
-            return rollout.load_dataset(dataset_dir / "train.npz"), split_paths(dataset_dir)
+    dataset_parent.mkdir(parents=True, exist_ok=True)
+    with (dataset_parent / ".creation.lock").open("a+b") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        cached = find_cached_dataset(dataset_parent, dataset_schema)
+        if cached is not None:
+            return cached
 
-    dataset, metadata = create_dataset()
-    dataset_dir = dataset_parent / timestamp_name()
-    return save_dataset_splits(dataset_dir, dataset, metadata, dataset_schema, args)
+        dataset, metadata = create_dataset()
+        dataset_dir = dataset_parent / timestamp_name()
+        return save_dataset_splits(dataset_dir, dataset, metadata, dataset_schema, args)
+
+
+def find_cached_dataset(
+    dataset_parent: Path,
+    dataset_schema: dict,
+) -> tuple[dict[str, np.ndarray], dict] | None:
+    for metadata_path in sorted(dataset_parent.glob("*/metadata.json"), reverse=True):
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        dataset_dir = metadata_path.parent
+        if (
+            metadata.get("dataset_schema") == dataset_schema
+            and dataset_cache_is_complete(dataset_dir)
+        ):
+            try:
+                dataset = rollout.load_dataset(dataset_dir / "train.npz")
+                rollout.load_dataset(dataset_dir / "test.npz")
+            except (OSError, ValueError, KeyError):
+                continue
+            return dataset, split_paths(dataset_dir)
+    return None
+
+
+def dataset_cache_is_complete(dataset_dir: Path) -> bool:
+    """Return whether the canonical split cache is present; full.npz is legacy-only."""
+    return all(
+        (dataset_dir / filename).is_file()
+        for filename in ("metadata.json", "train.npz", "test.npz")
+    )
 
 
 def save_dataset_splits(
@@ -608,7 +722,6 @@ def save_dataset_splits(
     dataset_schema: dict,
     args: argparse.Namespace,
 ) -> tuple[dict[str, np.ndarray], dict]:
-    full_path = dataset_dir / "full.npz"
     train_path = dataset_dir / "train.npz"
     test_path = dataset_dir / "test.npz"
     metadata_path = dataset_dir / "metadata.json"
@@ -618,7 +731,6 @@ def save_dataset_splits(
         **metadata,
         "dataset_schema": dataset_schema,
         "test_fraction": args.test_fraction,
-        "full_dataset_path": str(full_path.resolve()),
         "train_dataset_path": str(train_path.resolve()),
         "test_dataset_path": str(test_path.resolve()),
     }
@@ -627,11 +739,9 @@ def save_dataset_splits(
         test_fraction=args.test_fraction,
         seed=args.seed,
     )
-    rollout.save_dataset(dataset, full_path)
     rollout.save_dataset(train_dataset, train_path)
     rollout.save_dataset(test_dataset, test_path)
-    with metadata_path.open("w", encoding="utf-8") as file:
-        json.dump(metadata, file, indent=2, sort_keys=True)
+    write_json_atomic(metadata_path, metadata)
     return train_dataset, split_paths(dataset_dir)
 
 
@@ -689,9 +799,7 @@ def train_algos(
                     training_schema=schema,
                     args=args,
                 )
-            from validation import validate_run
-
-            validate_run(run_dir, args.device)
+            maybe_validate(run_dir, args)
             eval_dir = maybe_evaluate(run_dir, args)
             if eval_dir is not None:
                 eval_dirs.append(eval_dir)
@@ -751,7 +859,7 @@ def make_training_schema(
             schema["mobile"] = mobile_schema
     if algo in {"cql", "combo"}:
         schema["implementation_version"] = 2
-    if algo in TRAINABLE_MODEL_BASED_ALGOS:
+    if algo in MODEL_BASED_ALGOS:
         schema["model_based"] = {
             "dynamics_max_epochs": args.dynamics_max_epochs,
             "rollout_freq": args.rollout_freq,
@@ -786,29 +894,42 @@ def make_training_schema(
 
 def find_trained_run(run_parent: Path, training_schema: dict) -> Path | None:
     for manifest_path in sorted(run_parent.glob("*/run_manifest.json"), reverse=True):
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
         if manifest.get("training_schema") == training_schema and run_is_complete(manifest):
             return manifest_path.parent
     return None
 
 
 def run_is_complete(manifest: dict) -> bool:
-    paths = [
-        Path(manifest["model_dir"]) / "policy.pth",
-        Path(manifest["full_dataset_path"]),
-        Path(manifest["train_dataset_path"]),
-        Path(manifest["test_dataset_path"]),
-        Path(manifest["dataset_metadata_path"]),
-    ]
-    for checkpoint in manifest["checkpoints"]:
-        paths.append(Path(checkpoint["policy_path"]))
-        if "dynamics_path" in checkpoint:
-            dynamics_dir = Path(checkpoint["dynamics_path"])
-            paths.extend((dynamics_dir / "dynamics.pth", dynamics_dir / "mu.npy", dynamics_dir / "std.npy"))
-    if manifest["algo"] in LOADABLE_MODEL_BASED_ALGOS:
-        model_dir = Path(manifest["model_dir"])
-        paths.extend((model_dir / "dynamics.pth", model_dir / "mu.npy", model_dir / "std.npy"))
-    return all(path.exists() for path in paths)
+    try:
+        paths = [
+            Path(manifest["model_dir"]) / "policy.pth",
+            Path(manifest["train_dataset_path"]),
+            Path(manifest["test_dataset_path"]),
+            Path(manifest["dataset_metadata_path"]),
+        ]
+        for checkpoint in manifest["checkpoints"]:
+            paths.append(Path(checkpoint["policy_path"]))
+            if "dynamics_path" in checkpoint:
+                dynamics_dir = Path(checkpoint["dynamics_path"])
+                paths.extend((
+                    dynamics_dir / "dynamics.pth",
+                    dynamics_dir / "mu.npy",
+                    dynamics_dir / "std.npy",
+                ))
+        if manifest["algo"] in MODEL_BASED_ALGOS:
+            model_dir = Path(manifest["model_dir"])
+            paths.extend((
+                model_dir / "dynamics.pth",
+                model_dir / "mu.npy",
+                model_dir / "std.npy",
+            ))
+    except (KeyError, TypeError):
+        return False
+    return all(path.is_file() for path in paths)
 
 
 def maybe_evaluate(run_dir: Path, args: argparse.Namespace) -> Path | None:
@@ -833,6 +954,14 @@ def maybe_evaluate(run_dir: Path, args: argparse.Namespace) -> Path | None:
     )
 
 
+def maybe_validate(run_dir: Path, args: argparse.Namespace) -> None:
+    if not args.eval:
+        return
+    from validation import validate_run
+
+    validate_run(run_dir, args.device)
+
+
 def maybe_plot(eval_root: Path, eval_dirs: list[Path], args: argparse.Namespace) -> None:
     if not args.eval or not eval_dirs:
         return
@@ -844,15 +973,20 @@ def maybe_plot(eval_root: Path, eval_dirs: list[Path], args: argparse.Namespace)
 def split_paths(dataset_dir: Path) -> dict:
     with (dataset_dir / "metadata.json").open("r", encoding="utf-8") as file:
         metadata = json.load(file)
-    return {
+    paths = {
         "dataset_dir": str(dataset_dir.resolve()),
-        "full_dataset_path": str((dataset_dir / "full.npz").resolve()),
         "train_dataset_path": str((dataset_dir / "train.npz").resolve()),
         "test_dataset_path": str((dataset_dir / "test.npz").resolve()),
         "dataset_metadata_path": str((dataset_dir / "metadata.json").resolve()),
         "dataset_tag": dataset_dir.parent.name,
         "test_fraction": metadata["test_fraction"],
     }
+    legacy_full_path = metadata.get("full_dataset_path")
+    if legacy_full_path is not None:
+        paths["full_dataset_path"] = legacy_full_path
+    elif (dataset_dir / "full.npz").exists():
+        paths["full_dataset_path"] = str((dataset_dir / "full.npz").resolve())
+    return paths
 
 
 def train_algo(
@@ -867,33 +1001,30 @@ def train_algo(
     training_schema: dict,
     args: argparse.Namespace,
 ) -> None:
-    trainable_algos = (*TRAINABLE_MODEL_FREE_ALGOS, *TRAINABLE_MODEL_BASED_ALGOS)
-    loadable_algos = (*LOADABLE_MODEL_FREE_ALGOS, *LOADABLE_MODEL_BASED_ALGOS)
-    if algo in loadable_algos and algo not in trainable_algos:
-        raise ValueError(
-            f"Algorithm {algo!r} is retained only for loading legacy runs and cannot be trained."
-        )
-    if algo not in trainable_algos:
+    if algo not in (*MODEL_FREE_ALGOS, *MODEL_BASED_ALGOS):
         raise ValueError(f"Unsupported algorithm: {algo}")
 
     run_dir.mkdir(parents=True)
     seed_everything(args.seed)
 
     macro_discount = training_schema["macro_discount"]
-    eval_env = chunking.ActionChunkWrapper(make_env(env_name, split_paths, args), chunk_length)
-    eval_env.reset(seed=args.seed)
-    eval_env.action_space.seed(args.seed)
-    logger = build_logger(
-        run_dir, args, algo, env_name, chunk_length, macro_discount
-    )
-
+    eval_env = None
+    logger = None
+    trainer_closed_logger = False
     try:
-        if algo in TRAINABLE_MODEL_FREE_ALGOS:
+        eval_env = make_env(env_name, split_paths, args)
+        eval_env = chunking.ActionChunkWrapper(eval_env, chunk_length)
+        eval_env.reset(seed=args.seed)
+        eval_env.action_space.seed(args.seed)
+        logger = build_logger(
+            run_dir, args, algo, env_name, chunk_length, macro_discount
+        )
+
+        if algo in MODEL_FREE_ALGOS:
             buffer = build_buffer(chunk_dataset, eval_env, args.device)
             policy, lr_scheduler = build_model_free_policy(
                 algo, eval_env, buffer, args,
                 discount=macro_discount,
-                dql_config=None,
             )
             trainer = MFPolicyTrainer(
                 policy=policy,
@@ -920,7 +1051,6 @@ def train_algo(
                 args.model_manipulation_settings,
             )
             real_buffer = build_buffer(policy_dataset, eval_env, args.device)
-            obs_mean = obs_std = None
             fake_buffer = ReplayBuffer(
                 buffer_size=args.rollout_batch_size * args.rollout_length * args.model_retain_epochs,
                 obs_shape=eval_env.observation_space.shape,
@@ -932,8 +1062,6 @@ def train_algo(
             policy, dynamics, lr_scheduler = build_model_based_policy(
                 algo, eval_env, args,
                 discount=macro_discount,
-                obs_mean=obs_mean,
-                obs_std=obs_std,
                 chunk_length=chunk_length,
                 base_discount=BASE_DISCOUNT,
                 dynamics_chunk_mode=dynamics_chunk_mode,
@@ -960,7 +1088,6 @@ def train_algo(
                 batch_size=args.batch_size,
                 real_ratio=args.real_ratio,
                 lr_scheduler=lr_scheduler,
-                dynamics_update_freq=0,
                 checkpoint_epochs=checkpoint_epochs(args.epoch),
                 show_progress=not args.quiet,
             )
@@ -968,16 +1095,82 @@ def train_algo(
         initial_checkpoint = Path(logger.checkpoint_dir) / "step_0"
         initial_checkpoint.mkdir(exist_ok=True)
         torch.save(policy.state_dict(), initial_checkpoint / "policy.pth")
-        if algo in TRAINABLE_MODEL_BASED_ALGOS:
+        if algo in MODEL_BASED_ALGOS:
             dynamics.save(initial_checkpoint)
 
         trainer.train()
+        trainer_closed_logger = True
+        compact_run_artifacts(
+            run_dir, algo, args.epoch, args.step_per_epoch
+        )
         save_run_manifest(
             run_dir, eval_dir, algo, env_name, split_paths,
             training_schema, chunk_length, macro_discount, args,
         )
     finally:
-        eval_env.close()
+        try:
+            if logger is not None and not trainer_closed_logger:
+                logger.close()
+        finally:
+            if eval_env is not None:
+                eval_env.close()
+
+
+def compact_run_artifacts(
+    run_dir: Path,
+    algo: str,
+    epochs: int,
+    steps_per_epoch: int,
+) -> None:
+    """Deduplicate successful-run artifacts without changing referenced paths."""
+    final_policy = (
+        run_dir / "checkpoint" / f"step_{epochs * steps_per_epoch}" / "policy.pth"
+    )
+    rolling_policy = run_dir / "checkpoint" / "policy.pth"
+    if final_policy.is_file():
+        try:
+            rolling_policy.unlink(missing_ok=True)
+        except OSError:
+            pass
+        replace_identical_file_with_hardlink(
+            final_policy, run_dir / "model" / "policy.pth"
+        )
+
+    if algo in MODEL_BASED_ALGOS:
+        initial_dynamics = run_dir / "checkpoint" / "step_0"
+        model_dir = run_dir / "model"
+        for filename in ("dynamics.pth", "mu.npy", "std.npy"):
+            replace_identical_file_with_hardlink(
+                initial_dynamics / filename, model_dir / filename
+            )
+
+
+def replace_identical_file_with_hardlink(source: Path, duplicate: Path) -> bool:
+    """Replace an exact duplicate with a hardlink, falling back without error."""
+    if not source.is_file() or not duplicate.is_file():
+        return False
+    try:
+        if source.samefile(duplicate):
+            return True
+    except OSError:
+        return False
+    try:
+        identical = filecmp.cmp(source, duplicate, shallow=False)
+    except OSError:
+        return False
+    if not identical:
+        return False
+
+    temporary = duplicate.with_name(
+        f".{duplicate.name}.{uuid.uuid4().hex}.link"
+    )
+    try:
+        os.link(source, temporary)
+        os.replace(temporary, duplicate)
+    except OSError:
+        temporary.unlink(missing_ok=True)
+        return False
+    return True
 
 
 def prepare_model_based_datasets(
@@ -1012,8 +1205,8 @@ def prepare_model_based_datasets(
         return policy_dataset, None
 
     dynamics_dataset = {
-        key: np.asarray(primitive_dataset[key]).copy()
-        for key in ("observations", "actions", "next_observations", "rewards", "terminals")
+        key: np.asarray(primitive_dataset[key])
+        for key in ("observations", "actions", "next_observations")
     }
     primitive_rewards = np.asarray(primitive_dataset["rewards"], dtype=np.float32)
     if manipulation_settings:
@@ -1084,8 +1277,31 @@ def save_run_manifest(
         "checkpoints": checkpoint_manifest(run_dir, algo, args.epoch, args.step_per_epoch),
         **split_paths,
     }
-    with (run_dir / "run_manifest.json").open("w", encoding="utf-8") as file:
-        json.dump(manifest, file, indent=2, sort_keys=True)
+    write_json_atomic(run_dir / "run_manifest.json", manifest)
+
+
+def write_json_atomic(path: Path, payload: dict) -> None:
+    """Write JSON through a same-directory temporary file and atomic rename."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            json.dump(payload, temporary, indent=2, sort_keys=True)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+    except BaseException:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise
 
 
 def build_logger(
@@ -1114,7 +1330,11 @@ def build_logger(
         "step_per_epoch": args.step_per_epoch,
         "batch_size": args.batch_size,
     }
-    logger.log_hyperparameters(hyperparameters)
+    try:
+        logger.log_hyperparameters(hyperparameters)
+    except BaseException:
+        logger.close()
+        raise
     return logger
 
 
@@ -1154,7 +1374,7 @@ def checkpoint_manifest(run_dir: Path, algo: str, epochs: int, steps_per_epoch: 
             "step": step,
             "policy_path": str((checkpoint_dir / "policy.pth").resolve()),
         }
-        if algo in TRAINABLE_MODEL_BASED_ALGOS:
+        if algo in MODEL_BASED_ALGOS:
             dynamics_dir = run_dir / "checkpoint" / "step_0"
             record["dynamics_path"] = str(dynamics_dir.resolve())
         records.append(record)

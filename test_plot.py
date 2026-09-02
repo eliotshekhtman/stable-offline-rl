@@ -53,6 +53,42 @@ class EvaluationDiscoveryTests(unittest.TestCase):
 
             self.assertEqual(plot.latest_eval_dirs(root), sorted(expected))
 
+    def test_load_rows_rejects_historical_unsupported_task(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            eval_dir = root / "eval"
+            eval_dir.mkdir()
+            metadata_path = root / "metadata.json"
+            metadata_path.write_text(json.dumps({
+                "source": "robomimic",
+                "task": "Square",
+                "dataset_type": "ph",
+            }))
+            manifest_path = root / "run_manifest.json"
+            manifest_path.write_text(json.dumps({
+                "algo": "bc",
+                "chunk_length": 1,
+                "dataset_source": "robomimic",
+                "dataset_tag": "robomimic_square_ph",
+                "dataset_metadata_path": str(metadata_path),
+                "env_name": "Square",
+                "training_schema": {
+                    "algo": "bc",
+                    "chunk_length": 1,
+                    "dataset": {"source": "robomimic", "seed": 0},
+                    "seed": 0,
+                },
+            }))
+            (eval_dir / "results.json").write_text(json.dumps({
+                "run_manifest_path": str(manifest_path),
+                "evaluation_config": {
+                    "schema_version": plot.EVALUATION_SCHEMA_VERSION,
+                },
+            }))
+
+            with self.assertRaisesRegex(ValueError, "Unsupported task 'Square'"):
+                plot.load_rows([eval_dir])
+
 
 class DynamicsChunkModePlotTests(unittest.TestCase):
     @staticmethod
@@ -142,6 +178,7 @@ class DynamicsChunkModePlotTests(unittest.TestCase):
                         "dataset_source": "robomimic",
                         "dataset_tag": f"lift_seed{seed}",
                         "dataset_metadata_path": str(metadata_path),
+                        "env_name": "Lift",
                         "training_schema": {
                             "algo": "mobile",
                             "chunk_length": 4,
@@ -197,7 +234,280 @@ class DynamicsChunkModePlotTests(unittest.TestCase):
         plot.plt.close(figure)
 
 
+class PlotCohortTests(unittest.TestCase):
+    @staticmethod
+    def record(
+        algo="mobile", chunk_length=4, real_ratio=0.5, epoch=300,
+        dynamics_mode=None,
+    ):
+        model_based = {
+            "real_ratio": real_ratio,
+        }
+        if dynamics_mode is not None:
+            model_based["chunk_dynamics"] = {
+                "version": 1,
+                "mode": dynamics_mode,
+            }
+        return {
+            "algo": algo,
+            "chunk_length": chunk_length,
+            "training_schema": {
+                "algo": algo,
+                "chunk_length": chunk_length,
+                "epoch": epoch,
+                "model_based": model_based,
+            },
+        }
+
+    @staticmethod
+    def cohort(*series):
+        return plot.validate_plot_cohort({
+            "version": plot.PLOT_COHORT_VERSION,
+            "series": list(series),
+        })
+
+    def test_mobile_real_ratio_variants_are_separate_labeled_series(self):
+        rows = [
+            self.record(chunk_length=chunk_length, real_ratio=real_ratio)
+            for real_ratio in (0.0, 0.5)
+            for chunk_length in (2, 4)
+        ]
+        cohort = self.cohort(
+            {"algo": "mobile", "match": {"model_based.real_ratio": 0.0}},
+            {"algo": "mobile", "match": {"model_based.real_ratio": 0.5}},
+        )
+
+        selected = plot.select_plot_cohort(rows, cohort)
+        groups = plot.algorithm_groups(selected, "chunk_length")
+
+        self.assertEqual(
+            [label for label, _ in groups],
+            ["mobile (real ratio=0.00)", "mobile (real ratio=0.50)"],
+        )
+        self.assertEqual([len(group) for _, group in groups], [2, 2])
+
+    def test_automatic_grouping_rejects_two_configs_at_one_x_value(self):
+        rows = [
+            self.record(real_ratio=0.0),
+            self.record(real_ratio=0.5),
+        ]
+
+        with self.assertRaisesRegex(
+            ValueError, "multiple seed-averaged configurations"
+        ):
+            plot.algorithm_groups(rows, "chunk_length")
+
+    def test_coherent_unselected_sweep_keeps_one_legacy_series(self):
+        rows = [
+            self.record(chunk_length=chunk_length, real_ratio=0.5)
+            for chunk_length in (2, 4)
+        ]
+
+        groups = plot.algorithm_groups(rows, "chunk_length")
+
+        self.assertEqual(groups, [("mobile", rows)])
+
+    def test_underspecified_cohort_still_rejects_ambiguous_series(self):
+        rows = [
+            self.record(real_ratio=0.0),
+            self.record(real_ratio=0.5),
+        ]
+        selected = plot.select_plot_cohort(
+            rows, self.cohort({"algo": "mobile"})
+        )
+
+        with self.assertRaisesRegex(ValueError, "--cohort series"):
+            plot.algorithm_groups(selected, "chunk_length")
+
+    def test_declared_series_does_not_silently_split_dynamics_modes(self):
+        rows = [
+            self.record(dynamics_mode=None),
+            self.record(dynamics_mode="recursive"),
+        ]
+        selected = plot.select_plot_cohort(
+            rows, self.cohort({"algo": "mobile"})
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "multiple seed-averaged configurations"
+        ):
+            plot.algorithm_groups(selected, "chunk_length")
+
+    def test_separate_series_can_explicitly_select_dynamics_modes(self):
+        direct = self.record(dynamics_mode=None)
+        recursive = self.record(dynamics_mode="recursive")
+        cohort = self.cohort(
+            {
+                "algo": "mobile",
+                "label": "mobile direct",
+                "match": {"model_based.chunk_dynamics.mode": None},
+            },
+            {
+                "algo": "mobile",
+                "label": "mobile recursive",
+                "match": {"model_based.chunk_dynamics.mode": "recursive"},
+            },
+        )
+
+        selected = plot.select_plot_cohort([direct, recursive], cohort)
+        groups = plot.algorithm_groups(selected, "chunk_length")
+
+        self.assertEqual(len(groups), 2)
+
+    def test_selected_series_rejects_training_parameter_changes_across_x(self):
+        rows = [
+            self.record(chunk_length=2, epoch=100),
+            self.record(chunk_length=4, epoch=300),
+        ]
+        selected = plot.select_plot_cohort(
+            rows,
+            self.cohort({
+                "algo": "mobile",
+                "match": {"model_based.real_ratio": 0.5},
+            }),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "non-axis training parameters.*epoch"
+        ):
+            plot.algorithm_groups(selected, "chunk_length")
+
+    def test_chunk_and_generated_dataset_axis_fields_may_change(self):
+        chunk_rows = [
+            {
+                **self.record(chunk_length=chunk_length),
+                "training_schema": {
+                    **self.record(chunk_length=chunk_length)["training_schema"],
+                    "macro_discount": 0.99**chunk_length,
+                },
+            }
+            for chunk_length in (2, 4)
+        ]
+        self.assertEqual(
+            len(plot.algorithm_groups(chunk_rows, "chunk_length")), 1
+        )
+
+        dataset_rows = []
+        for fraction in (0.0, 0.5):
+            row = self.record()
+            row["noisy_trajectory_fraction"] = fraction
+            row["training_schema"]["dataset"] = {
+                "source": "generated",
+                "num_samples": 1000,
+                "noise_scale": 0.5,
+                "prop_clean_expert": 1.0 - fraction,
+                "prop_noisy_expert": fraction,
+                "prop_random": 0.0,
+                "prop_expert": 1.0,
+            }
+            dataset_rows.append(row)
+        self.assertEqual(
+            len(plot.algorithm_groups(
+                dataset_rows, "noisy_trajectory_fraction"
+            )),
+            1,
+        )
+
+    def test_different_algorithms_may_have_different_parameters(self):
+        mobile = self.record(algo="mobile", epoch=100)
+        mopo = self.record(algo="mopo", epoch=300)
+
+        groups = plot.algorithm_groups([mobile, mopo], "chunk_length")
+
+        self.assertEqual(
+            [label for label, _ in groups], ["mobile", "mopo"]
+        )
+
+    def test_overlapping_cohort_series_are_rejected(self):
+        row = self.record(real_ratio=0.0)
+        cohort = self.cohort(
+            {"algo": "mobile"},
+            {"algo": "mobile", "match": {"model_based.real_ratio": 0.0}},
+        )
+
+        with self.assertRaisesRegex(ValueError, "select the same"):
+            plot.select_plot_cohort([row], cohort)
+
+    def test_cohort_cannot_select_individual_seeds(self):
+        with self.assertRaisesRegex(ValueError, "seed-averaged"):
+            self.cohort({
+                "algo": "mobile",
+                "match": {"dataset.seed": 1},
+            })
+
+    def test_cohort_requires_every_declared_series_to_match(self):
+        cohort = self.cohort({
+            "algo": "mobile",
+            "match": {"model_based.real_ratio": 0.0},
+        })
+
+        with self.assertRaisesRegex(ValueError, "matched no"):
+            plot.select_plot_cohort([self.record(real_ratio=0.5)], cohort)
+
+    def test_selected_history_label_includes_variant_parameters(self):
+        row = {
+            **self.record(real_ratio=0.0),
+            "seed_group": "selected",
+        }
+        selected_rows = plot.select_plot_cohort(
+            [row],
+            self.cohort({
+                "algo": "mobile",
+                "match": {"model_based.real_ratio": 0.0},
+            }),
+        )
+        histories = plot.select_cohort_histories(
+            [{**row, "label": "mobile (l=4)"}], selected_rows
+        )
+
+        self.assertEqual(
+            histories[0]["label"],
+            "mobile (l=4, real ratio=0.00)",
+        )
+
+
 class CleanMinariPlotTests(unittest.TestCase):
+    @staticmethod
+    def training_schema(source, fraction=None, noise_scale=0.5, epoch=300):
+        dataset = {
+            "version": 4,
+            "source": source,
+            "env_name": "Reacher-v5",
+            "expert_path": "/experts/Reacher-v5.zip",
+            "max_timesteps": 1000000,
+            "num_samples": 500000,
+            "deterministic": True,
+            "seed": 0,
+            "test_fraction": 0.2,
+        }
+        if source == "generated":
+            dataset.update({
+                "noise_scale": noise_scale,
+                "prop_clean_expert": 1.0,
+                "prop_noisy_expert": 0.0,
+                "prop_random": 0.0,
+                "prop_expert": 1.0,
+            })
+        else:
+            dataset.update({
+                "dataset_id": "mujoco/reacher/medium-v0",
+                "minari_fraction": fraction,
+            })
+        return {
+            "version": 3,
+            "env_name": "Reacher-v5",
+            "algo": "bc",
+            "dataset": dataset,
+            "chunk_length": 1,
+            "base_discount": 0.99,
+            "macro_discount": 0.99,
+            "chunk_reward": "discounted_sum",
+            "seed": 0,
+            "epoch": epoch,
+            "step_per_epoch": 1000,
+            "batch_size": 256,
+        }
+
     def test_dataset_fields_only_reads_clean_minari_markers_for_mixture(self):
         fields = plot.dataset_fields({
             "source": "clean-minari",
@@ -232,13 +542,13 @@ class CleanMinariPlotTests(unittest.TestCase):
             "dataset_source": "generated",
             "algo": "bc",
             "seed_rows": [{"seed": 0}],
+            "training_schema": self.training_schema("generated"),
             "num_samples": 500000,
             "chunk_length": 1,
             "requested_prop_clean_expert": 1.0,
             "requested_prop_noisy_expert": 0.0,
             "requested_prop_random": 0.0,
         }
-        historical_clean = {**clean, "seed_rows": [{"seed": 1}]}
         wrong_size = {**clean, "num_samples": 1000000}
         noisy = {
             **clean,
@@ -248,7 +558,7 @@ class CleanMinariPlotTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             plot.plot_clean_minari_ablation(
-                [*mixed, clean, historical_clean, wrong_size, noisy], Path(directory)
+                [*mixed, clean, wrong_size, noisy], Path(directory)
             )
 
         plotted_rows = performance_plot.call_args.args[0]
@@ -259,8 +569,84 @@ class CleanMinariPlotTests(unittest.TestCase):
         baseline = next(
             row for row in plotted_rows if row["minari_trajectory_fraction"] == 0.0
         )
-        self.assertEqual(len(baseline["seed_rows"]), 2)
+        self.assertEqual(len(baseline["seed_rows"]), 1)
         self.assertEqual(contraction_plot.call_count, 1)
+
+    def test_clean_baselines_coalesce_noise_variants_by_unique_seed(self):
+        def baseline(noise_scale, created_at, seeds):
+            return {
+                "algo": "bc",
+                "chunk_length": 1,
+                "created_at": created_at,
+                "training_schema": self.training_schema(
+                    "generated", noise_scale=noise_scale
+                ),
+                "seed_rows": [
+                    {
+                        "seed": seed,
+                        "created_at": created_at,
+                        "eval_dir": f"{created_at}/seed{seed}",
+                    }
+                    for seed in seeds
+                ],
+            }
+
+        old = baseline(0.1, "2026-01-01", [0, 1])
+        new = baseline(0.5, "2026-02-01", [0, 2])
+
+        coalesced = plot.coalesce_clean_minari_baselines([old, new])
+
+        self.assertEqual(len(coalesced), 1)
+        self.assertEqual(
+            [row["seed"] for row in coalesced[0]["seed_rows"]],
+            [0, 1, 2],
+        )
+        seed_zero = next(
+            row for row in coalesced[0]["seed_rows"] if row["seed"] == 0
+        )
+        self.assertEqual(seed_zero["created_at"], "2026-02-01")
+
+    def test_clean_baseline_and_mixtures_form_one_consistent_line(self):
+        baseline = {
+            "algo": "bc",
+            "chunk_length": 1,
+            "minari_trajectory_fraction": 0.0,
+            "training_schema": self.training_schema("generated"),
+        }
+        mixtures = [
+            {
+                "algo": "bc",
+                "chunk_length": 1,
+                "minari_trajectory_fraction": fraction,
+                "training_schema": self.training_schema(
+                    "clean-minari", fraction=fraction
+                ),
+            }
+            for fraction in (0.5, 1.0)
+        ]
+
+        groups = plot.algorithm_groups(
+            [baseline, *mixtures], "minari_trajectory_fraction"
+        )
+
+        self.assertEqual(len(groups), 1)
+
+    def test_clean_baselines_with_different_training_configs_do_not_merge(self):
+        rows = [
+            {
+                "algo": "bc",
+                "chunk_length": 1,
+                "training_schema": self.training_schema(
+                    "generated", epoch=epoch
+                ),
+                "seed_rows": [{"seed": 0}],
+            }
+            for epoch in (100, 300)
+        ]
+
+        self.assertEqual(
+            len(plot.coalesce_clean_minari_baselines(rows)), 2
+        )
 
     def test_plot_root_does_not_delete_unrelated_existing_plots(self):
         with tempfile.TemporaryDirectory() as directory:

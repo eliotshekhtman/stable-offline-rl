@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import gymnasium as gym
 import numpy as np
@@ -78,6 +78,59 @@ class MobileShiftTests(unittest.TestCase):
         }
         values.update(overrides)
         return SimpleNamespace(**values)
+
+    def test_algorithm_registries_match_active_builders(self):
+        self.assertEqual(
+            policies.MODEL_FREE_ALGOS,
+            ("bc", "cql", "iql", "td3bc", "edac"),
+        )
+        self.assertEqual(
+            policies.MODEL_BASED_ALGOS,
+            ("mopo", "combo", "mobile"),
+        )
+        self.assertEqual(policies.ROBOMIMIC_TASKS, {"can", "lift"})
+
+    def test_td3bc_requires_observation_normalization_buffer(self):
+        with self.assertRaisesRegex(ValueError, "TD3\\+BC requires a replay buffer"):
+            policies.build_model_free_policy(
+                "td3bc", DummyEnv("Reacher-v5"), None,
+                SimpleNamespace(device="cpu"), discount=0.99,
+            )
+
+    def test_inference_only_model_based_policies_strictly_load_training_state(self):
+        env = DummyEnv("Reacher-v5")
+        args = self.model_args()
+        for algo in policies.MODEL_BASED_ALGOS:
+            with self.subTest(algo=algo), patch.object(
+                policies, "build_dynamics", return_value=MagicMock()
+            ):
+                torch.manual_seed(7)
+                trained_policy, trained_dynamics, _ = policies.build_model_based_policy(
+                    algo, env, args, discount=0.99, build_dynamics_model=True
+                )
+                torch.manual_seed(8)
+                inference_policy, inference_dynamics, _ = policies.build_model_based_policy(
+                    algo, env, args, discount=0.99, build_dynamics_model=False
+                )
+
+                self.assertIsNotNone(trained_dynamics)
+                self.assertIsNone(inference_dynamics)
+                inference_policy.load_state_dict(
+                    trained_policy.state_dict(), strict=True
+                )
+                self.assertEqual(
+                    set(inference_policy.state_dict()),
+                    set(trained_policy.state_dict()),
+                )
+
+    def test_model_based_builder_rejects_unsupported_algorithm_before_construction(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported algorithm"):
+            policies.build_model_based_policy(
+                "unsupported",
+                DummyEnv("Lift"),
+                self.model_args(),
+                discount=0.99,
+            )
 
     def test_chunk_one_recursive_request_uses_exact_plain_dynamics_path(self):
         torch.manual_seed(13)

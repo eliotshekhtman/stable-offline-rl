@@ -4,13 +4,15 @@
 # - Save/load this project's canonical .npz transition schema and JSON metadata.
 # - Preserve Gymnasium terminated vs truncated signals as terminals vs timeouts.
 
+import os
+import tempfile
 from pathlib import Path
 from typing import Callable
 
 import gymnasium as gym
 import numpy as np
-from sb3_contrib import TQC
-from stable_baselines3 import PPO, SAC
+from stable_baselines3 import SAC
+from task_support import GENERATED_TASKS, require_supported_task
 
 
 DATASET_KEYS = (
@@ -27,13 +29,12 @@ MAX_SEED = np.iinfo(np.int32).max
 
 def load_expert_policy(env_name: str, policy_path: str):
     """Load the SB3 expert policy convention used by this project."""
-    if env_name == "Humanoid-v5":
-        return TQC.load(policy_path)
-    if env_name == "Swimmer-v5":
-        return PPO.load(policy_path)
-    if any(env_name.endswith(f"-v{version}") for version in (2, 3, 4, 5)):
+    if env_name in GENERATED_TASKS:
         return SAC.load(policy_path)
-    raise ValueError(f"Unknown environment name: {env_name}")
+    raise ValueError(
+        f"Unsupported generated-data task {env_name!r}; supported tasks are "
+        "Reacher-v5 and HalfCheetah-v5."
+    )
 
 
 def collect_traj(
@@ -99,6 +100,7 @@ def collect_expert(
     episode_id_start: int = 0,
 ) -> dict[str, np.ndarray]:
     """Collect an exact number of complete expert trajectories."""
+    require_supported_task(env_name, "generated")
     rng = np.random.default_rng() if rng is None else rng
 
     def make_action_fn(env: gym.Env) -> Callable[[np.ndarray], np.ndarray]:
@@ -140,6 +142,7 @@ def collect_suboptimal(
     episode_id_start: int = 0,
 ) -> dict[str, np.ndarray]:
     """Collect an exact number of complete random-action trajectories."""
+    require_supported_task(env_name, "generated")
     rng = np.random.default_rng() if rng is None else rng
 
     def make_action_fn(env: gym.Env) -> Callable[[np.ndarray], np.ndarray]:
@@ -177,6 +180,7 @@ def collect_dataset(
     allocations; the remainder is random data. Whole trajectories are added
     until the dataset contains at least num_samples transitions.
     """
+    require_supported_task(env_name, "generated")
     _validate_collection_args(
         max_timesteps=max_timesteps,
         num_samples=num_samples,
@@ -301,7 +305,24 @@ def save_dataset(dataset: dict[str, np.ndarray], dataset_path: str | Path) -> No
     dataset_path = Path(dataset_path)
     dataset_path.parent.mkdir(parents=True, exist_ok=True)
     validate_dataset(dataset)
-    np.savez_compressed(dataset_path, **dataset)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w+b",
+            prefix=f".{dataset_path.name}.",
+            suffix=".tmp",
+            dir=dataset_path.parent,
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            np.savez_compressed(temporary, **dataset)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, dataset_path)
+    except BaseException:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise
 
 
 def load_dataset(dataset_path: str | Path) -> dict[str, np.ndarray]:
@@ -384,6 +405,9 @@ def validate_dataset(dataset: dict[str, np.ndarray]) -> None:
     if missing:
         raise ValueError(f"Dataset is missing required keys: {missing}")
 
+    scalar_keys = [key for key in DATASET_KEYS if np.asarray(dataset[key]).ndim == 0]
+    if scalar_keys:
+        raise ValueError(f"Dataset arrays must have a transition axis: {scalar_keys}")
     lengths = {key: len(dataset[key]) for key in DATASET_KEYS}
     if len(set(lengths.values())) != 1:
         raise ValueError(f"Dataset arrays have inconsistent lengths: {lengths}")

@@ -21,11 +21,17 @@ def make_action_chunk_dataset(
     if not np.isfinite(discount):
         raise ValueError("discount must be finite.")
 
+    episode_slices = _ordered_episode_slices(dataset)
+    if not episode_slices:
+        raise ValueError(f"No episode contains {chunk_length} consecutive transitions.")
+    if chunk_length == 1 and dataset["rewards"].dtype == np.float32:
+        return dataset
+
     window_offsets = np.arange(chunk_length)
     discount_powers = discount**window_offsets
     chunks = {key: [] for key in DATASET_KEYS}
 
-    for start, stop in _ordered_episode_slices(dataset):
+    for start, stop in episode_slices:
         chunk_count = stop - start - chunk_length + 1
         if chunk_count <= 0:
             continue

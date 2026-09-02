@@ -19,57 +19,34 @@ from offlinerlkit.buffer import ReplayBuffer
 from offlinerlkit.dynamics import EnsembleDynamics
 from offlinerlkit.modules import Actor, ActorProb, Critic, DiagGaussian, EnsembleCritic, EnsembleDynamicsModel, TanhDiagGaussian
 from offlinerlkit.nets import MLP
-from offlinerlkit.policy import BCPolicy, COMBOPolicy, CQLPolicy, EDACPolicy, IQLPolicy, MOBILEPolicy, MOPOPolicy, RAMBOPolicy, TD3BCPolicy
+from offlinerlkit.policy import BCPolicy, COMBOPolicy, CQLPolicy, EDACPolicy, IQLPolicy, MOBILEPolicy, MOPOPolicy, TD3BCPolicy
 from offlinerlkit.utils.noise import GaussianNoise
 from offlinerlkit.utils.scaler import StandardScaler
-from offlinerlkit.utils.termination_fns import get_termination_fn, obs_unnormalization
+from offlinerlkit.utils.termination_fns import get_termination_fn
+from task_support import ROBOMIMIC_TASKS as ROBOMIMIC_TASK_NAMES
 
 
-TRAINABLE_MODEL_FREE_ALGOS = ("bc", "cql", "iql", "td3bc", "edac")
-TRAINABLE_MODEL_BASED_ALGOS = ("mopo", "combo", "mobile")
-LOADABLE_MODEL_FREE_ALGOS = (*TRAINABLE_MODEL_FREE_ALGOS, "dql")
-LOADABLE_MODEL_BASED_ALGOS = (*TRAINABLE_MODEL_BASED_ALGOS, "rambo")
-
-# Backward-compatible aliases used when interpreting existing manifests. New
-# training entry points must use the explicit TRAINABLE_* registries instead.
-MODEL_FREE_ALGOS = LOADABLE_MODEL_FREE_ALGOS
-MODEL_BASED_ALGOS = LOADABLE_MODEL_BASED_ALGOS
-ROBOMIMIC_TASKS = {"can", "lift", "square", "transport", "toolhang"}
+MODEL_FREE_ALGOS = ("bc", "cql", "iql", "td3bc", "edac")
+MODEL_BASED_ALGOS = ("mopo", "combo", "mobile")
+ROBOMIMIC_TASKS = {task.lower() for task in ROBOMIMIC_TASK_NAMES}
 
 MODEL_BASED_DEFAULTS = {
     "mopo": {"hidden_dims": [256, 256]},
     "combo": {"hidden_dims": [256, 256, 256], "dynamics_penalty_coef": 0.0, "cql_weight": 5.0},
     "mobile": {"hidden_dims": [256, 256], "dynamics_penalty_coef": 0.0},
-    "rambo": {"hidden_dims": [256, 256, 256], "dynamics_penalty_coef": 0.0},
 }
 
 
 def build_model_free_policy(
     algo: str,
     env: gym.Env,
-    buffer: ReplayBuffer,
+    buffer: ReplayBuffer | None,
     args: argparse.Namespace,
     discount: float,
-    dql_config: dict | None = None,
 ):
     obs_dim = int(np.prod(env.observation_space.shape))
     action_dim = int(np.prod(env.action_space.shape))
     max_action = float(env.action_space.high[0])
-
-    if algo == "dql":
-        # Keep old DQL checkpoints loadable without making CleanDiffuser a
-        # dependency of ordinary training, evaluation, or plotting imports.
-        from dql import build_dql_policy
-
-        return build_dql_policy(
-            buffer,
-            action_low=env.action_space.low,
-            action_high=env.action_space.high,
-            total_steps=args.epoch * args.step_per_epoch,
-            device=args.device,
-            discount=discount,
-            config=dql_config,
-        ), None
 
     if algo == "bc":
         actor_backbone = MLP(input_dim=obs_dim, hidden_dims=[256, 256])
@@ -151,6 +128,11 @@ def build_model_free_policy(
         return policy, scheduler
 
     if algo == "td3bc":
+        if buffer is None:
+            raise ValueError(
+                "TD3+BC requires a replay buffer with observation "
+                "normalization statistics"
+            )
         obs_mean, obs_std = buffer.normalize_obs()
         hidden_dims = args.td3bc_hidden_dims
         actor_backbone = MLP(input_dim=obs_dim, hidden_dims=hidden_dims)
@@ -207,21 +189,21 @@ def build_model_based_policy(
     env: gym.Env,
     args: argparse.Namespace,
     discount: float,
-    obs_mean: np.ndarray | None = None,
-    obs_std: np.ndarray | None = None,
     chunk_length: int = 1,
     base_discount: float = 0.99,
     dynamics_chunk_mode: str = DIRECT_DYNAMICS_MODE,
     primitive_action_dim: int | None = None,
+    build_dynamics_model: bool = True,
 ):
+    if algo not in MODEL_BASED_ALGOS:
+        raise ValueError(f"Unsupported algorithm: {algo}")
+
     obs_dim = int(np.prod(env.observation_space.shape))
     action_dim = int(np.prod(env.action_space.shape))
     effective_dynamics_mode = resolve_dynamics_chunk_mode(
         dynamics_chunk_mode, chunk_length
     )
     if effective_dynamics_mode != DIRECT_DYNAMICS_MODE:
-        if algo == "rambo":
-            raise ValueError("RAMBO does not support recursive chunk dynamics")
         if primitive_action_dim is None:
             if action_dim % chunk_length:
                 raise ValueError(
@@ -263,19 +245,19 @@ def build_model_based_policy(
         actor_lr = 3e-5 if manipulation_settings else 1e-4
     critic_lr = args.model_critic_learning_rate
     dynamics_penalty_coef = args.mopo_penalty_coef if algo == "mopo" else defaults["dynamics_penalty_coef"]
-    dynamics = build_dynamics(
-        obs_dim,
-        dynamics_action_dim,
-        env.spec.id,
-        args,
-        hidden_dims=dynamics_hidden_dims,
-        penalty_coef=dynamics_penalty_coef,
-        obs_mean=obs_mean,
-        obs_std=obs_std,
-        chunk_length=chunk_length,
-        base_discount=base_discount,
-        dynamics_chunk_mode=effective_dynamics_mode,
-    )
+    dynamics = None
+    if build_dynamics_model:
+        dynamics = build_dynamics(
+            obs_dim,
+            dynamics_action_dim,
+            env.spec.id,
+            args,
+            hidden_dims=dynamics_hidden_dims,
+            penalty_coef=dynamics_penalty_coef,
+            chunk_length=chunk_length,
+            base_discount=base_discount,
+            dynamics_chunk_mode=effective_dynamics_mode,
+        )
 
     if algo == "mobile":
         actor, actor_optim = build_prob_actor(obs_dim, action_dim, max_action, hidden_dims, args.device, actor_lr)
@@ -357,31 +339,6 @@ def build_model_based_policy(
         )
         return policy, dynamics, lr_scheduler
 
-    if algo == "rambo":
-        if obs_mean is None or obs_std is None:
-            raise ValueError("RAMBO requires observation normalization statistics.")
-        dynamics_adv_optim = torch.optim.Adam(dynamics.model.parameters(), lr=3e-4)
-        policy = RAMBOPolicy(
-            dynamics,
-            actor,
-            critic1,
-            critic2,
-            actor_optim,
-            critic1_optim,
-            critic2_optim,
-            dynamics_adv_optim,
-            tau=0.005,
-            gamma=discount,
-            alpha=alpha,
-            adv_weight=args.adv_weight,
-            adv_rollout_length=args.rollout_length,
-            adv_rollout_batch_size=args.adv_batch_size,
-            include_ent_in_adv=False,
-            scaler=StandardScaler(mu=obs_mean, std=obs_std),
-            device=args.device,
-        ).to(args.device)
-        return policy, dynamics, None
-
     raise ValueError(f"Unsupported model-based algorithm: {algo}")
 
 
@@ -392,8 +349,6 @@ def build_dynamics(
     args: argparse.Namespace,
     hidden_dims: list[int],
     penalty_coef: float,
-    obs_mean: np.ndarray | None = None,
-    obs_std: np.ndarray | None = None,
     chunk_length: int = 1,
     base_discount: float = 0.99,
     dynamics_chunk_mode: str = DIRECT_DYNAMICS_MODE,
@@ -418,8 +373,6 @@ def build_dynamics(
         termination_fn = termination_fn_inverted_double_pendulum
     else:
         termination_fn = get_termination_fn(task)
-    if obs_mean is not None and obs_std is not None:
-        termination_fn = obs_unnormalization(termination_fn, obs_mean, obs_std)
     if effective_dynamics_mode == DIRECT_DYNAMICS_MODE:
         return EnsembleDynamics(
             dynamics_model,
