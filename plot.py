@@ -3,6 +3,7 @@
 # - Average matching results across the random seeds selected by the sweep.
 # - Plot final-policy performance and contraction against action chunk length.
 # - Plot task performance and contraction against generated noisy-trajectory fractions.
+# - Plot final-policy performance against generated expert-action noise scale.
 # - Plot task performance and contraction against clean-expert/Minari fractions.
 # - Plot state and state-action conservativity over policy-training checkpoints.
 # - Plot task performance over policy-training checkpoints.
@@ -71,6 +72,7 @@ def plot_root(
         histories = select_cohort_histories(histories, rows)
     out.mkdir(parents=True, exist_ok=True)
     plot_generated_ablation(rows, out)
+    plot_noise_scale_ablation(rows, out)
     plot_clean_minari_ablation(rows, out)
 
     dataset_tags = sorted({row["plot_dataset_tag"] for row in rows} | {history["plot_dataset_tag"] for history in histories})
@@ -482,6 +484,9 @@ AXIS_SCHEMA_PATHS = {
         ("dataset", "prop_random"),
         ("dataset", "prop_expert"),
     },
+    "noise_scale": {
+        ("dataset", "noise_scale"),
+    },
     "minari_trajectory_fraction": {
         ("dataset", "source"),
         ("dataset", "dataset_id"),
@@ -750,7 +755,8 @@ def history_scalar_samples(history: dict, step: int, key: str) -> list[np.ndarra
 
 
 def plot_performance_vs_chunk_length(rows: list[dict], out: Path) -> None:
-    if len({row["chunk_length"] for row in rows}) < 2:
+    chunk_lengths = sorted({row["chunk_length"] for row in rows})
+    if len(chunk_lengths) < 2:
         return
 
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -761,6 +767,15 @@ def plot_performance_vs_chunk_length(rows: list[dict], out: Path) -> None:
         center, low, high = map(np.asarray, zip(*intervals))
         line, = ax.plot(x, center, marker="o", label=label)
         ax.fill_between(x, low, high, color=line.get_color(), alpha=0.2)
+    ax.set_xscale("log", base=2)
+    ax.set_xticks(chunk_lengths)
+    ax.set_xticklabels([
+        rf"$2^{{{chunk_length.bit_length() - 1}}}$"
+        if chunk_length > 0 and (chunk_length & (chunk_length - 1)) == 0
+        else str(chunk_length)
+        for chunk_length in chunk_lengths
+    ])
+    ax.minorticks_off()
     ax.axhline(
         np.mean([row["expert_performance_mean"] for row in rows]),
         color="black", linestyle=":", label="expert",
@@ -812,6 +827,51 @@ def plot_generated_ablation(rows: list[dict], out: Path) -> None:
         f"Final-policy {title.lower()}",
         experiment_out / "contraction_vs_noisy_fraction.png",
     )
+
+
+def plot_noise_scale_ablation(rows: list[dict], out: Path) -> None:
+    groups = {}
+    for row in rows:
+        if (
+            row["dataset_source"] != "generated"
+            or row["requested_prop_noisy_expert"] == 0.0
+        ):
+            continue
+        key = (
+            row["num_samples"],
+            row["requested_prop_clean_expert"],
+            row["requested_prop_noisy_expert"],
+            row["requested_prop_random"],
+            row["chunk_length"],
+        )
+        groups.setdefault(key, []).append(row)
+
+    for (
+        num_samples, clean, noisy, random, chunk_length
+    ), group in groups.items():
+        if len({row["noise_scale"] for row in group}) < 2:
+            continue
+        experiment_out = (
+            out / "noise_scale"
+            / (
+                f"samples{num_samples}_clean{clean:g}_noisy{noisy:g}_"
+                f"random{random:g}_chunk{chunk_length}"
+            )
+            / "final"
+        )
+        experiment_out.mkdir(parents=True, exist_ok=True)
+        title = (
+            "Gaussian action-noise scale ablation "
+            f"(clean={clean:g}, noisy={noisy:g}, random={random:g})"
+        )
+        performance_ablation_plot(
+            group,
+            title,
+            experiment_out / "performance_vs_noise_scale.png",
+            "noise_scale",
+            "Gaussian action-noise scale",
+            fraction_axis=False,
+        )
 
 
 def plot_clean_minari_ablation(rows: list[dict], out: Path) -> None:
@@ -868,6 +928,7 @@ def performance_ablation_plot(
     path: Path,
     value_key: str,
     value_label: str,
+    fraction_axis: bool = True,
 ) -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
     for label, group_rows in algorithm_groups(rows, value_key):
@@ -881,7 +942,8 @@ def performance_ablation_plot(
         np.mean([row["expert_performance_mean"] for row in rows]),
         color="black", linestyle=":", label="expert",
     )
-    ax.set_xlim(-0.02, 1.02)
+    if fraction_axis:
+        ax.set_xlim(-0.02, 1.02)
     ax.set_xlabel(value_label)
     ax.set_ylabel(rows[0]["performance_label"])
     ax.set_title(f"Final-policy {rows[0]['performance_label']}\n{title}")

@@ -737,6 +737,57 @@ class EvaluationTests(unittest.TestCase):
         finally:
             env.close()
 
+    def test_cql_loader_reconstructs_legacy_defaults_and_overrides(self):
+        env = chunking.ActionChunkWrapper(PositionEnv(), 1)
+        policy = MagicMock()
+        common = {
+            "algo": "cql",
+            "epoch": 3,
+            "step_per_epoch": 4,
+            "chunk_length": 1,
+            "macro_discount": 0.99,
+        }
+        try:
+            for cql_schema, expected_lr, expected_max, expected_mode in (
+                ({}, 1e-4, 1.0, "fixed"),
+                (
+                    {
+                        "entropy_learning_rate": 3e-4,
+                        "entropy_alpha_max": None,
+                        "lagrange_target_mode": "action-volume",
+                    },
+                    3e-4,
+                    None,
+                    "action-volume",
+                ),
+            ):
+                training_schema = {"implementation_version": 2}
+                if cql_schema:
+                    training_schema["cql"] = cql_schema
+                manifest = {**common, "training_schema": training_schema}
+                with (
+                    patch.object(
+                        evaluation,
+                        "build_model_free_policy",
+                        return_value=(policy, None),
+                    ) as builder,
+                    patch.object(evaluation.torch, "load", return_value={}),
+                ):
+                    evaluation.load_policy_and_dynamics(
+                        manifest, "cpu", Path("policy.pth"), None, {}, env
+                    )
+                build_args = builder.call_args.args[3]
+                self.assertEqual(
+                    build_args.cql_entropy_learning_rate, expected_lr
+                )
+                self.assertEqual(build_args.cql_entropy_alpha_max, expected_max)
+                self.assertEqual(
+                    build_args.cql_lagrange_target_mode, expected_mode
+                )
+                self.assertEqual(builder.call_args.kwargs["chunk_length"], 1)
+        finally:
+            env.close()
+
     def test_loader_rejects_unsupported_manifest_algorithm(self):
         manifest_data = {
             "algo": "unknown",

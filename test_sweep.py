@@ -182,6 +182,185 @@ class StorageRootTests(unittest.TestCase):
             )
 
 
+class CQLArgumentTests(unittest.TestCase):
+    def parse(self, *extra):
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "sweep.py",
+                "--env", "Lift",
+                "--dataset-source", "robomimic",
+                *extra,
+            ],
+        ):
+            return sweep.parse_args()
+
+    def test_defaults_and_robomimic_overrides(self):
+        defaults = self.parse()
+        self.assertEqual(defaults.cql_entropy_learning_rate, 1e-4)
+        self.assertEqual(defaults.cql_entropy_alpha_max, 1.0)
+        self.assertEqual(defaults.cql_lagrange_target_mode, "action-volume")
+
+        overrides = self.parse(
+            "--cql-entropy-learning-rate", "3e-4",
+            "--cql-entropy-alpha-max", "none",
+            "--cql-lagrange-target-mode", "fixed",
+        )
+        self.assertEqual(overrides.cql_entropy_learning_rate, 3e-4)
+        self.assertIsNone(overrides.cql_entropy_alpha_max)
+        self.assertEqual(overrides.cql_lagrange_target_mode, "fixed")
+
+    def test_rejects_invalid_values(self):
+        for value in ("0", "-1", "nan", "inf"):
+            with self.subTest(argument="learning-rate", value=value), self.assertRaises(SystemExit):
+                self.parse("--cql-entropy-learning-rate", value)
+            with self.subTest(argument="alpha-max", value=value), self.assertRaises(SystemExit):
+                self.parse("--cql-entropy-alpha-max", value)
+        with self.assertRaises(SystemExit):
+            self.parse("--cql-lagrange-target-mode", "unknown")
+
+    def test_default_and_explicit_values_have_identical_schema(self):
+        defaults = self.parse()
+        explicit = self.parse(
+            "--cql-entropy-learning-rate", "1e-4",
+            "--cql-entropy-alpha-max", "1.0",
+            "--cql-lagrange-target-mode", "action-volume",
+        )
+        defaults.seed = explicit.seed = 0
+
+        default_schema = sweep.make_training_schema(
+            "cql", "Lift", {"source": "test"}, 1, defaults
+        )
+        explicit_schema = sweep.make_training_schema(
+            "cql", "Lift", {"source": "test"}, 1, explicit
+        )
+
+        self.assertEqual(explicit_schema, default_schema)
+        self.assertEqual(
+            default_schema["cql"],
+            {"lagrange_target_mode": "action-volume"},
+        )
+        self.assertEqual(default_schema["implementation_version"], 2)
+
+    def test_fixed_target_preserves_legacy_cql_schema(self):
+        args = self.parse("--cql-lagrange-target-mode", "fixed")
+        args.seed = 0
+
+        schema = sweep.make_training_schema(
+            "cql", "Lift", {"source": "test"}, 4, args
+        )
+
+        self.assertNotIn("cql", schema)
+        self.assertEqual(schema["implementation_version"], 2)
+
+    def test_target_mode_is_recorded_only_for_lagrange_cql(self):
+        args = self.parse()
+        args.seed = 0
+
+        lift_schemas = [
+            sweep.make_training_schema(
+                "cql", "Lift", {"source": "test"}, chunk_length, args
+            )
+            for chunk_length in (1, 4)
+        ]
+        self.assertEqual(
+            [schema["cql"]["lagrange_target_mode"] for schema in lift_schemas],
+            ["action-volume", "action-volume"],
+        )
+        reacher_schema = sweep.make_training_schema(
+            "cql", "Reacher-v5", {"source": "test"}, 4, args
+        )
+        self.assertNotIn("cql", reacher_schema)
+
+    def test_nondefault_values_are_cql_only_training_identity(self):
+        defaults = self.parse()
+        overrides = self.parse(
+            "--cql-entropy-learning-rate", "3e-4",
+            "--cql-entropy-alpha-max", "none",
+        )
+        defaults.seed = overrides.seed = 0
+
+        cql_schema = sweep.make_training_schema(
+            "cql", "Lift", {"source": "test"}, 1, overrides
+        )
+        self.assertEqual(
+            cql_schema["cql"],
+            {
+                "entropy_learning_rate": 3e-4,
+                "entropy_alpha_max": None,
+                "lagrange_target_mode": "action-volume",
+            },
+        )
+        fixed = self.parse("--cql-lagrange-target-mode", "fixed")
+        fixed.seed = 0
+        for algo in (*sweep.MODEL_FREE_ALGOS, *sweep.MODEL_BASED_ALGOS):
+            if algo == "cql":
+                continue
+            with self.subTest(algo=algo):
+                self.assertEqual(
+                    sweep.make_training_schema(
+                        algo, "Lift", {"source": "test"}, 1, overrides
+                    ),
+                    sweep.make_training_schema(
+                        algo, "Lift", {"source": "test"}, 1, defaults
+                    ),
+                )
+                self.assertEqual(
+                    sweep.make_training_schema(
+                        algo, "Lift", {"source": "test"}, 1, fixed
+                    ),
+                    sweep.make_training_schema(
+                        algo, "Lift", {"source": "test"}, 1, defaults
+                    ),
+                )
+
+    def test_default_request_discovers_existing_default_cql_schema(self):
+        args = self.parse()
+        args.seed = 0
+        schema = sweep.make_training_schema(
+            "cql", "Lift", {"source": "test"}, 1, args
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "existing-run"
+            run_dir.mkdir()
+            (run_dir / "run_manifest.json").write_text(
+                json.dumps({"training_schema": schema}), encoding="utf-8"
+            )
+            with patch("sweep.run_is_complete", return_value=True):
+                self.assertEqual(
+                    sweep.find_trained_run(Path(directory), schema),
+                    run_dir,
+                )
+
+    def test_adjusted_target_does_not_reuse_legacy_fixed_cql(self):
+        adjusted_args = self.parse()
+        fixed_args = self.parse("--cql-lagrange-target-mode", "fixed")
+        adjusted_args.seed = fixed_args.seed = 0
+        adjusted_schema = sweep.make_training_schema(
+            "cql", "Lift", {"source": "test"}, 4, adjusted_args
+        )
+        fixed_schema = sweep.make_training_schema(
+            "cql", "Lift", {"source": "test"}, 4, fixed_args
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "legacy-fixed-run"
+            run_dir.mkdir()
+            (run_dir / "run_manifest.json").write_text(
+                json.dumps({"training_schema": fixed_schema}), encoding="utf-8"
+            )
+            with patch("sweep.run_is_complete", return_value=True):
+                self.assertIsNone(
+                    sweep.find_trained_run(Path(directory), adjusted_schema)
+                )
+                self.assertEqual(
+                    sweep.find_trained_run(Path(directory), fixed_schema),
+                    run_dir,
+                )
+
+
 class MobileShiftArgumentTests(unittest.TestCase):
     def parse(self, *extra):
         with patch.object(sys, "argv", ["sweep.py", "--env", "Reacher-v5", *extra]):

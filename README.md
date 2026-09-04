@@ -33,7 +33,19 @@ All datasets are split by complete episode. Minari episodes, robomimic demonstra
 
 Robomimic Lift uses continuing-task semantics: success annotations are not Bellman terminals, demonstration endpoints are timeouts, and model-generated transitions do not terminate at success. These datasets and runs use a `_continuing` tag so they cannot be confused with or reuse older terminal-Lift artifacts. Other environments retain their existing termination semantics.
 
-Generated datasets can mix clean expert, noisy expert, and random-action episodes. Pass `--composition CLEAN_EXPERT NOISY_EXPERT`; random data fills the remaining proportion. Repeat the argument to sweep specified compositions without taking a Cartesian product between their two values. `--noise-scale` applies only to the noisy expert component, while clean expert actions use zero noise. The default composition is `1 0`.
+Generated datasets can mix clean expert, noisy expert, and random-action episodes. Pass `--composition CLEAN_EXPERT NOISY_EXPERT`; random data fills the remaining proportion. Repeat the argument to sweep specified compositions without taking a Cartesian product between their two values. Pass multiple `--noise-scale` values to sweep the Gaussian noise applied to the noisy-expert component while keeping each requested composition fixed. Each action coordinate receives standard deviation `noise_scale / sqrt(action_dimension)` before clipping to the action space; clean expert actions use zero noise. The default composition is `1 0`.
+
+For example, this evaluates a pure noisy-expert dataset at five noise scales, including the clean-action endpoint at scale zero:
+
+```bash
+python sweep.py \
+  --env HalfCheetah-v5 \
+  --dataset-source generated \
+  --composition 0 1 \
+  --noise-scale 0 0.05 0.1 0.2 0.5 \
+  --algos cql iql mopo mobile \
+  --eval
+```
 
 Use `--dataset-source clean-minari --dataset DATASET` to ablate between clean expert trajectories and one Minari quality dataset. `--minari-fraction` defaults to `0 0.25 0.5 0.75 1`; fractions allocate complete trajectories, and Minari episodes are selected from a seeded permutation without replacement. A request that needs more Minari episodes or transitions than the source contains fails instead of duplicating data. The 0% endpoint reuses an existing generated-clean dataset and model when its environment, expert, horizon, sample count, seed, split, and training settings match; the irrelevant historical clean-dataset `noise_scale` may differ.
 
@@ -49,6 +61,26 @@ python sweep.py \
 ```
 
 MOBILE on `Reacher-v5` uses a shifted zero clamp for its critic targets. `--mobile-return-shift D` defaults to `30`: the critics are initialized with `+D`, each macro reward receives `(1 - macro_discount) * D`, and clamping at zero in shifted units is equivalent to a target floor of `-D` in the original units. The option is ignored by other environments, whose MOBILE behavior is unchanged.
+
+CQL exposes `--cql-entropy-learning-rate` (default `1e-4`) and
+`--cql-entropy-alpha-max` (default `1.0`) for its automatically tuned entropy
+coefficient. Pass `--cql-entropy-alpha-max none` to remove the upper clamp.
+For CQL on Lift and Can, `--cql-lagrange-target-mode action-volume` is the
+default. It changes the legacy Lagrange target `tau_1 = 5` to
+
+```text
+tau_H = tau_1 + cql_weight * (log volume(A_H) - log volume(A_1)).
+```
+
+The action-chunk wrapper tiles the primitive Box bounds, so Lift's seven
+coordinates in `[-1, 1]` give `tau_H = 5 + 7(H - 1) log(2)`. This removes the
+known uniform-action log-density growth from the target scale; it is a
+normalization hypothesis, not an exact dimension-invariance result for CQL's
+full mixed-proposal log-sum-exp. Use `--cql-lagrange-target-mode fixed` to keep
+the legacy target `5`. Old CQL manifests without this field reconstruct as
+`fixed`, while new action-volume runs record the mode at every chunk length so
+one plotting series has a consistent configuration. The option is ignored by
+non-CQL algorithms and by CQL on tasks where Lagrange tuning is disabled.
 
 `DATASET_SCHEMA_VERSION` and `TRAINING_SCHEMA_VERSION` in `sweep.py` invalidate cached artifacts when dataset conversion or training behavior changes without a corresponding CLI change. Increment the relevant value when making such a change; evaluation-only edits require neither increment.
 
@@ -89,7 +121,7 @@ Final-policy contraction pairs deterministic rollouts from the same simulator st
 
 State and state-action OOD ratios are evaluated over checkpoints. Each is the mean rollout-to-training k-nearest-neighbor distance divided by the corresponding held-out-to-training distance, so a ratio near one means rollout samples are about as far from training data as held-out samples are.
 
-For Robomimic datasets, final-policy plots compare task performance and contraction curves across action chunk lengths. For generated datasets, they compare those metrics against the realized fraction of complete trajectories collected from the noisy expert. A fixed random fraction gives the clean-expert/noisy-expert ablation; zero clean-expert fraction gives the random/noisy-expert ablation. Clean-Minari sweeps plot the same metrics against the realized Minari trajectory fraction, separately for each Minari dataset, sample count, and chunk length. Each plotter reads only its own source-specific metadata; generating one family no longer deletes unrelated existing plots. Performance and OOD ratios are also plotted against training percent. Lines are exact means with shaded hierarchical-bootstrap 10th-90th percentile bands: seeds and episodes are resampled for performance, while seeds and trajectory pairs are resampled for contraction. A one-seed run still uses episode or trajectory-pair variability; milestone OOD bands require multiple seeds because only one OOD estimate is saved per seed and checkpoint. Raw arrays are saved under the matching `<storage-root>/evals/<environment>/<run-name>/<training-timestamp>/` directory, and plots are written under `<storage-root>/evals/<environment>/plots/`.
+For Robomimic datasets, final-policy plots compare task performance and contraction curves across action chunk lengths. For generated datasets, they compare those metrics against the realized fraction of complete trajectories collected from the noisy expert. A fixed random fraction gives the clean-expert/noisy-expert ablation; zero clean-expert fraction gives the random/noisy-expert ablation. A generated run with multiple noise scales also plots final-policy performance against requested noise scale, separately for every fixed sample count, requested composition, and chunk length, under `plots/noise_scale/`. Clean-Minari sweeps plot the same metrics against the realized Minari trajectory fraction, separately for each Minari dataset, sample count, and chunk length. Each plotter reads only its own source-specific metadata; generating one family no longer deletes unrelated existing plots. Performance and OOD ratios are also plotted against training percent. Lines are exact means with shaded hierarchical-bootstrap 10th-90th percentile bands: seeds and episodes are resampled for performance, while seeds and trajectory pairs are resampled for contraction. A one-seed run still uses episode or trajectory-pair variability; milestone OOD bands require multiple seeds because only one OOD estimate is saved per seed and checkpoint. Raw arrays are saved under the matching `<storage-root>/evals/<environment>/<run-name>/<training-timestamp>/` directory, and plots are written under `<storage-root>/evals/<environment>/plots/`.
 
 When plotting an environment's full result history, pass `python plot.py --root /data/shekhe/stable-offline-rl/evals/<environment> --cohort <cohort.json>` to select explicit series. Each `match` key is a dotted path within `training_schema`; matched parameters are appended to the plot label. For example, this cohort deliberately plots two MOBILE variants as `mobile (real ratio=0.00)` and `mobile (real ratio=0.50)`:
 

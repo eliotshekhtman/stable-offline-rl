@@ -234,6 +234,44 @@ class DynamicsChunkModePlotTests(unittest.TestCase):
         plot.plt.close(figure)
 
 
+class ChunkLengthAxisTests(unittest.TestCase):
+    @patch("plot.final_performance_samples", return_value=[np.ones(2)])
+    def test_performance_plot_uses_log2_axis_and_labels(self, _samples):
+        chunk_lengths = (1, 2, 4, 6, 8)
+        rows = [
+            {
+                "algo": "iql",
+                "chunk_length": chunk_length,
+                "training_schema": {
+                    "algo": "iql",
+                    "chunk_length": chunk_length,
+                },
+                "expert_performance_mean": 1.0,
+                "performance_label": "success rate",
+            }
+            for chunk_length in chunk_lengths
+        ]
+        figure, axis = plot.plt.subplots()
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "plot.plt.subplots", return_value=(figure, axis)
+        ), patch("plot.plt.close"):
+            plot.plot_performance_vs_chunk_length(rows, Path(directory))
+
+        self.assertEqual(axis.get_xscale(), "log")
+        np.testing.assert_array_equal(axis.get_xticks(), chunk_lengths)
+        self.assertEqual(
+            [tick.get_text() for tick in axis.get_xticklabels()],
+            [r"$2^{0}$", r"$2^{1}$", r"$2^{2}$", "6", r"$2^{3}$"],
+        )
+        np.testing.assert_array_equal(axis.lines[0].get_xdata(), chunk_lengths)
+        np.testing.assert_allclose(
+            axis.xaxis.get_transform().transform(np.asarray([1, 2, 4, 8])),
+            [0, 1, 2, 3],
+        )
+        self.assertEqual(len(axis.xaxis.get_minorticklocs()), 0)
+        plot.plt.close(figure)
+
+
 class PlotCohortTests(unittest.TestCase):
     @staticmethod
     def record(
@@ -464,6 +502,116 @@ class PlotCohortTests(unittest.TestCase):
             histories[0]["label"],
             "mobile (l=4, real ratio=0.00)",
         )
+
+
+class NoiseScalePlotTests(unittest.TestCase):
+    @staticmethod
+    def row(noise_scale, chunk_length=1, noisy=1.0, epoch=300):
+        clean = 1.0 - noisy
+        return {
+            "dataset_source": "generated",
+            "algo": "iql",
+            "chunk_length": chunk_length,
+            "num_samples": 1000,
+            "noise_scale": noise_scale,
+            "requested_prop_clean_expert": clean,
+            "requested_prop_noisy_expert": noisy,
+            "requested_prop_random": 0.0,
+            "training_schema": {
+                "algo": "iql",
+                "chunk_length": chunk_length,
+                "epoch": epoch,
+                "dataset": {
+                    "source": "generated",
+                    "num_samples": 1000,
+                    "noise_scale": noise_scale,
+                    "prop_clean_expert": clean,
+                    "prop_noisy_expert": noisy,
+                    "prop_random": 0.0,
+                    "prop_expert": 1.0,
+                },
+            },
+        }
+
+    def test_noise_scale_is_the_only_training_schema_axis(self):
+        rows = [self.row(scale) for scale in (0.0, 0.5, 1.0)]
+
+        self.assertEqual(len(plot.algorithm_groups(rows, "noise_scale")), 1)
+
+        rows[-1]["training_schema"]["epoch"] = 100
+        with self.assertRaisesRegex(
+            ValueError, "non-axis training parameters.*epoch"
+        ):
+            plot.algorithm_groups(rows, "noise_scale")
+
+    @patch("plot.performance_ablation_plot")
+    def test_noise_scale_plot_is_split_by_fixed_dataset_and_chunk(
+        self, performance_plot
+    ):
+        rows = [
+            self.row(scale, chunk_length=chunk_length)
+            for chunk_length in (1, 4)
+            for scale in (0.0, 0.5)
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            plot.plot_noise_scale_ablation(rows, Path(directory))
+
+        self.assertEqual(performance_plot.call_count, 2)
+        paths = {call.args[2] for call in performance_plot.call_args_list}
+        self.assertEqual(paths, {
+            Path(directory)
+            / "noise_scale/samples1000_clean0_noisy1_random0_chunk1/final"
+            / "performance_vs_noise_scale.png",
+            Path(directory)
+            / "noise_scale/samples1000_clean0_noisy1_random0_chunk4/final"
+            / "performance_vs_noise_scale.png",
+        })
+        for call in performance_plot.call_args_list:
+            self.assertEqual(
+                call.args[3:5],
+                ("noise_scale", "Gaussian action-noise scale"),
+            )
+            self.assertFalse(call.kwargs["fraction_axis"])
+
+    @patch("plot.performance_ablation_plot")
+    def test_noise_scale_plot_requires_multiple_scales_and_a_noisy_component(
+        self, performance_plot
+    ):
+        plot.plot_noise_scale_ablation([self.row(0.5)], Path("unused"))
+        plot.plot_noise_scale_ablation(
+            [self.row(scale, noisy=0.0) for scale in (0.0, 0.5)],
+            Path("unused"),
+        )
+
+        performance_plot.assert_not_called()
+
+    @patch("plot.final_performance_samples", return_value=[np.ones(2)])
+    def test_noise_scale_plot_does_not_use_fraction_axis_limits(self, _samples):
+        rows = []
+        for scale in (0.0, 2.0):
+            row = self.row(scale)
+            row.update({
+                "seed_rows": [{}],
+                "expert_performance_mean": 1.0,
+                "performance_label": "forward displacement",
+            })
+            rows.append(row)
+        figure, axis = plot.plt.subplots()
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "plot.plt.subplots", return_value=(figure, axis)
+        ), patch("plot.plt.close"):
+            plot.performance_ablation_plot(
+                rows,
+                "noise scale",
+                Path(directory) / "plot.png",
+                "noise_scale",
+                "Gaussian action-noise scale",
+                fraction_axis=False,
+            )
+
+        self.assertGreater(axis.get_xlim()[1], 2.0)
+        plot.plt.close(figure)
 
 
 class CleanMinariPlotTests(unittest.TestCase):

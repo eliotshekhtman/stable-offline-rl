@@ -29,6 +29,15 @@ from task_support import ROBOMIMIC_TASKS as ROBOMIMIC_TASK_NAMES
 MODEL_FREE_ALGOS = ("bc", "cql", "iql", "td3bc", "edac")
 MODEL_BASED_ALGOS = ("mopo", "combo", "mobile")
 ROBOMIMIC_TASKS = {task.lower() for task in ROBOMIMIC_TASK_NAMES}
+CQL_DEFAULT_ENTROPY_LEARNING_RATE = 1e-4
+CQL_DEFAULT_ENTROPY_ALPHA_MAX = 1.0
+CQL_FIXED_LAGRANGE_TARGET_MODE = "fixed"
+CQL_ACTION_VOLUME_LAGRANGE_TARGET_MODE = "action-volume"
+CQL_LAGRANGE_TARGET_MODES = (
+    CQL_FIXED_LAGRANGE_TARGET_MODE,
+    CQL_ACTION_VOLUME_LAGRANGE_TARGET_MODE,
+)
+CQL_DEFAULT_LAGRANGE_TARGET_MODE = CQL_ACTION_VOLUME_LAGRANGE_TARGET_MODE
 
 MODEL_BASED_DEFAULTS = {
     "mopo": {"hidden_dims": [256, 256]},
@@ -43,6 +52,7 @@ def build_model_free_policy(
     buffer: ReplayBuffer | None,
     args: argparse.Namespace,
     discount: float,
+    chunk_length: int = 1,
 ):
     obs_dim = int(np.prod(env.observation_space.shape))
     action_dim = int(np.prod(env.action_space.shape))
@@ -66,7 +76,32 @@ def build_model_free_policy(
             for head in (actor.dist_net.mu, actor.dist_net.sigma):
                 torch.nn.init.uniform_(head.weight, -1e-3, 1e-3)
                 torch.nn.init.uniform_(head.bias, -1e-3, 1e-3)
-        alpha = build_auto_alpha(action_dim, args.device, 1e-4)
+        entropy_learning_rate = getattr(
+            args,
+            "cql_entropy_learning_rate",
+            CQL_DEFAULT_ENTROPY_LEARNING_RATE,
+        )
+        entropy_alpha_max = getattr(
+            args,
+            "cql_entropy_alpha_max",
+            CQL_DEFAULT_ENTROPY_ALPHA_MAX,
+        )
+        lagrange_threshold = 10.0
+        if is_robomimic:
+            lagrange_threshold = cql_lagrange_threshold(
+                env.action_space,
+                chunk_length,
+                base_threshold=5.0,
+                cql_weight=1.0,
+                mode=getattr(
+                    args,
+                    "cql_lagrange_target_mode",
+                    CQL_DEFAULT_LAGRANGE_TARGET_MODE,
+                ),
+            )
+        alpha = build_auto_alpha(
+            action_dim, args.device, entropy_learning_rate
+        )
         return CQLPolicy(
             actor,
             critic1,
@@ -83,9 +118,10 @@ def build_model_free_policy(
             max_q_backup=False,
             deterministic_backup=True,
             with_lagrange=is_robomimic,
-            lagrange_threshold=5.0 if is_robomimic else 10.0,
+            lagrange_threshold=lagrange_threshold,
             cql_alpha_lr=1e-3 if is_robomimic else 3e-4,
             num_repeart_actions=10,
+            entropy_alpha_max=entropy_alpha_max,
         ), None
 
     if algo == "iql":
@@ -182,6 +218,59 @@ def build_model_free_policy(
         ), None
 
     raise ValueError(f"Unsupported algorithm: {algo}")
+
+
+def cql_lagrange_threshold(
+    action_space: gym.spaces.Space,
+    chunk_length: int,
+    base_threshold: float,
+    cql_weight: float,
+    mode: str,
+) -> float:
+    """Return CQL's Lagrange target on a comparable action-volume scale."""
+    if mode not in CQL_LAGRANGE_TARGET_MODES:
+        raise ValueError(
+            f"Unsupported CQL Lagrange target mode {mode!r}; expected one of "
+            f"{CQL_LAGRANGE_TARGET_MODES}."
+        )
+    if mode == CQL_FIXED_LAGRANGE_TARGET_MODE:
+        return float(base_threshold)
+    if (
+        isinstance(chunk_length, bool)
+        or not isinstance(chunk_length, (int, np.integer))
+        or chunk_length < 1
+    ):
+        raise ValueError("chunk_length must be a positive integer.")
+    chunk_length = int(chunk_length)
+    if not isinstance(action_space, gym.spaces.Box):
+        raise TypeError("Action-volume CQL targets require a Box action space.")
+
+    widths = (
+        np.asarray(action_space.high, dtype=np.float64).reshape(-1)
+        - np.asarray(action_space.low, dtype=np.float64).reshape(-1)
+    )
+    if widths.size % chunk_length:
+        raise ValueError(
+            f"Chunk action dimension {widths.size} is not divisible by "
+            f"chunk length {chunk_length}."
+        )
+    if not np.all(np.isfinite(widths)) or np.any(widths <= 0.0):
+        raise ValueError(
+            "Action-volume CQL targets require finite, positive Box widths."
+        )
+
+    primitive_dim = widths.size // chunk_length
+    primitive_widths = widths[:primitive_dim]
+    if not np.array_equal(widths, np.tile(primitive_widths, chunk_length)):
+        raise ValueError(
+            "Action-volume CQL targets require the chunk action bounds to be "
+            "tiled copies of the primitive action bounds."
+        )
+
+    added_log_volume = float(
+        np.log(widths).sum() - np.log(primitive_widths).sum()
+    )
+    return float(base_threshold + cql_weight * added_log_volume)
 
 
 def build_model_based_policy(

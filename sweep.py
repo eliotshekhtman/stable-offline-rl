@@ -31,6 +31,11 @@ from offlinerlkit.buffer import ReplayBuffer
 from offlinerlkit.policy_trainer import MBPolicyTrainer, MFPolicyTrainer
 from offlinerlkit.utils.logger import Logger
 from policies import (
+    CQL_ACTION_VOLUME_LAGRANGE_TARGET_MODE,
+    CQL_DEFAULT_ENTROPY_ALPHA_MAX,
+    CQL_DEFAULT_ENTROPY_LEARNING_RATE,
+    CQL_DEFAULT_LAGRANGE_TARGET_MODE,
+    CQL_LAGRANGE_TARGET_MODES,
     MODEL_BASED_ALGOS,
     MODEL_FREE_ALGOS,
     build_model_based_policy,
@@ -42,6 +47,22 @@ DEFAULT_STORAGE_ROOT = Path("/data/shekhe/stable-offline-rl")
 DATASET_SCHEMA_VERSION = 4
 TRAINING_SCHEMA_VERSION = 3
 BASE_DISCOUNT = 0.99
+
+
+def positive_float_or_none(value: str) -> float | None:
+    if value.lower() == "none":
+        return None
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            f"expected a positive finite float or 'none', got {value!r}"
+        ) from error
+    if not math.isfinite(parsed) or parsed <= 0.0:
+        raise argparse.ArgumentTypeError(
+            f"expected a positive finite float or 'none', got {value!r}"
+        )
+    return parsed
 
 
 def prepare_storage_root(storage_root: Path) -> None:
@@ -105,7 +126,14 @@ def parse_args() -> argparse.Namespace:
     generated = parser.add_argument_group("generated and clean-Minari dataset options")
     generated.add_argument("--expert", default="/home/shekhe/stable-offline-rl/experts", help="Expert policy .zip path or directory containing <env>.zip; used for generated or clean-Minari expert trajectories and expert evaluation")
     generated.add_argument("--num-samples", type=int, nargs="+", default=[1000000], help="Minimum transition counts for generated and clean-minari datasets; collection always retains complete trajectories")
-    generated.add_argument("--noise-scale", type=float, nargs="+", default=[0.0], help="Gaussian action-noise scales applied to noisy expert actions in generated datasets")
+    generated.add_argument(
+        "--noise-scale", type=float, nargs="+", default=[0.0],
+        help=(
+            "Gaussian action-noise scales to sweep for generated noisy-expert "
+            "trajectories; each action coordinate uses standard deviation "
+            "scale / sqrt(action dimension)"
+        ),
+    )
     generated.add_argument(
         "--composition", type=float, nargs=2, action="append", metavar=("CLEAN_EXPERT", "NOISY_EXPERT"),
         help="Generated-data clean and noisy expert trajectory proportions; repeat for multiple compositions, with random trajectories filling the remainder (default: 1 0)",
@@ -127,6 +155,33 @@ def parse_args() -> argparse.Namespace:
     training.add_argument("--epoch", type=int, default=1000, help="Number of policy-training epochs")
     training.add_argument("--step-per-epoch", type=int, default=1000, help="Gradient-update steps per policy-training epoch")
     training.add_argument("--batch-size", type=int, default=512, help="Policy-training batch size")
+
+    cql = parser.add_argument_group("CQL options")
+    cql.add_argument(
+        "--cql-entropy-learning-rate",
+        type=float,
+        default=CQL_DEFAULT_ENTROPY_LEARNING_RATE,
+        help="Learning rate for CQL's automatically tuned entropy coefficient",
+    )
+    cql.add_argument(
+        "--cql-entropy-alpha-max",
+        type=positive_float_or_none,
+        default=CQL_DEFAULT_ENTROPY_ALPHA_MAX,
+        help=(
+            "Upper bound for CQL's automatically tuned entropy coefficient; "
+            "use 'none' for no upper bound"
+        ),
+    )
+    cql.add_argument(
+        "--cql-lagrange-target-mode",
+        choices=CQL_LAGRANGE_TARGET_MODES,
+        default=CQL_DEFAULT_LAGRANGE_TARGET_MODE,
+        help=(
+            "Lagrange target for CQL on Robomimic tasks: action-volume adds "
+            "the chunk's extra log Box volume to the legacy fixed target; "
+            "fixed preserves the legacy target of 5"
+        ),
+    )
 
     iql = parser.add_argument_group("IQL options")
     iql.add_argument("--iql-temperature", type=float, default=3.0, help="IQL advantage-weighting temperature; larger values favor higher-advantage dataset actions more strongly")
@@ -177,6 +232,11 @@ def parse_args() -> argparse.Namespace:
         parser.error(str(error))
     if any(chunk_length <= 0 for chunk_length in args.chunk_lengths):
         parser.error("--chunk-lengths values must be positive")
+    if (
+        not math.isfinite(args.cql_entropy_learning_rate)
+        or args.cql_entropy_learning_rate <= 0.0
+    ):
+        parser.error("--cql-entropy-learning-rate must be a positive finite float")
     if args.iql_temperature <= 0.0:
         parser.error("--iql-temperature must be positive")
     if not 0.0 < args.iql_expectile < 1.0:
@@ -842,6 +902,38 @@ def make_training_schema(
             "alpha": args.td3bc_alpha,
             "hidden_dims": args.td3bc_hidden_dims,
         }
+    if algo == "cql":
+        entropy_learning_rate = getattr(
+            args,
+            "cql_entropy_learning_rate",
+            CQL_DEFAULT_ENTROPY_LEARNING_RATE,
+        )
+        entropy_alpha_max = getattr(
+            args,
+            "cql_entropy_alpha_max",
+            CQL_DEFAULT_ENTROPY_ALPHA_MAX,
+        )
+        lagrange_target_mode = getattr(
+            args,
+            "cql_lagrange_target_mode",
+            CQL_DEFAULT_LAGRANGE_TARGET_MODE,
+        )
+        cql_schema = {}
+        if (
+            entropy_learning_rate != CQL_DEFAULT_ENTROPY_LEARNING_RATE
+            or entropy_alpha_max != CQL_DEFAULT_ENTROPY_ALPHA_MAX
+        ):
+            cql_schema.update(
+                entropy_learning_rate=entropy_learning_rate,
+                entropy_alpha_max=entropy_alpha_max,
+            )
+        if (
+            env_name in task_support.ROBOMIMIC_TASKS
+            and lagrange_target_mode == CQL_ACTION_VOLUME_LAGRANGE_TARGET_MODE
+        ):
+            cql_schema["lagrange_target_mode"] = lagrange_target_mode
+        if cql_schema:
+            schema["cql"] = cql_schema
     if algo == "mopo" and args.mopo_penalty_coef != 0.5:
         schema["mopo"] = {"penalty_coef": args.mopo_penalty_coef}
     if algo == "mobile":
@@ -1025,6 +1117,7 @@ def train_algo(
             policy, lr_scheduler = build_model_free_policy(
                 algo, eval_env, buffer, args,
                 discount=macro_discount,
+                **({"chunk_length": chunk_length} if algo == "cql" else {}),
             )
             trainer = MFPolicyTrainer(
                 policy=policy,

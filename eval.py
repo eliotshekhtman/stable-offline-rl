@@ -27,7 +27,15 @@ import load_offline
 import rollout
 import task_support
 from chunked_dynamics import DIRECT_DYNAMICS_MODE, resolve_dynamics_chunk_mode
-from policies import MODEL_BASED_ALGOS, MODEL_FREE_ALGOS, build_model_based_policy, build_model_free_policy
+from policies import (
+    CQL_DEFAULT_ENTROPY_ALPHA_MAX,
+    CQL_DEFAULT_ENTROPY_LEARNING_RATE,
+    CQL_FIXED_LAGRANGE_TARGET_MODE,
+    MODEL_BASED_ALGOS,
+    MODEL_FREE_ALGOS,
+    build_model_based_policy,
+    build_model_free_policy,
+)
 
 
 EVALUATION_SCHEMA_VERSION = 2
@@ -320,6 +328,17 @@ def load_policy_and_dynamics(
         build_args.td3bc_learning_rate = td3bc["learning_rate"]
         build_args.td3bc_alpha = td3bc["alpha"]
         build_args.td3bc_hidden_dims = td3bc["hidden_dims"]
+    elif manifest["algo"] == "cql":
+        cql = manifest["training_schema"].get("cql", {})
+        build_args.cql_entropy_learning_rate = cql.get(
+            "entropy_learning_rate", CQL_DEFAULT_ENTROPY_LEARNING_RATE
+        )
+        build_args.cql_entropy_alpha_max = cql.get(
+            "entropy_alpha_max", CQL_DEFAULT_ENTROPY_ALPHA_MAX
+        )
+        build_args.cql_lagrange_target_mode = cql.get(
+            "lagrange_target_mode", CQL_FIXED_LAGRANGE_TARGET_MODE
+        )
 
     if manifest["algo"] in MODEL_BASED_ALGOS:
         chunk_length = manifest["chunk_length"]
@@ -361,9 +380,11 @@ def load_policy_and_dynamics(
             buffer = argparse.Namespace(
                 normalize_obs=lambda: (obs_mean, obs_std)
             )
+        builder_kwargs = {"discount": manifest["macro_discount"]}
+        if manifest["algo"] == "cql":
+            builder_kwargs["chunk_length"] = manifest["chunk_length"]
         policy, _ = build_model_free_policy(
-            manifest["algo"], env, buffer, build_args,
-            discount=manifest["macro_discount"],
+            manifest["algo"], env, buffer, build_args, **builder_kwargs
         )
         dynamics = None
     else:

@@ -90,12 +90,244 @@ class MobileShiftTests(unittest.TestCase):
         )
         self.assertEqual(policies.ROBOMIMIC_TASKS, {"can", "lift"})
 
+    def test_cql_action_volume_target_matches_tiled_box_formula(self):
+        expected_lift_targets = {
+            1: 5.0,
+            2: 9.852030263919616,
+            4: 19.556090791758852,
+            8: 38.96421184743732,
+            16: 77.78045395879425,
+        }
+        for chunk_length, expected in expected_lift_targets.items():
+            with self.subTest(chunk_length=chunk_length):
+                action_space = gym.spaces.Box(
+                    -1.0, 1.0, shape=(7 * chunk_length,)
+                )
+                actual = policies.cql_lagrange_threshold(
+                    action_space,
+                    chunk_length,
+                    base_threshold=5.0,
+                    cql_weight=1.0,
+                    mode="action-volume",
+                )
+                self.assertAlmostEqual(actual, expected)
+
+        primitive_low = np.array([-2.0, -1.0], dtype=np.float32)
+        primitive_high = np.array([2.0, 1.0], dtype=np.float32)
+        action_space = gym.spaces.Box(
+            np.tile(primitive_low, 3), np.tile(primitive_high, 3)
+        )
+        self.assertAlmostEqual(
+            policies.cql_lagrange_threshold(
+                action_space,
+                3,
+                base_threshold=5.0,
+                cql_weight=2.0,
+                mode="action-volume",
+            ),
+            13.317766166719343,
+        )
+
+    def test_cql_action_volume_target_validates_chunk_box(self):
+        invalid_spaces = (
+            (gym.spaces.Box(-1.0, 1.0, shape=(5,)), 2, "not divisible"),
+            (
+                gym.spaces.Box(
+                    low=np.array([-1.0, -1.0, -1.0, -1.0], dtype=np.float32),
+                    high=np.array([1.0, 2.0, 1.0, 1.0], dtype=np.float32),
+                ),
+                2,
+                "tiled copies",
+            ),
+            (
+                gym.spaces.Box(
+                    low=np.array([-1.0, -1.0], dtype=np.float32),
+                    high=np.array([np.inf, 1.0], dtype=np.float32),
+                ),
+                1,
+                "finite, positive",
+            ),
+        )
+        for action_space, chunk_length, message in invalid_spaces:
+            with self.subTest(message=message), self.assertRaisesRegex(
+                ValueError, message
+            ):
+                policies.cql_lagrange_threshold(
+                    action_space,
+                    chunk_length,
+                    base_threshold=5.0,
+                    cql_weight=1.0,
+                    mode="action-volume",
+                )
+
+    def test_cql_target_mode_changes_only_chunked_lagrange_target(self):
+        torch.manual_seed(17)
+        fixed_policy, _ = policies.build_model_free_policy(
+            "cql",
+            DummyEnv("Lift", action_dim=7),
+            None,
+            SimpleNamespace(device="cpu", cql_lagrange_target_mode="fixed"),
+            discount=0.99,
+            chunk_length=1,
+        )
+        torch.manual_seed(17)
+        adjusted_policy, _ = policies.build_model_free_policy(
+            "cql",
+            DummyEnv("Lift", action_dim=7),
+            None,
+            SimpleNamespace(
+                device="cpu", cql_lagrange_target_mode="action-volume"
+            ),
+            discount=0.99,
+            chunk_length=1,
+        )
+        self.assertEqual(fixed_policy._lagrange_threshold, 5.0)
+        self.assertEqual(adjusted_policy._lagrange_threshold, 5.0)
+        for key, value in fixed_policy.state_dict().items():
+            torch.testing.assert_close(adjusted_policy.state_dict()[key], value)
+        adjusted_policy.load_state_dict(fixed_policy.state_dict(), strict=True)
+
+        batch = {
+            "observations": torch.zeros((2, 2)),
+            "actions": torch.zeros((2, 7)),
+            "next_observations": torch.ones((2, 2)),
+            "rewards": torch.zeros((2, 1)),
+            "terminals": torch.zeros((2, 1)),
+        }
+        torch.manual_seed(23)
+        fixed_result = fixed_policy.learn(batch)
+        torch.manual_seed(23)
+        adjusted_result = adjusted_policy.learn(batch)
+        self.assertEqual(fixed_result.keys(), adjusted_result.keys())
+        for key in fixed_result:
+            self.assertAlmostEqual(fixed_result[key], adjusted_result[key])
+        for key, value in fixed_policy.state_dict().items():
+            torch.testing.assert_close(adjusted_policy.state_dict()[key], value)
+
+        chunked_policy, _ = policies.build_model_free_policy(
+            "cql",
+            DummyEnv("Lift", action_dim=28),
+            None,
+            SimpleNamespace(
+                device="cpu", cql_lagrange_target_mode="action-volume"
+            ),
+            discount=0.99**4,
+            chunk_length=4,
+        )
+        self.assertAlmostEqual(
+            chunked_policy._lagrange_threshold,
+            5.0 + 21.0 * np.log(2.0),
+        )
+        self.assertTrue(chunked_policy._with_lagrange)
+
+        non_lagrange_policy, _ = policies.build_model_free_policy(
+            "cql",
+            DummyEnv("Reacher-v5", action_dim=8),
+            None,
+            SimpleNamespace(
+                device="cpu", cql_lagrange_target_mode="action-volume"
+            ),
+            discount=0.99**4,
+            chunk_length=4,
+        )
+        self.assertFalse(non_lagrange_policy._with_lagrange)
+        self.assertEqual(non_lagrange_policy._lagrange_threshold, 10.0)
+
     def test_td3bc_requires_observation_normalization_buffer(self):
         with self.assertRaisesRegex(ValueError, "TD3\\+BC requires a replay buffer"):
             policies.build_model_free_policy(
                 "td3bc", DummyEnv("Reacher-v5"), None,
                 SimpleNamespace(device="cpu"), discount=0.99,
             )
+
+    def test_cql_entropy_settings_preserve_defaults_and_accept_overrides(self):
+        torch.manual_seed(5)
+        default_policy, _ = policies.build_model_free_policy(
+            "cql", DummyEnv("Lift"), None, SimpleNamespace(device="cpu"),
+            discount=0.99,
+        )
+        torch.manual_seed(5)
+        explicit_default_policy, _ = policies.build_model_free_policy(
+            "cql",
+            DummyEnv("Lift"),
+            None,
+            SimpleNamespace(
+                device="cpu",
+                cql_entropy_learning_rate=1e-4,
+                cql_entropy_alpha_max=1.0,
+            ),
+            discount=0.99,
+        )
+        override_policy, _ = policies.build_model_free_policy(
+            "cql",
+            DummyEnv("Lift"),
+            None,
+            SimpleNamespace(
+                device="cpu",
+                cql_entropy_learning_rate=3e-4,
+                cql_entropy_alpha_max=None,
+            ),
+            discount=0.99,
+        )
+
+        for key, value in default_policy.state_dict().items():
+            torch.testing.assert_close(
+                explicit_default_policy.state_dict()[key], value
+            )
+        override_policy.load_state_dict(
+            default_policy.state_dict(), strict=True
+        )
+        self.assertEqual(
+            default_policy.alpha_optim.param_groups[0]["lr"], 1e-4
+        )
+        self.assertEqual(
+            override_policy.alpha_optim.param_groups[0]["lr"], 3e-4
+        )
+        self.assertEqual(default_policy._entropy_alpha_max, 1.0)
+        self.assertIsNone(override_policy._entropy_alpha_max)
+
+        capped_policy, _ = policies.build_model_free_policy(
+            "cql",
+            DummyEnv("Lift"),
+            None,
+            SimpleNamespace(
+                device="cpu",
+                cql_entropy_learning_rate=1e-4,
+                cql_entropy_alpha_max=0.5,
+            ),
+            discount=0.99,
+        )
+        self.assertEqual(float(capped_policy._alpha), 0.5)
+
+    def test_cql_entropy_alpha_max_controls_clamping(self):
+        batch = {
+            "observations": torch.zeros((2, 2)),
+            "actions": torch.zeros((2, 1)),
+            "next_observations": torch.zeros((2, 2)),
+            "rewards": torch.zeros((2, 1)),
+            "terminals": torch.zeros((2, 1)),
+        }
+        for alpha_max, expected_alpha in ((1.0, 1.0), (None, 2.0)):
+            with self.subTest(alpha_max=alpha_max):
+                policy, _ = policies.build_model_free_policy(
+                    "cql",
+                    DummyEnv("Lift"),
+                    None,
+                    SimpleNamespace(
+                        device="cpu",
+                        cql_entropy_learning_rate=1e-4,
+                        cql_entropy_alpha_max=alpha_max,
+                    ),
+                    discount=0.99,
+                )
+                policy._log_alpha.data.fill_(float(np.log(2.0)))
+                policy.alpha_optim.param_groups[0]["lr"] = 0.0
+
+                policy.learn(batch)
+
+                self.assertAlmostEqual(
+                    float(policy._alpha), expected_alpha, places=6
+                )
 
     def test_inference_only_model_based_policies_strictly_load_training_state(self):
         env = DummyEnv("Reacher-v5")
