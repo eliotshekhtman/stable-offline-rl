@@ -981,7 +981,7 @@ def performance_definition(env_name: str) -> tuple[str, str, bool]:
         return "success_rate", "task success rate", True
     if env_name == "Reacher-v5":
         return "final_target_distance", "final fingertip-target distance (m)", False
-    if env_name == "HalfCheetah-v5":
+    if env_name in {"HalfCheetah-v5", "Walker2d-v5"}:
         return "forward_displacement", "forward displacement (m)", True
     raise ValueError(f"Unsupported task {env_name!r}.")
 
@@ -1001,7 +1001,7 @@ def episode_performance(
         fingertip = env.unwrapped.get_body_com("fingertip")
         target = env.unwrapped.get_body_com("target")
         return float(np.linalg.norm(fingertip - target))
-    if env_name == "HalfCheetah-v5":
+    if env_name in {"HalfCheetah-v5", "Walker2d-v5"}:
         return float(final_info["x_position"] - reset_info["x_position"])
     raise ValueError(f"Unsupported task {env_name!r}.")
 

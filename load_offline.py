@@ -21,6 +21,7 @@ from task_support import require_supported_task
 MINARI_PREFIXES = {
     "HalfCheetah-v5": "mujoco/halfcheetah",
     "Reacher-v5": "mujoco/reacher",
+    "Walker2d-v5": "mujoco/walker2d",
 }
 
 ROBOMIMIC_HF_REPO_ID = "robomimic/robomimic_datasets"
@@ -85,34 +86,32 @@ def load_minari_dataset(dataset_id: str, seed: int | None = None) -> tuple[dict[
     }
 
 
-def load_minari_episode_subset(
+def load_minari_transition_subset(
     dataset_id: str,
-    num_episodes: int,
+    num_transitions: int,
     seed: int,
-    episode_id_start: int,
-    episode_offset: int = 0,
+    episode_id_start: int = 0,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
-    """Load one slice of a deterministic Minari episode permutation."""
+    """Meet a transition quota with whole episodes sampled without replacement."""
     require_supported_minari_dataset(dataset_id)
+    if num_transitions <= 0:
+        raise ValueError("num_transitions must be positive.")
     import minari
 
     minari_dataset = minari.load_dataset(dataset_id, download=True)
     available_episodes = int(minari_dataset.total_episodes)
-    if num_episodes <= 0 or episode_offset < 0:
-        raise ValueError("num_episodes must be positive and episode_offset nonnegative.")
-    selection_stop = episode_offset + num_episodes
-    if selection_stop > available_episodes:
+    available_transitions = int(minari_dataset.total_steps)
+    if num_transitions > available_transitions:
         raise ValueError(
-            f"Requested {selection_stop} unique episodes from {dataset_id}, but it contains "
-            f"only {available_episodes} episodes "
-            f"({int(minari_dataset.total_steps)} transitions); cannot top up without repetition."
+            f"Requested {num_transitions} unique transitions from {dataset_id}, but it "
+            f"contains only {available_transitions} transitions "
+            f"({available_episodes} episodes); cannot meet the quota without repetition."
         )
 
     rng = np.random.default_rng(seed)
-    episode_indices = rng.permutation(minari_dataset.episode_indices)[
-        episode_offset:selection_stop
-    ]
+    episode_indices = rng.permutation(minari_dataset.episode_indices)
     episodes = []
+    collected_transitions = 0
     for episode_id, episode in enumerate(
         minari_dataset.iterate_episodes(episode_indices), start=episode_id_start
     ):
@@ -121,6 +120,16 @@ def load_minari_episode_subset(
             len(transitions["actions"]), episode_id, dtype=np.int64
         )
         episodes.append(transitions)
+        collected_transitions += len(transitions["actions"])
+        if collected_transitions >= num_transitions:
+            break
+
+    if collected_transitions < num_transitions:
+        raise ValueError(
+            f"Requested {num_transitions} unique transitions from {dataset_id}, but "
+            f"exhausted its episodes after {collected_transitions} transitions; "
+            "cannot meet the quota without repetition."
+        )
 
     dataset = concat_datasets(episodes)
     env_spec = getattr(minari_dataset, "env_spec", None)
@@ -128,10 +137,9 @@ def load_minari_episode_subset(
         "dataset_id": dataset_id,
         "env_id": getattr(env_spec, "id", None),
         "available_num_episodes": available_episodes,
-        "available_num_transitions": int(minari_dataset.total_steps),
-        "num_episodes": num_episodes,
+        "available_num_transitions": available_transitions,
+        "num_episodes": len(episodes),
         "num_transitions": int(len(dataset["rewards"])),
-        "episode_offset": episode_offset,
         "seed": seed,
     }
 

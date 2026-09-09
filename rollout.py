@@ -33,7 +33,7 @@ def load_expert_policy(env_name: str, policy_path: str):
         return SAC.load(policy_path)
     raise ValueError(
         f"Unsupported generated-data task {env_name!r}; supported tasks are "
-        "Reacher-v5 and HalfCheetah-v5."
+        f"{', '.join(sorted(GENERATED_TASKS))}."
     )
 
 
@@ -92,14 +92,15 @@ def collect_traj(
 def collect_expert(
     env_name: str,
     policy_path: str,
-    num_trajectories: int,
+    num_trajectories: int | None,
     max_timesteps: int,
     noise_scale: float = 0.0,
     deterministic: bool = True,
     rng: np.random.Generator | None = None,
     episode_id_start: int = 0,
+    min_transitions: int | None = None,
 ) -> dict[str, np.ndarray]:
-    """Collect an exact number of complete expert trajectories."""
+    """Collect complete expert trajectories to a count or transition minimum."""
     require_supported_task(env_name, "generated")
     rng = np.random.default_rng() if rng is None else rng
 
@@ -128,20 +129,22 @@ def collect_expert(
         max_timesteps=max_timesteps,
         rng=rng,
         episode_id_start=episode_id_start,
+        min_transitions=min_transitions,
     )
 
 
 def collect_suboptimal(
     env_name: str,
     policy_path: str,
-    num_trajectories: int,
+    num_trajectories: int | None,
     max_timesteps: int,
     noise_scale: float = 0.0,
     deterministic: bool = True,
     rng: np.random.Generator | None = None,
     episode_id_start: int = 0,
+    min_transitions: int | None = None,
 ) -> dict[str, np.ndarray]:
-    """Collect an exact number of complete random-action trajectories."""
+    """Collect complete random trajectories to a count or transition minimum."""
     require_supported_task(env_name, "generated")
     rng = np.random.default_rng() if rng is None else rng
 
@@ -160,6 +163,7 @@ def collect_suboptimal(
         max_timesteps=max_timesteps,
         rng=rng,
         episode_id_start=episode_id_start,
+        min_transitions=min_transitions,
     )
 
 
@@ -176,9 +180,9 @@ def collect_dataset(
 ) -> tuple[dict[str, np.ndarray], dict]:
     """Collect an ordered offline-RL dataset containing complete episodes.
 
-    The two expert proportions determine clean and noisy expert trajectory
-    allocations; the remainder is random data. Whole trajectories are added
-    until the dataset contains at least num_samples transitions.
+    Each source contributes at least its proportion of num_samples transitions.
+    Complete trajectories are retained, so the final source trajectory may
+    overshoot its quota. The remainder is random data.
     """
     require_supported_task(env_name, "generated")
     _validate_collection_args(
@@ -191,53 +195,33 @@ def collect_dataset(
 
     rng = np.random.default_rng(seed)
     proportions = np.asarray(
-        [prop_clean_expert, prop_noisy_expert, 1.0 - prop_clean_expert - prop_noisy_expert]
+        [prop_clean_expert, prop_noisy_expert, 1.0 - (prop_clean_expert + prop_noisy_expert)]
     )
-    target_num_trajectories = max(1, int(np.ceil(num_samples / max_timesteps)))
+    quotas = transition_quotas(num_samples, proportions)
     datasets = []
     next_episode_id = 0
     trajectory_counts = np.zeros(3, dtype=np.int64)
     transition_counts = np.zeros(3, dtype=np.int64)
 
-    while transition_counts.sum() < num_samples:
-        target_counts = np.asarray(
-            _allocate_trajectory_counts(target_num_trajectories, proportions), dtype=np.int64
+    for source, quota in enumerate(quotas):
+        if quota == 0:
+            continue
+        collect = collect_expert if source < 2 else collect_suboptimal
+        component = collect(
+            env_name=env_name,
+            policy_path=policy_path,
+            num_trajectories=None,
+            min_transitions=int(quota),
+            max_timesteps=max_timesteps,
+            noise_scale=0.0 if source == 0 else noise_scale,
+            deterministic=deterministic,
+            rng=rng,
+            episode_id_start=next_episode_id,
         )
-        for source, target_count in enumerate(target_counts):
-            count = int(target_count - trajectory_counts[source])
-            if count == 0:
-                continue
-            if source < 2:
-                component = collect_expert(
-                    env_name=env_name,
-                    policy_path=policy_path,
-                    num_trajectories=count,
-                    max_timesteps=max_timesteps,
-                    noise_scale=0.0 if source == 0 else noise_scale,
-                    deterministic=deterministic,
-                    rng=rng,
-                    episode_id_start=next_episode_id,
-                )
-            else:
-                component = collect_suboptimal(
-                    env_name=env_name,
-                    policy_path=policy_path,
-                    num_trajectories=count,
-                    max_timesteps=max_timesteps,
-                    noise_scale=noise_scale,
-                    deterministic=deterministic,
-                    rng=rng,
-                    episode_id_start=next_episode_id,
-                )
-            datasets.append(component)
-            trajectory_counts[source] += count
-            transition_counts[source] += len(component["rewards"])
-            next_episode_id += count
-
-        if transition_counts.sum() < num_samples:
-            mean_length = transition_counts.sum() / trajectory_counts.sum()
-            shortfall = num_samples - transition_counts.sum()
-            target_num_trajectories += max(1, int(np.ceil(shortfall / mean_length)))
+        datasets.append(component)
+        trajectory_counts[source] = len(np.unique(component["episode_ids"]))
+        transition_counts[source] = len(component["rewards"])
+        next_episode_id += int(trajectory_counts[source])
 
     dataset = _concat_datasets(datasets)
     metadata = make_metadata(
@@ -269,7 +253,7 @@ def make_metadata(
     trajectory_counts: np.ndarray,
     transition_counts: np.ndarray,
 ) -> dict:
-    prop_random = 1.0 - prop_clean_expert - prop_noisy_expert
+    prop_random = 1.0 - (prop_clean_expert + prop_noisy_expert)
     num_trajectories = int(trajectory_counts.sum())
     num_transitions = int(transition_counts.sum())
     return {
@@ -280,6 +264,12 @@ def make_metadata(
         "requested_prop_clean_expert": prop_clean_expert,
         "requested_prop_noisy_expert": prop_noisy_expert,
         "requested_prop_random": prop_random,
+        "requested_transition_quotas": dict(zip(
+            ("clean_expert", "noisy_expert", "random"),
+            transition_quotas(
+                num_samples, [prop_clean_expert, prop_noisy_expert, prop_random]
+            ).tolist(),
+        )),
         "num_trajectories": num_trajectories,
         "num_clean_expert_trajectories": int(trajectory_counts[0]),
         "num_noisy_expert_trajectories": int(trajectory_counts[1]),
@@ -364,26 +354,34 @@ def split_dataset(
 def _collect_source(
     env_name: str,
     make_action_fn: Callable[[gym.Env], Callable[[np.ndarray], np.ndarray]],
-    num_trajectories: int,
+    num_trajectories: int | None,
     max_timesteps: int,
     rng: np.random.Generator,
     episode_id_start: int = 0,
+    min_transitions: int | None = None,
 ) -> dict[str, np.ndarray]:
+    if (num_trajectories is None) == (min_transitions is None):
+        raise ValueError("Specify either num_trajectories or min_transitions.")
+    target = num_trajectories if min_transitions is None else min_transitions
+    if isinstance(target, (bool, np.bool_)) or not isinstance(target, (int, np.integer)) or target <= 0:
+        raise ValueError("Collection target must be a positive integer.")
     env = gym.make(env_name)
     try:
         action_fn = make_action_fn(env)
         datasets = []
-        for trajectory in range(num_trajectories):
+        transitions = 0
+        while (len(datasets) if min_transitions is None else transitions) < target:
             traj = collect_traj(
                 env,
                 action_fn,
                 max_timesteps=max_timesteps,
-                episode_id=episode_id_start + trajectory,
+                episode_id=episode_id_start + len(datasets),
                 seed=int(rng.integers(0, MAX_SEED)),
             )
             if len(traj["rewards"]) == 0:
                 raise RuntimeError("Collected an empty trajectory; check the environment and action function.")
             datasets.append(traj)
+            transitions += len(traj["rewards"])
 
         dataset = _concat_datasets(datasets)
         return dataset
@@ -434,13 +432,18 @@ def _validate_collection_args(
         raise ValueError("clean and noisy expert proportions cannot sum above 1.")
 
 
-def _allocate_trajectory_counts(
-    num_trajectories: int,
-    proportions: np.ndarray,
-) -> tuple[int, int, int]:
-    """Return a deterministic integer allocation that stays close to each proportion."""
-    counts = np.zeros(3, dtype=np.int64)
-    for total in range(1, num_trajectories + 1):
-        deficits = total * proportions - counts
-        counts[int(np.argmax(deficits))] += 1
-    return tuple(int(count) for count in counts)
+def transition_quotas(num_samples: int, proportions) -> np.ndarray:
+    """Round each source's transition minimum up independently."""
+    if isinstance(num_samples, (bool, np.bool_)) or not isinstance(num_samples, (int, np.integer)) or num_samples <= 0:
+        raise ValueError("num_samples must be a positive integer.")
+    proportions = np.asarray(proportions, dtype=np.float64)
+    if (
+        proportions.ndim != 1
+        or not np.all(np.isfinite(proportions))
+        or np.any(proportions < 0.0)
+        or not np.isclose(proportions.sum(), 1.0, rtol=0.0, atol=1e-12)
+    ):
+        raise ValueError("Source proportions must be finite, nonnegative, and sum to one.")
+    # Decimal shares can round one ULP above an integer transition count.
+    targets = np.nextafter(num_samples * proportions, -np.inf)
+    return np.ceil(targets).astype(np.int64)

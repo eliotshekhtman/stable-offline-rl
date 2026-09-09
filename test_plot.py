@@ -32,6 +32,35 @@ class BootstrapTests(unittest.TestCase):
         self.assertTrue(np.all(center <= high))
 
 
+class HistorySampleTests(unittest.TestCase):
+    def test_mixed_checkpoint_schedules_use_only_evaluated_seeds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            histories = []
+            for seed, steps in ((0, (1000, 2000)), (1, (2000,))):
+                eval_dir = root / str(seed)
+                (eval_dir / "rollouts").mkdir(parents=True)
+                records = []
+                for step in steps:
+                    np.savez(
+                        eval_dir / "rollouts" / f"step_{step}.npz",
+                        performance=np.asarray([seed, seed + 1]),
+                    )
+                    records.append({"step": step, "state_ood_ratio": seed + 2.0})
+                histories.append({"eval_dir": str(eval_dir), "records": records})
+            history = {"seed_histories": histories}
+
+            for step, expected_seeds in ((1000, (0,)), (2000, (0, 1))):
+                with self.subTest(step=step):
+                    performance = plot.history_performance_samples(history, step)
+                    scalar = plot.history_scalar_samples(history, step, "state_ood_ratio")
+                    self.assertEqual(len(performance), len(expected_seeds))
+                    self.assertEqual(len(scalar), len(expected_seeds))
+                    for values, ood, seed in zip(performance, scalar, expected_seeds):
+                        np.testing.assert_array_equal(values, [seed, seed + 1])
+                        np.testing.assert_array_equal(ood, [seed + 2.0])
+
+
 class EvaluationDiscoveryTests(unittest.TestCase):
     def test_latest_eval_dirs_keeps_each_seed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -106,30 +135,30 @@ class DynamicsChunkModePlotTests(unittest.TestCase):
             },
         }
 
-    def test_old_model_based_schema_is_direct_and_keeps_old_labels(self):
+    def test_old_model_based_schema_is_direct_with_uppercase_labels(self):
         record = self.record()
 
         self.assertEqual(plot.dynamics_chunk_mode(record), "direct")
-        self.assertEqual(plot.algorithm_label(record), "mopo")
-        self.assertEqual(plot.policy_label(record), "mopo (l=4)")
+        self.assertEqual(plot.algorithm_label(record), "MOPO")
+        self.assertEqual(plot.policy_label(record), "MOPO (l=4)")
 
     def test_recursive_mode_has_distinct_algorithm_and_policy_labels(self):
         record = self.record(mode="recursive")
 
         self.assertEqual(plot.dynamics_chunk_mode(record), "recursive")
-        self.assertEqual(plot.algorithm_label(record), "mopo (recursive dynamics)")
+        self.assertEqual(plot.algorithm_label(record), "MOPO (recursive dynamics)")
         self.assertEqual(
-            plot.policy_label(record), "mopo (l=4, recursive dynamics)"
+            plot.policy_label(record), "MOPO (l=4, recursive dynamics)"
         )
 
     def test_chunk_length_one_is_always_labeled_as_direct(self):
         record = self.record(chunk_length=1, mode="recursive")
 
         self.assertEqual(plot.dynamics_chunk_mode(record), "direct")
-        self.assertEqual(plot.algorithm_label(record), "mopo")
-        self.assertEqual(plot.policy_label(record), "mopo (l=1)")
+        self.assertEqual(plot.algorithm_label(record), "MOPO")
+        self.assertEqual(plot.policy_label(record), "MOPO (l=1)")
 
-    def test_model_free_label_is_unchanged(self):
+    def test_model_free_labels_are_uppercase(self):
         record = {
             "algo": "iql",
             "chunk_length": 4,
@@ -137,8 +166,8 @@ class DynamicsChunkModePlotTests(unittest.TestCase):
         }
 
         self.assertIsNone(plot.dynamics_chunk_mode(record))
-        self.assertEqual(plot.algorithm_label(record), "iql")
-        self.assertEqual(plot.policy_label(record), "iql (l=4)")
+        self.assertEqual(plot.algorithm_label(record), "IQL")
+        self.assertEqual(plot.policy_label(record), "IQL (l=4)")
 
     def test_algorithm_groups_separate_direct_and_recursive(self):
         direct = self.record(mode="direct")
@@ -148,7 +177,7 @@ class DynamicsChunkModePlotTests(unittest.TestCase):
 
         self.assertEqual(
             [(label, rows) for label, rows in groups],
-            [("mopo", [direct]), ("mopo (recursive dynamics)", [recursive])],
+            [("MOPO", [direct]), ("MOPO (recursive dynamics)", [recursive])],
         )
 
     def test_seed_averaging_keeps_modes_separate(self):
@@ -203,7 +232,7 @@ class DynamicsChunkModePlotTests(unittest.TestCase):
         self.assertEqual(sorted(len(row["seed_rows"]) for row in averaged), [2, 2])
         self.assertEqual(
             {row["label"] for row in averaged},
-            {"mobile (l=4)", "mobile (l=4, recursive dynamics)"},
+            {"MOBILE (l=4)", "MOBILE (l=4, recursive dynamics)"},
         )
 
     @patch("plot.final_performance_samples", return_value=[np.ones(2)])
@@ -229,8 +258,10 @@ class DynamicsChunkModePlotTests(unittest.TestCase):
 
         self.assertEqual(
             axis.get_legend_handles_labels()[1],
-            ["mopo", "mopo (recursive dynamics)", "expert"],
+            ["MOPO", "MOPO (recursive dynamics)", "Expert"],
         )
+        self.assertEqual(axis.get_xlabel(), "Fraction")
+        self.assertEqual(axis.get_ylabel(), "Success rate")
         plot.plt.close(figure)
 
 
@@ -269,6 +300,8 @@ class ChunkLengthAxisTests(unittest.TestCase):
             [0, 1, 2, 3],
         )
         self.assertEqual(len(axis.xaxis.get_minorticklocs()), 0)
+        self.assertEqual(axis.get_xlabel(), "Action chunk length")
+        self.assertEqual(axis.get_ylabel(), "Success rate")
         plot.plt.close(figure)
 
 
@@ -320,9 +353,252 @@ class PlotCohortTests(unittest.TestCase):
 
         self.assertEqual(
             [label for label, _ in groups],
-            ["mobile (real ratio=0.00)", "mobile (real ratio=0.50)"],
+            ["MOBILE (real ratio=0.00)", "MOBILE (real ratio=0.50)"],
         )
         self.assertEqual([len(group) for _, group in groups], [2, 2])
+
+    def test_single_td3bc_alpha_is_hidden_without_changing_selection(self):
+        rows = []
+        for alpha in (0.05, 0.25):
+            for chunk_length in (2, 4):
+                row = self.record(algo="td3bc", chunk_length=chunk_length)
+                row["training_schema"]["td3bc"] = {"alpha": alpha}
+                rows.append(row)
+        rows.append(self.record(algo="iql"))
+        cohort = self.cohort(
+            {"algo": "td3bc", "match": {"td3bc.alpha": 0.05}},
+            {"algo": "iql"},
+        )
+        original = json.dumps({"rows": rows, "cohort": cohort}, sort_keys=True)
+        selected = plot.select_plot_cohort(rows, cohort)
+
+        groups = plot.algorithm_groups(selected, "chunk_length")
+
+        self.assertEqual([label for label, _ in groups], ["TD3BC", "IQL"])
+        self.assertEqual([len(group) for _, group in groups], [2, 1])
+        self.assertTrue(all(
+            row["training_schema"]["td3bc"]["alpha"] == 0.05
+            for row in groups[0][1]
+        ))
+        self.assertEqual(json.dumps({"rows": rows, "cohort": cohort}, sort_keys=True), original)
+        self.assertIn("td3bc.alpha=0.05", plot.cohort_policy_label(
+            selected[0], selected[0]["_plot_cohort_spec"]
+        ))
+
+    def test_multiple_td3bc_alphas_remain_in_series_labels(self):
+        rows = []
+        for alpha in (0.05, 0.25):
+            for chunk_length in (2, 4):
+                row = self.record(algo="td3bc", chunk_length=chunk_length)
+                row["training_schema"]["td3bc"] = {"alpha": alpha}
+                rows.append(row)
+        selected = plot.select_plot_cohort(rows, self.cohort(*[
+            {"algo": "td3bc", "match": {"td3bc.alpha": alpha}}
+            for alpha in (0.05, 0.25)
+        ]))
+
+        groups = plot.algorithm_groups(selected, "chunk_length")
+
+        self.assertEqual([label for label, _ in groups], [
+            "TD3BC (td3bc.alpha=0.05)", "TD3BC (td3bc.alpha=0.25)",
+        ])
+        self.assertEqual([len(group) for _, group in groups], [2, 2])
+
+    def test_noisy_ratio_legend_hides_shared_noise_without_changing_selection(self):
+        rows = []
+        series = []
+        variants = [("td3bc", 0.5), ("iql", 0.5), ("mopo", 0.5),
+                    ("mobile", 0.5), ("mobile", 0.0)]
+        for algo, ratio in variants:
+            match = {"dataset.noise_scale": 0.5}
+            if algo == "mobile":
+                match["model_based.real_ratio"] = ratio
+            series.append({"algo": algo, "match": match})
+            for fraction in (0.0, 1.0):
+                row = self.record(algo=algo, real_ratio=ratio)
+                row["noisy_trajectory_fraction"] = fraction
+                row["training_schema"]["dataset"] = {
+                    "noise_scale": 0.5,
+                    "prop_clean_expert": 1.0 - fraction,
+                    "prop_noisy_expert": fraction,
+                }
+                rows.append(row)
+        cohort = self.cohort(*series)
+        original = json.dumps({"rows": rows, "cohort": cohort}, sort_keys=True)
+        selected = plot.select_plot_cohort(rows, cohort)
+
+        groups = plot.algorithm_groups(selected, "noisy_trajectory_fraction")
+
+        self.assertEqual([label for label, _ in groups], [
+            "TD3BC", "IQL", "MOPO",
+            "MOBILE (real ratio=0.50)", "MOBILE (real ratio=0.00)",
+        ])
+        self.assertEqual([len(group) for _, group in groups], [2] * 5)
+        self.assertEqual(json.dumps({"rows": rows, "cohort": cohort}, sort_keys=True), original)
+        self.assertIn("noise scale=0.5", plot.plot_series_label(selected[0]))
+
+    def test_noisy_ratio_legend_retains_noise_when_it_distinguishes_series(self):
+        rows = []
+        for noise in (0.25, 0.5):
+            row = self.record()
+            row["noisy_trajectory_fraction"] = 0.5
+            row["training_schema"]["dataset"] = {"noise_scale": noise}
+            rows.append(row)
+        selected = plot.select_plot_cohort(rows, self.cohort(*[
+            {"algo": "mobile", "match": {"dataset.noise_scale": noise}}
+            for noise in (0.25, 0.5)
+        ]))
+
+        groups = plot.algorithm_groups(selected, "noisy_trajectory_fraction")
+
+        self.assertIn("noise scale=0.25", groups[0][0])
+        self.assertIn("noise scale=0.5", groups[1][0])
+
+    def test_custom_labels_capitalize_first_word_and_preserve_acronyms(self):
+        row = self.record()
+        self.assertEqual(plot.algorithm_name(row, {"label": "mobile baseline"}), "MOBILE baseline")
+        self.assertEqual(plot.algorithm_name(row, {"label": "reference OOD"}), "Reference OOD")
+        self.assertEqual(plot.capitalize_label("state-action OOD"), "State-action OOD")
+
+    def test_noise_scale_legend_hides_all_constant_filters(self):
+        rows = []
+        series = []
+        for algo in ("td3bc", "iql", "mopo", "mobile"):
+            match = {
+                "dataset.prop_clean_expert": 0.5,
+                "dataset.prop_noisy_expert": 0.5,
+            }
+            if algo == "mobile":
+                match["model_based.real_ratio"] = 0.5
+            series.append({"algo": algo, "match": match})
+            for noise in (0.0, 0.5):
+                row = self.record(algo=algo)
+                row["noise_scale"] = noise
+                row["training_schema"]["dataset"] = {
+                    "noise_scale": noise,
+                    "prop_clean_expert": 0.5,
+                    "prop_noisy_expert": 0.5,
+                }
+                rows.append(row)
+        cohort = self.cohort(*series)
+        selected = plot.select_plot_cohort(rows, cohort)
+        original = json.dumps(selected, sort_keys=True)
+
+        groups = plot.algorithm_groups(selected, "noise_scale")
+
+        self.assertEqual([label for label, _ in groups], [
+            "TD3BC", "IQL", "MOPO", "MOBILE",
+        ])
+        self.assertEqual([len(group) for _, group in groups], [2] * 4)
+        self.assertEqual(json.dumps(selected, sort_keys=True), original)
+
+    def test_constant_filters_are_hidden_for_arbitrary_parameter_types(self):
+        for value in (100, "fixed", None, [256, 256], {"a": 1, "b": [2]}):
+            with self.subTest(value=value):
+                row = self.record()
+                row["training_schema"]["example"] = {"setting": value}
+                selected = plot.select_plot_cohort([row], self.cohort({
+                    "algo": "mobile", "match": {"example.setting": value},
+                }))
+
+                self.assertEqual(
+                    plot.algorithm_groups(selected, "chunk_length")[0][0],
+                    "MOBILE",
+                )
+
+    def test_differing_filters_remain_for_arbitrary_parameter_types(self):
+        for values in ((100, 300), ("a", "b"), (None, 1),
+                       ([256, 256], [512, 512]), ({"a": 1}, {"a": 2})):
+            with self.subTest(values=values):
+                rows = []
+                for value in values:
+                    row = self.record()
+                    row["training_schema"]["example"] = {"setting": value}
+                    rows.append(row)
+                selected = plot.select_plot_cohort(rows, self.cohort(*[
+                    {"algo": "mobile", "match": {"example.setting": value}}
+                    for value in values
+                ]))
+
+                self.assertEqual(
+                    [label for label, _ in plot.algorithm_groups(selected, "chunk_length")],
+                    [f"MOBILE ({plot.parameter_value_label('example.setting', value)})"
+                     for value in values],
+                )
+
+    def test_shared_filter_compares_actual_values_of_other_algorithms(self):
+        rows = [self.record(algo="mopo", epoch=100), self.record(epoch=300)]
+        selected = plot.select_plot_cohort(rows, self.cohort(
+            {"algo": "mopo", "match": {"epoch": 100}},
+            {"algo": "mobile"},
+        ))
+
+        self.assertEqual(
+            [label for label, _ in plot.algorithm_groups(selected, "chunk_length")],
+            ["MOPO (epoch=100)", "MOBILE"],
+        )
+
+    def test_equal_numbers_and_dict_order_do_not_create_false_variants(self):
+        rows = [self.record(algo="mopo"), self.record()]
+        rows[0]["training_schema"]["example"] = {"setting": {"a": 1, "b": 2}}
+        rows[1]["training_schema"]["example"] = {"setting": {"b": 2.0, "a": 1.0}}
+        selected = plot.select_plot_cohort(rows, self.cohort(*[
+            {"algo": row["algo"], "match": {"example.setting": {"a": 1, "b": 2}}}
+            for row in rows
+        ]))
+
+        self.assertEqual(
+            [label for label, _ in plot.algorithm_groups(selected, "chunk_length")],
+            ["MOPO", "MOBILE"],
+        )
+
+    def test_missing_setting_within_same_algorithm_is_a_real_difference(self):
+        baseline, variant = self.record(), self.record()
+        variant["training_schema"]["example"] = {"setting": 1}
+        selected = plot.select_plot_cohort([baseline, variant], self.cohort(
+            {"algo": "mobile", "match": {"example.setting": None}},
+            {"algo": "mobile", "match": {"example.setting": 1}},
+        ))
+
+        self.assertEqual(
+            [label for label, _ in plot.algorithm_groups(selected, "chunk_length")],
+            ["MOBILE (example.setting=None)", "MOBILE (example.setting=1)"],
+        )
+
+    def test_labels_use_only_variants_present_in_current_plot(self):
+        rows = [self.record(real_ratio=ratio) for ratio in (0.0, 0.5)]
+        selected = plot.select_plot_cohort(rows, self.cohort(*[
+            {"algo": "mobile", "match": {"model_based.real_ratio": ratio}}
+            for ratio in (0.0, 0.5)
+        ]))
+
+        self.assertEqual(
+            plot.algorithm_groups(selected[:1], "chunk_length")[0][0], "MOBILE"
+        )
+        self.assertEqual(
+            plot.algorithm_groups(selected, "chunk_length")[0][0],
+            "MOBILE (real ratio=0.00)",
+        )
+
+    def test_history_legends_use_same_rule_and_preserve_chunk_labels(self):
+        rows = []
+        for ratio in (0.0, 0.5):
+            row = self.record(real_ratio=ratio)
+            row["seed_group"] = str(ratio)
+            rows.append(row)
+        selected = plot.select_plot_cohort(rows, self.cohort(*[
+            {"algo": "mobile", "match": {"model_based.real_ratio": ratio, "epoch": 300}}
+            for ratio in (0.0, 0.5)
+        ]))
+        histories = plot.select_cohort_histories(rows, selected)
+
+        self.assertEqual(plot.history_plot_labels(histories), [
+            "MOBILE (l=4, real ratio=0.00)", "MOBILE (l=4, real ratio=0.50)",
+        ])
+        self.assertEqual(plot.history_plot_labels(histories[:1]), ["MOBILE (l=4)"])
+        self.assertEqual(plot.history_plot_labels([
+            {**rows[0], "label": "Existing custom label"},
+        ]), ["Existing custom label"])
 
     def test_automatic_grouping_rejects_two_configs_at_one_x_value(self):
         rows = [
@@ -343,7 +619,7 @@ class PlotCohortTests(unittest.TestCase):
 
         groups = plot.algorithm_groups(rows, "chunk_length")
 
-        self.assertEqual(groups, [("mobile", rows)])
+        self.assertEqual(groups, [("MOBILE", rows)])
 
     def test_underspecified_cohort_still_rejects_ambiguous_series(self):
         rows = [
@@ -453,7 +729,7 @@ class PlotCohortTests(unittest.TestCase):
         groups = plot.algorithm_groups([mobile, mopo], "chunk_length")
 
         self.assertEqual(
-            [label for label, _ in groups], ["mobile", "mopo"]
+            [label for label, _ in groups], ["MOBILE", "MOPO"]
         )
 
     def test_overlapping_cohort_series_are_rejected(self):
@@ -500,7 +776,7 @@ class PlotCohortTests(unittest.TestCase):
 
         self.assertEqual(
             histories[0]["label"],
-            "mobile (l=4, real ratio=0.00)",
+            "MOBILE (l=4, real ratio=0.00)",
         )
 
 
@@ -568,11 +844,48 @@ class NoiseScalePlotTests(unittest.TestCase):
             / "performance_vs_noise_scale.png",
         })
         for call in performance_plot.call_args_list:
+            self.assertEqual(call.args[1], (
+                "Gaussian action-noise scale ablation\n"
+                "Trajectories: 100% noisy expert"
+            ))
             self.assertEqual(
                 call.args[3:5],
                 ("noise_scale", "Gaussian action-noise scale"),
             )
             self.assertFalse(call.kwargs["fraction_axis"])
+
+    @patch("plot.performance_ablation_plot")
+    def test_noise_scale_title_shows_only_nonzero_mixture_components(
+        self, performance_plot
+    ):
+        cases = [
+            (0.5, 0.5, 0.0, "50% clean expert, 50% noisy expert"),
+            (0.0, 0.5, 0.5, "50% noisy expert, 50% random policy"),
+            (0.25, 0.5, 0.25, "25% clean expert, 50% noisy expert, 25% random policy"),
+        ]
+        for clean, noisy, random, expected in cases:
+            with self.subTest(composition=(clean, noisy, random)):
+                performance_plot.reset_mock()
+                rows = [self.row(scale, noisy=noisy) for scale in (0.0, 0.5)]
+                for row in rows:
+                    row["requested_prop_clean_expert"] = clean
+                    row["requested_prop_random"] = random
+                    row["training_schema"]["dataset"].update({
+                        "prop_clean_expert": clean,
+                        "prop_random": random,
+                        "prop_expert": clean + noisy,
+                    })
+                original = json.dumps(rows, sort_keys=True)
+
+                with tempfile.TemporaryDirectory() as directory:
+                    plot.plot_noise_scale_ablation(rows, Path(directory))
+
+                performance_plot.assert_called_once()
+                self.assertEqual(performance_plot.call_args.args[1], (
+                    "Gaussian action-noise scale ablation\n"
+                    f"Trajectories: {expected}"
+                ))
+                self.assertEqual(json.dumps(rows, sort_keys=True), original)
 
     @patch("plot.performance_ablation_plot")
     def test_noise_scale_plot_requires_multiple_scales_and_a_noisy_component(

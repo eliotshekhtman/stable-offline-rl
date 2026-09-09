@@ -4,6 +4,7 @@
 SUPPORTED_TASK_SOURCES = {
     "Reacher-v5": frozenset({"generated", "minari", "clean-minari"}),
     "HalfCheetah-v5": frozenset({"generated", "minari", "clean-minari"}),
+    "Walker2d-v5": frozenset({"generated", "minari", "clean-minari"}),
     "Lift": frozenset({"robomimic"}),
     "Can": frozenset({"robomimic"}),
 }

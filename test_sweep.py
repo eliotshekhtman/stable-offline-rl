@@ -725,6 +725,7 @@ class MobileShiftArgumentTests(unittest.TestCase):
             dataset_dir.mkdir(parents=True)
             (dataset_dir / "metadata.json").write_text(json.dumps({
                 "dataset_schema": schema,
+                "num_clean_expert_transitions": 500,
             }))
             for filename in ("full.npz", "train.npz", "test.npz"):
                 (dataset_dir / filename).touch()
@@ -736,6 +737,7 @@ class MobileShiftArgumentTests(unittest.TestCase):
             newer_dir.mkdir(parents=True)
             (newer_dir / "metadata.json").write_text(json.dumps({
                 "dataset_schema": {**schema, "noise_scale": 0.0},
+                "num_clean_expert_transitions": 500,
             }))
             for filename in ("full.npz", "train.npz", "test.npz"):
                 (newer_dir / filename).touch()
@@ -778,168 +780,134 @@ class MobileShiftArgumentTests(unittest.TestCase):
         self.assertIs(train_algos.call_args.args[5], schema)
         self.assertEqual(train_algos.call_args.args[6].dataset_source, "generated")
 
-    @patch("sweep.load_offline.load_minari_episode_subset")
+    @staticmethod
+    def clean_minari_test_dataset(lengths, episode_id_start=0):
+        size = sum(lengths)
+        observations = np.arange(size, dtype=np.float32).reshape(-1, 1)
+        timeouts = np.zeros(size, dtype=bool)
+        timeouts[np.cumsum(lengths) - 1] = True
+        return {
+            "observations": observations,
+            "actions": np.zeros((size, 1), dtype=np.float32),
+            "next_observations": observations + 1.0,
+            "rewards": np.zeros(size, dtype=np.float32),
+            "terminals": np.zeros(size, dtype=bool),
+            "timeouts": timeouts,
+            "episode_ids": np.repeat(
+                np.arange(episode_id_start, episode_id_start + len(lengths)), lengths
+            ),
+        }
+
+    @patch("sweep.load_offline.load_minari_transition_subset")
     @patch("sweep.rollout.collect_expert")
-    @patch("sweep.gym.make")
-    def test_clean_minari_collection_allocates_complete_trajectories(
-        self, make_env, collect_expert, load_minari_subset
+    def test_clean_minari_collection_meets_independent_transition_quotas(
+        self, collect_expert, load_minari_subset
     ):
-        make_env.return_value = SimpleNamespace(
-            spec=SimpleNamespace(max_episode_steps=50),
-            close=lambda: None,
-        )
-
-        def dataset(num_episodes, episode_id_start):
-            size = num_episodes * 50
-            episode_ids = np.repeat(
-                np.arange(episode_id_start, episode_id_start + num_episodes), 50
-            )
-            return {
-                "observations": np.zeros((size, 2), dtype=np.float32),
-                "actions": np.zeros((size, 1), dtype=np.float32),
-                "next_observations": np.zeros((size, 2), dtype=np.float32),
-                "rewards": np.zeros(size, dtype=np.float32),
-                "terminals": np.zeros(size, dtype=bool),
-                "timeouts": np.isin(np.arange(size), np.arange(49, size, 50)),
-                "episode_ids": episode_ids,
-            }
-
-        collect_expert.return_value = dataset(7, 0)
+        clean = self.clean_minari_test_dataset([100, 100, 100], episode_id_start=5)
+        minari = self.clean_minari_test_dataset([60, 60, 60, 60, 20])
+        collect_expert.return_value = clean
         load_minari_subset.return_value = (
-            dataset(3, 7),
+            minari,
             {
                 "env_id": "Reacher-v5",
-                "available_num_episodes": 10000,
-                "available_num_transitions": 500000,
+                "num_episodes": 5,
+                "available_num_episodes": 100,
+                "available_num_transitions": 5000,
             },
         )
-        args = self.parse(
-            "--dataset-source", "clean-minari",
-            "--dataset", "medium-v0",
-        )
-        args.seed = 0
+        args = self.parse("--dataset-source", "clean-minari", "--dataset", "medium-v0")
+        args.seed = 13
 
         with tempfile.NamedTemporaryFile(suffix=".zip") as expert:
             combined, metadata = sweep.collect_clean_minari_dataset(
                 "Reacher-v5", Path(expert.name), "mujoco/reacher/medium-v0",
-                num_samples=500, minari_fraction=0.3, args=args,
+                num_samples=500, minari_fraction=0.5, args=args,
             )
 
-        self.assertEqual(len(combined["rewards"]), 500)
-        self.assertEqual(len(np.unique(combined["episode_ids"])), 10)
-        self.assertEqual(metadata["num_clean_expert_trajectories"], 7)
-        self.assertEqual(metadata["num_minari_trajectories"], 3)
-        self.assertEqual(metadata["actual_minari_trajectory_fraction"], 0.3)
+        load_minari_subset.assert_called_once_with(
+            dataset_id="mujoco/reacher/medium-v0", num_transitions=250,
+            seed=13, episode_id_start=0,
+        )
+        collect_expert.assert_called_once()
+        clean_request = collect_expert.call_args.kwargs
+        self.assertEqual(clean_request["min_transitions"], 250)
+        self.assertIsNone(clean_request["num_trajectories"])
+        self.assertEqual(clean_request["episode_id_start"], 5)
         self.assertEqual(
-            load_minari_subset.call_args.kwargs["episode_id_start"], 7
+            clean_request["rng"].integers(2**31), np.random.default_rng(13).integers(2**31)
         )
+        self.assertEqual(metadata["requested_transition_quotas"], {
+            "clean_expert": 250, "minari": 250,
+        })
+        self.assertEqual(metadata["requested_minari_transition_fraction"], 0.5)
+        self.assertEqual(metadata["num_clean_expert_transitions"], 300)
+        self.assertEqual(metadata["num_minari_transitions"], 260)
+        self.assertEqual(metadata["num_clean_expert_trajectories"], 3)
+        self.assertEqual(metadata["num_minari_trajectories"], 5)
+        self.assertEqual(metadata["actual_minari_trajectory_fraction"], 5 / 8)
+        self.assertEqual(metadata["actual_minari_transition_fraction"], 260 / 560)
+        self.assertLess(metadata["num_clean_expert_transitions"] - 250, 100)
+        self.assertLess(metadata["num_minari_transitions"] - 250, 20)
+        self.assertEqual(len(combined["rewards"]), 560)
+        self.assertEqual(len(np.unique(combined["episode_ids"])), 8)
+        for key in rollout.DATASET_KEYS:
+            np.testing.assert_array_equal(combined[key], np.concatenate([minari[key], clean[key]]))
 
-    def test_clean_minari_short_episodes_top_up_without_repeating_subset(self):
-        args = self.parse(
-            "--dataset-source", "clean-minari",
-            "--dataset", "medium-v0",
+    @patch("sweep.load_offline.load_minari_transition_subset")
+    @patch("sweep.rollout.collect_expert")
+    def test_minari_only_collection_does_not_require_or_collect_expert(
+        self, collect_expert, load_minari_subset
+    ):
+        minari = self.clean_minari_test_dataset([200, 200, 110])
+        load_minari_subset.return_value = (
+            minari,
+            {
+                "env_id": "Reacher-v5",
+                "num_episodes": 3,
+                "available_num_episodes": 100,
+                "available_num_transitions": 5000,
+            },
         )
+        args = self.parse("--dataset-source", "clean-minari", "--dataset", "medium-v0")
         args.seed = 13
 
-        def make_dataset(num_episodes, episode_id_start, episode_length, marker):
-            size = num_episodes * episode_length
-            episode_ids = np.repeat(
-                np.arange(episode_id_start, episode_id_start + num_episodes),
-                episode_length,
-            )
-            observations = (
-                marker + np.arange(size, dtype=np.float32)
-            ).reshape(-1, 1)
-            timeouts = np.zeros(size, dtype=bool)
-            timeouts[episode_length - 1::episode_length] = True
-            return {
-                "observations": observations,
-                "actions": np.zeros((size, 1), dtype=np.float32),
-                "next_observations": observations + 1.0,
-                "rewards": np.zeros(size, dtype=np.float32),
-                "terminals": np.zeros(size, dtype=bool),
-                "timeouts": timeouts,
-                "episode_ids": episode_ids,
-            }
-
-        def collect_once():
-            clean_call = 0
-            minari_call = 0
-            minari_requests = []
-            clean_rngs = []
-
-            def collect_expert(**kwargs):
-                nonlocal clean_call
-                clean_rngs.append(kwargs["rng"])
-                lengths = (20, 5, 30)
-                length = lengths[min(clean_call, len(lengths) - 1)]
-                clean_call += 1
-                return make_dataset(
-                    kwargs["num_trajectories"], kwargs["episode_id_start"],
-                    length, marker=1000 * clean_call,
-                )
-
-            def load_subset(**kwargs):
-                nonlocal minari_call
-                lengths = (20, 5, 30)
-                length = lengths[min(minari_call, len(lengths) - 1)]
-                minari_call += 1
-                offset = kwargs["episode_offset"]
-                count = kwargs["num_episodes"]
-                minari_requests.append((offset, count))
-                return (
-                    make_dataset(
-                        count, kwargs["episode_id_start"], length,
-                        marker=10000 + 1000 * offset,
-                    ),
-                    {
-                        "env_id": "Reacher-v5",
-                        "available_num_episodes": 100,
-                        "available_num_transitions": 5000,
-                    },
-                )
-
-            env = SimpleNamespace(
-                spec=SimpleNamespace(max_episode_steps=50),
-                close=lambda: None,
-            )
-            with patch("sweep.gym.make", return_value=env), patch(
-                "sweep.rollout.collect_expert", side_effect=collect_expert
-            ), patch(
-                "sweep.load_offline.load_minari_episode_subset",
-                side_effect=load_subset,
-            ), tempfile.NamedTemporaryFile(suffix=".zip") as expert:
-                dataset, metadata = sweep.collect_clean_minari_dataset(
-                    "Reacher-v5", Path(expert.name),
-                    "mujoco/reacher/medium-v0", num_samples=500,
-                    minari_fraction=0.5, args=args,
-                )
-            return dataset, metadata, minari_requests, clean_rngs
-
-        first_dataset, first_metadata, first_requests, first_rngs = collect_once()
-        second_dataset, second_metadata, second_requests, second_rngs = collect_once()
-
-        self.assertGreaterEqual(len(first_requests), 3)
-        self.assertEqual(first_requests, second_requests)
-        for (offset, count), (next_offset, _) in zip(
-            first_requests, first_requests[1:]
-        ):
-            self.assertEqual(next_offset, offset + count)
-        selected = [
-            episode
-            for offset, count in first_requests
-            for episode in range(offset, offset + count)
-        ]
-        self.assertEqual(len(selected), len(set(selected)))
-        self.assertTrue(all(rng is first_rngs[0] for rng in first_rngs))
-        self.assertTrue(all(rng is second_rngs[0] for rng in second_rngs))
-        self.assertGreaterEqual(len(first_dataset["rewards"]), 500)
-        self.assertEqual(
-            {key: value for key, value in first_metadata.items() if key != "policy_path"},
-            {key: value for key, value in second_metadata.items() if key != "policy_path"},
+        combined, metadata = sweep.collect_clean_minari_dataset(
+            "Reacher-v5", Path("/unused/expert.zip"), "mujoco/reacher/medium-v0",
+            num_samples=500, minari_fraction=1.0, args=args,
         )
-        for key in first_dataset:
-            np.testing.assert_array_equal(first_dataset[key], second_dataset[key])
+
+        load_minari_subset.assert_called_once_with(
+            dataset_id="mujoco/reacher/medium-v0", num_transitions=500,
+            seed=13, episode_id_start=0,
+        )
+        collect_expert.assert_not_called()
+        self.assertEqual(metadata["num_clean_expert_transitions"], 0)
+        self.assertEqual(metadata["num_clean_expert_trajectories"], 0)
+        self.assertEqual(metadata["actual_minari_transition_fraction"], 1.0)
+        self.assertEqual(metadata["num_transitions"], 510)
+        for key in rollout.DATASET_KEYS:
+            np.testing.assert_array_equal(combined[key], minari[key])
+
+    @patch("sweep.load_offline.load_minari_transition_subset")
+    @patch("sweep.rollout.collect_expert")
+    def test_insufficient_minari_capacity_fails_before_collecting_clean(
+        self, collect_expert, load_minari_subset
+    ):
+        load_minari_subset.side_effect = ValueError("cannot meet the quota without repetition")
+        args = self.parse("--dataset-source", "clean-minari", "--dataset", "medium-v0")
+        args.seed = 13
+
+        with self.assertRaisesRegex(ValueError, "cannot meet the quota without repetition"):
+            sweep.collect_clean_minari_dataset(
+                "Reacher-v5", Path("/unused/expert.zip"), "mujoco/reacher/medium-v0",
+                num_samples=500, minari_fraction=0.5, args=args,
+            )
+
+        load_minari_subset.assert_called_once_with(
+            dataset_id="mujoco/reacher/medium-v0", num_transitions=250,
+            seed=13, episode_id_start=0,
+        )
+        collect_expert.assert_not_called()
 
     def test_new_dataset_cache_omits_full_copy_and_reuses_without_it(self):
         observations = np.arange(4, dtype=np.float32).reshape(-1, 1)

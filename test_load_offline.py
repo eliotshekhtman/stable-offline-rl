@@ -57,9 +57,10 @@ class RobomimicDatasetTests(unittest.TestCase):
 
 
 class MinariDatasetTests(unittest.TestCase):
-    def test_only_reacher_and_halfcheetah_are_supported(self):
+    def test_only_supported_mujoco_tasks_have_minari_prefixes(self):
         self.assertEqual(
-            set(load_offline.MINARI_PREFIXES), {"Reacher-v5", "HalfCheetah-v5"}
+            set(load_offline.MINARI_PREFIXES),
+            {"Reacher-v5", "HalfCheetah-v5", "Walker2d-v5"},
         )
         with self.assertRaisesRegex(ValueError, "Unsupported task 'Ant-v5'"):
             load_offline.list_minari_dataset_ids("Ant-v5")
@@ -88,68 +89,126 @@ class MinariDatasetTests(unittest.TestCase):
             load_offline.list_minari_dataset_ids("HalfCheetah-v5", "unknown-v0")
 
     @patch("minari.load_dataset")
-    def test_loads_seeded_subset_without_replacement_and_checks_capacity(self, load_dataset):
+    def test_loads_whole_episodes_until_transition_quota_without_replacement(self, load_dataset):
         episodes = []
-        for episode_id in range(4):
-            observations = np.asarray(
-                [[10 * episode_id], [10 * episode_id + 1], [10 * episode_id + 2]],
-                dtype=np.float32,
-            )
+        lengths = [3, 1, 5, 2]
+        for episode_id, length in enumerate(lengths):
             episodes.append(SimpleNamespace(
                 id=episode_id,
-                observations=observations,
-                actions=np.zeros((2, 1), dtype=np.float32),
-                rewards=np.full(2, episode_id, dtype=np.float32),
-                terminations=np.zeros(2, dtype=bool),
-                truncations=np.asarray([False, True]),
+                observations=(10 * episode_id + np.arange(length + 1, dtype=np.float32))[:, None],
+                actions=np.zeros((length, 1), dtype=np.float32),
+                rewards=np.full(length, episode_id, dtype=np.float32),
+                terminations=np.asarray([False] * (length - 1) + [episode_id % 2 == 0]),
+                truncations=np.asarray([False] * (length - 1) + [episode_id % 2 == 1]),
             ))
 
         minari_dataset = SimpleNamespace(
             total_episodes=4,
-            total_steps=8,
+            total_steps=sum(lengths),
             episode_indices=np.arange(4),
             env_spec=SimpleNamespace(id="Reacher-v5"),
         )
-        minari_dataset.iterate_episodes = lambda indices: iter(
-            [episodes[index] for index in indices]
-        )
+        yielded_indices = []
+
+        def iterate_episodes(indices):
+            for index in indices:
+                yielded_indices.append(index)
+                yield episodes[index]
+
+        minari_dataset.iterate_episodes = iterate_episodes
         load_dataset.return_value = minari_dataset
 
-        dataset, metadata = load_offline.load_minari_episode_subset(
-            "mujoco/reacher/medium-v0", num_episodes=3, seed=7, episode_id_start=10
+        dataset, metadata = load_offline.load_minari_transition_subset(
+            "mujoco/reacher/medium-v0", num_transitions=7, seed=7, episode_id_start=10
         )
+        load_dataset.assert_called_once_with("mujoco/reacher/medium-v0", download=True)
         permutation = np.random.default_rng(7).permutation(4)
-        expected_indices = permutation[:3]
+        count = np.searchsorted(np.cumsum(np.asarray(lengths)[permutation]), 7) + 1
+        expected_indices = permutation[:count]
+        expected_lengths = np.asarray(lengths)[expected_indices]
+        np.testing.assert_array_equal(yielded_indices, expected_indices)
+        self.assertEqual(len(set(yielded_indices)), len(yielded_indices))
         np.testing.assert_array_equal(
-            dataset["observations"][::2, 0] // 10, expected_indices
-        )
-        np.testing.assert_array_equal(
-            dataset["episode_ids"], [10, 10, 11, 11, 12, 12]
-        )
-        self.assertEqual(metadata["available_num_episodes"], 4)
-        self.assertEqual(metadata["available_num_transitions"], 8)
-
-        continuation, _ = load_offline.load_minari_episode_subset(
-            "mujoco/reacher/medium-v0", num_episodes=1, seed=7,
-            episode_id_start=20, episode_offset=3,
+            dataset["observations"],
+            np.concatenate([episodes[index].observations[:-1] for index in expected_indices]),
         )
         np.testing.assert_array_equal(
-            continuation["observations"][::2, 0] // 10, permutation[3:]
+            dataset["next_observations"],
+            np.concatenate([episodes[index].observations[1:] for index in expected_indices]),
         )
-        self.assertNotIn(
-            continuation["observations"][0, 0] // 10,
-            dataset["observations"][::2, 0] // 10,
+        np.testing.assert_array_equal(
+            dataset["episode_ids"], np.repeat(np.arange(10, 10 + count), expected_lengths)
         )
-
-        with self.assertRaisesRegex(ValueError, "contains only 4 episodes"):
-            load_offline.load_minari_episode_subset(
-                "mujoco/reacher/medium-v0", num_episodes=5, seed=7, episode_id_start=0
+        for key, attribute in (("terminals", "terminations"), ("timeouts", "truncations")):
+            np.testing.assert_array_equal(
+                dataset[key],
+                np.concatenate([getattr(episodes[index], attribute) for index in expected_indices]),
             )
-        with self.assertRaisesRegex(ValueError, "cannot top up without repetition"):
-            load_offline.load_minari_episode_subset(
-                "mujoco/reacher/medium-v0", num_episodes=2, seed=7,
-                episode_id_start=20, episode_offset=3,
+        self.assertEqual(metadata, {
+            "dataset_id": "mujoco/reacher/medium-v0",
+            "env_id": "Reacher-v5",
+            "available_num_episodes": 4,
+            "available_num_transitions": sum(lengths),
+            "num_episodes": count,
+            "num_transitions": sum(expected_lengths),
+            "seed": 7,
+        })
+        self.assertGreaterEqual(metadata["num_transitions"], 7)
+        self.assertLess(metadata["num_transitions"] - 7, expected_lengths[-1])
+
+        repeated, repeated_metadata = load_offline.load_minari_transition_subset(
+            "mujoco/reacher/medium-v0", num_transitions=7, seed=7, episode_id_start=10
+        )
+        self.assertEqual(repeated_metadata, metadata)
+        for key in dataset:
+            np.testing.assert_array_equal(repeated[key], dataset[key])
+
+        complete, complete_metadata = load_offline.load_minari_transition_subset(
+            "mujoco/reacher/medium-v0", num_transitions=sum(lengths), seed=7
+        )
+        self.assertEqual(complete_metadata["num_transitions"], sum(lengths))
+        self.assertEqual(complete_metadata["num_episodes"], len(episodes))
+        np.testing.assert_array_equal(
+            complete["episode_ids"], np.repeat(np.arange(4), np.asarray(lengths)[permutation])
+        )
+
+        yielded_indices.clear()
+        with self.assertRaisesRegex(ValueError, "contains only 11 transitions"):
+            load_offline.load_minari_transition_subset(
+                "mujoco/reacher/medium-v0", num_transitions=12, seed=7
             )
+        self.assertEqual(yielded_indices, [])
+
+        minari_dataset.total_steps = 20
+        with self.assertRaisesRegex(ValueError, "exhausted its episodes after 11 transitions"):
+            load_offline.load_minari_transition_subset(
+                "mujoco/reacher/medium-v0", num_transitions=12, seed=7
+            )
+        self.assertEqual(len(yielded_indices), len(episodes))
+        self.assertEqual(len(set(yielded_indices)), len(episodes))
+
+    @patch("minari.load_dataset")
+    def test_transition_quota_must_be_positive_before_loading(self, load_dataset):
+        for quota in (0, -1):
+            with self.subTest(quota=quota):
+                with self.assertRaisesRegex(ValueError, "num_transitions must be positive"):
+                    load_offline.load_minari_transition_subset(
+                        "mujoco/reacher/medium-v0", num_transitions=quota, seed=7
+                    )
+        load_dataset.assert_not_called()
+
+    @patch("minari.list_remote_datasets")
+    def test_walker_uses_its_own_minari_prefix(self, list_remote_datasets):
+        list_remote_datasets.return_value = {
+            "mujoco/walker2d/simple-v0": {},
+            "mujoco/walker2d/medium-v0": {},
+            "mujoco/walker2d/expert-v0": {},
+        }
+        self.assertEqual(
+            load_offline.list_minari_dataset_ids("Walker2d-v5", "medium-v0"),
+            ["mujoco/walker2d/medium-v0"],
+        )
+        list_remote_datasets.assert_called_once_with(prefix="mujoco/walker2d")
 
 
 if __name__ == "__main__":

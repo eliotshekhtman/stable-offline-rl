@@ -458,6 +458,8 @@ def build_dynamics(
     task = task.lower()
     if task in ROBOMIMIC_TASKS or task == "reacher-v5":
         termination_fn = termination_fn_never
+    elif task == "walker2d-v5":
+        termination_fn = termination_fn_walker2d
     elif task == "inverteddoublependulum-v5":
         termination_fn = termination_fn_inverted_double_pendulum
     else:
@@ -484,6 +486,15 @@ def build_dynamics(
 
 def termination_fn_never(obs, act, next_obs):
     return np.zeros((len(obs), 1), dtype=bool)
+
+
+def termination_fn_walker2d(obs, act, next_obs):
+    # Default Walker2d-v5 observations omit global x, so height/angle lead.
+    height, angle = next_obs[:, 0], next_obs[:, 1]
+    healthy = (height > 0.8) & (height < 2.0) & (angle > -1.0) & (angle < 1.0)
+    # Reject nonfinite model predictions in addition to the native health rule.
+    healthy &= np.isfinite(next_obs).all(axis=-1)
+    return (~healthy)[:, None]
 
 
 def termination_fn_inverted_double_pendulum(obs, act, next_obs):

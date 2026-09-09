@@ -428,11 +428,23 @@ def algorithm_group_key(record: dict) -> tuple[str, str]:
     return record["algo"], dynamics_chunk_mode(record) or ""
 
 
+def capitalize_label(label: str) -> str:
+    return label[:1].upper() + label[1:]
+
+
+def algorithm_name(record: dict, series: dict | None = None) -> str:
+    algo = record["algo"]
+    label = (series or {}).get("label", algo)
+    if label.lower() == algo or label.lower().startswith(algo + " "):
+        return algo.upper() + label[len(algo):]
+    return capitalize_label(label)
+
+
 def algorithm_label(record: dict) -> str:
     mode = dynamics_chunk_mode(record)
     if mode is not None and mode != "direct":
-        return f"{record['algo']} ({mode} dynamics)"
-    return record["algo"]
+        return f"{algorithm_name(record)} ({mode} dynamics)"
+    return algorithm_name(record)
 
 
 def parameter_value_label(path: str, value) -> str:
@@ -450,20 +462,58 @@ def parameter_value_label(path: str, value) -> str:
     return f"{name}={rendered}"
 
 
-def cohort_parameter_labels(series: dict) -> list[str]:
+def cohort_parameter_labels(
+    series: dict, hidden_parameters: set[str] | None = None
+) -> list[str]:
     return [
         parameter_value_label(path, value)
         for path, value in sorted(series["match"].items())
+        if hidden_parameters is None or path not in hidden_parameters
     ]
 
 
-def cohort_policy_label(record: dict, series: dict) -> str:
+def constant_cohort_parameters(records: list[dict]) -> set[str]:
+    """Find constant filters in this plot without treating unrelated algorithms as variants."""
+    paths = {
+        path for record in records
+        for path in record.get("_plot_cohort_spec", {}).get("match", {})
+    }
+    constant = set()
+    for path in paths:
+        values = [
+            (record["algo"], training_schema_value(record, path),
+             path in record.get("_plot_cohort_spec", {}).get("match", {}))
+            for record in records
+        ]
+        applicable_algorithms = {
+            algo for algo, (_, present), matched in values if present or matched
+        }
+        applicable_values = [
+            value for algo, value, _ in values if algo in applicable_algorithms
+        ]
+        if all(value == applicable_values[0] for value in applicable_values[1:]):
+            constant.add(path)
+    return constant
+
+
+def cohort_policy_label(
+    record: dict, series: dict, hidden_parameters: set[str] | None = None
+) -> str:
     qualifiers = [f"l={record['chunk_length']}"]
     mode = dynamics_chunk_mode(record)
     if mode is not None and mode != "direct":
         qualifiers.append(f"{mode} dynamics")
-    qualifiers.extend(cohort_parameter_labels(series))
-    return f"{series.get('label', record['algo'])} ({', '.join(qualifiers)})"
+    qualifiers.extend(cohort_parameter_labels(series, hidden_parameters))
+    return f"{algorithm_name(record, series)} ({', '.join(qualifiers)})"
+
+
+def history_plot_labels(histories: list[dict]) -> list[str]:
+    hidden_parameters = constant_cohort_parameters(histories)
+    return [
+        cohort_policy_label(history, history["_plot_cohort_spec"], hidden_parameters)
+        if "_plot_cohort_spec" in history else history["label"]
+        for history in histories
+    ]
 
 
 def plot_series_key(record: dict) -> tuple[int, str, str]:
@@ -593,7 +643,9 @@ def coalesce_clean_minari_baselines(rows: list[dict]) -> list[dict]:
     return coalesced
 
 
-def plot_series_label(record: dict) -> str:
+def plot_series_label(
+    record: dict, hidden_parameters: set[str] | None = None
+) -> str:
     series = record.get("_plot_cohort_spec")
     if series is None:
         return algorithm_label(record)
@@ -602,8 +654,8 @@ def plot_series_label(record: dict) -> str:
     mode = dynamics_chunk_mode(record)
     if mode is not None and mode != "direct":
         qualifiers.append(f"{mode} dynamics")
-    qualifiers.extend(cohort_parameter_labels(series))
-    label = series.get("label", record["algo"])
+    qualifiers.extend(cohort_parameter_labels(series, hidden_parameters))
+    label = algorithm_name(record, series)
     if qualifiers:
         return f"{label} ({', '.join(qualifiers)})"
     return label
@@ -612,13 +664,14 @@ def plot_series_label(record: dict) -> str:
 def algorithm_groups(
     records: list[dict], value_key: str | None = None
 ) -> list[tuple[str, list[dict]]]:
+    hidden_parameters = constant_cohort_parameters(records)
     groups = {}
     for record in records:
         groups.setdefault(plot_series_key(record), []).append(record)
 
     result = []
     for _, group in sorted(groups.items()):
-        label = plot_series_label(group[0])
+        label = plot_series_label(group[0], hidden_parameters)
         if value_key is not None:
             by_value = {}
             for record in group:
@@ -649,8 +702,8 @@ def algorithm_groups(
 def policy_label(record: dict) -> str:
     mode = dynamics_chunk_mode(record)
     if mode is not None and mode != "direct":
-        return f"{record['algo']} (l={record['chunk_length']}, {mode} dynamics)"
-    return f"{record['algo']} (l={record['chunk_length']})"
+        return f"{algorithm_name(record)} (l={record['chunk_length']}, {mode} dynamics)"
+    return f"{algorithm_name(record)} (l={record['chunk_length']})"
 
 
 def bootstrap_mean(samples_by_seed: list[np.ndarray]) -> tuple[float, float, float]:
@@ -740,8 +793,9 @@ def final_performance_samples(row: dict) -> list[np.ndarray]:
 def history_performance_samples(history: dict, step: int) -> list[np.ndarray]:
     samples = []
     for seed_history in history["seed_histories"]:
-        record = next(record for record in seed_history["records"] if record["step"] == step)
-        with np.load(Path(seed_history["eval_dir"]) / "rollouts" / f"step_{record['step']}.npz") as data:
+        if not any(record["step"] == step for record in seed_history["records"]):
+            continue
+        with np.load(Path(seed_history["eval_dir"]) / "rollouts" / f"step_{step}.npz") as data:
             samples.append(data["performance"])
     return samples
 
@@ -749,7 +803,9 @@ def history_performance_samples(history: dict, step: int) -> list[np.ndarray]:
 def history_scalar_samples(history: dict, step: int, key: str) -> list[np.ndarray]:
     samples = []
     for seed_history in history["seed_histories"]:
-        record = next(record for record in seed_history["records"] if record["step"] == step)
+        record = next((record for record in seed_history["records"] if record["step"] == step), None)
+        if record is None:
+            continue
         samples.append(np.asarray([record[key]], dtype=np.float64))
     return samples
 
@@ -778,10 +834,10 @@ def plot_performance_vs_chunk_length(rows: list[dict], out: Path) -> None:
     ax.minorticks_off()
     ax.axhline(
         np.mean([row["expert_performance_mean"] for row in rows]),
-        color="black", linestyle=":", label="expert",
+        color="black", linestyle=":", label="Expert",
     )
-    ax.set_xlabel("action chunk length")
-    ax.set_ylabel(rows[0]["performance_label"])
+    ax.set_xlabel("Action chunk length")
+    ax.set_ylabel(capitalize_label(rows[0]["performance_label"]))
     ax.set_title(f"Final-policy {rows[0]['performance_label']} vs action chunk length")
     ax.legend()
     fig.tight_layout()
@@ -860,9 +916,17 @@ def plot_noise_scale_ablation(rows: list[dict], out: Path) -> None:
             / "final"
         )
         experiment_out.mkdir(parents=True, exist_ok=True)
+        mixture = ", ".join(
+            f"{100 * fraction:g}% {name}"
+            for name, fraction in (
+                ("clean expert", clean), ("noisy expert", noisy),
+                ("random policy", random),
+            )
+            if fraction > 0.0
+        )
         title = (
-            "Gaussian action-noise scale ablation "
-            f"(clean={clean:g}, noisy={noisy:g}, random={random:g})"
+            "Gaussian action-noise scale ablation\n"
+            f"Trajectories: {mixture}"
         )
         performance_ablation_plot(
             group,
@@ -940,13 +1004,13 @@ def performance_ablation_plot(
         ax.fill_between(x, low, high, color=line.get_color(), alpha=0.2)
     ax.axhline(
         np.mean([row["expert_performance_mean"] for row in rows]),
-        color="black", linestyle=":", label="expert",
+        color="black", linestyle=":", label="Expert",
     )
     if fraction_axis:
         ax.set_xlim(-0.02, 1.02)
-    ax.set_xlabel(value_label)
-    ax.set_ylabel(rows[0]["performance_label"])
-    ax.set_title(f"Final-policy {rows[0]['performance_label']}\n{title}")
+    ax.set_xlabel(capitalize_label(value_label))
+    ax.set_ylabel(capitalize_label(rows[0]["performance_label"]))
+    ax.set_title(f"Final-policy {rows[0]['performance_label']}\n{capitalize_label(title)}")
     ax.legend()
     fig.tight_layout()
     fig.savefig(path, dpi=200)
@@ -979,15 +1043,15 @@ def contraction_curve_plot(
                         seed_curves.append(data["distance_curves"])
             center, low, high = bootstrap_curve(seed_curves)
             timesteps = np.arange(len(center))
-            line, = axis.plot(center, label=f"{value_label}={row[value_key]:g}")
+            line, = axis.plot(center, label=f"{capitalize_label(value_label)}={row[value_key]:g}")
             axis.fill_between(
                 timesteps, low, high, color=line.get_color(), alpha=0.2
             )
         axis.set_title(label)
-        axis.set_xlabel("primitive timestep")
+        axis.set_xlabel("Primitive timestep")
         axis.legend(fontsize=8)
-    axes[0, 0].set_ylabel("agent Cartesian-position distance (m)")
-    fig.suptitle(title)
+    axes[0, 0].set_ylabel("Agent Cartesian-position distance (m)")
+    fig.suptitle(capitalize_label(title))
     fig.tight_layout()
     fig.savefig(path, dpi=200)
     plt.close(fig)
@@ -1006,7 +1070,7 @@ def plot_training_histories(histories: list[dict], out: Path) -> None:
 
 def performance_history_plot(histories: list[dict], path: Path) -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
-    for history in histories:
+    for history, label in zip(histories, history_plot_labels(histories)):
         records = history["records"]
         x = [record["actual_percent"] for record in records]
         intervals = [
@@ -1014,14 +1078,14 @@ def performance_history_plot(histories: list[dict], path: Path) -> None:
             for record in records
         ]
         center, low, high = map(np.asarray, zip(*intervals))
-        line, = ax.plot(x, center, marker="o", label=history["label"])
+        line, = ax.plot(x, center, marker="o", label=label)
         ax.fill_between(x, low, high, color=line.get_color(), alpha=0.2)
     ax.axhline(
         np.mean([history["expert_performance_mean"] for history in histories]),
-        color="black", linestyle=":", label="expert",
+        color="black", linestyle=":", label="Expert",
     )
-    ax.set_xlabel("training completed (%)")
-    ax.set_ylabel(histories[0]["performance_label"])
+    ax.set_xlabel("Training completed (%)")
+    ax.set_ylabel(capitalize_label(histories[0]["performance_label"]))
     ax.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(path, dpi=200)
@@ -1035,7 +1099,7 @@ def history_line_plot(histories: list[dict], keys: tuple[str, ...], names: tuple
         if not key_histories:
             axis.set_visible(False)
             continue
-        for history in key_histories:
+        for history, label in zip(key_histories, history_plot_labels(key_histories)):
             records = history["records"]
             x = [record["actual_percent"] for record in records]
             intervals = [
@@ -1043,13 +1107,13 @@ def history_line_plot(histories: list[dict], keys: tuple[str, ...], names: tuple
                 for record in records
             ]
             center, low, high = map(np.asarray, zip(*intervals))
-            line, = axis.plot(x, center, marker="o", label=history["label"])
+            line, = axis.plot(x, center, marker="o", label=label)
             axis.fill_between(x, low, high, color=line.get_color(), alpha=0.2)
         if key.endswith("_ood_ratio"):
             axis.axhline(1.0, color="gray", linestyle=":")
-        axis.set_ylabel(name)
+        axis.set_ylabel(capitalize_label(name))
     axes[0, 0].legend(fontsize=8)
-    axes[-1, 0].set_xlabel("training completed (%)")
+    axes[-1, 0].set_xlabel("Training completed (%)")
     fig.tight_layout()
     fig.savefig(path, dpi=200)
     plt.close(fig)

@@ -136,10 +136,10 @@ def parse_args() -> argparse.Namespace:
     )
     generated.add_argument(
         "--composition", type=float, nargs=2, action="append", metavar=("CLEAN_EXPERT", "NOISY_EXPERT"),
-        help="Generated-data clean and noisy expert trajectory proportions; repeat for multiple compositions, with random trajectories filling the remainder (default: 1 0)",
+        help="Minimum clean and noisy expert shares of --num-samples transitions; complete trajectories may overshoot each quota, with random data filling the remainder (default: 1 0)",
     )
     generated.add_argument("--max-timesteps", type=int, default=1000, help="Maximum length of each generated clean, noisy, or random rollout trajectory")
-    generated.add_argument("--minari-fraction", dest="minari_fractions", type=float, nargs="+", default=[0.0, 0.25, 0.5, 0.75, 1.0], help="Clean-minari trajectory fractions to sweep; the remainder comes from clean expert trajectories")
+    generated.add_argument("--minari-fraction", dest="minari_fractions", type=float, nargs="+", default=[0.0, 0.25, 0.5, 0.75, 1.0], help="Minimum Minari shares of --num-samples transitions; the remainder comes from clean expert trajectories, retaining complete episodes")
 
     training = parser.add_argument_group("policy training")
     training.add_argument(
@@ -565,75 +565,39 @@ def collect_clean_minari_dataset(
     minari_fraction: float,
     args: argparse.Namespace,
 ) -> tuple[dict[str, np.ndarray], dict]:
-    env = gym.make(env_name)
-    try:
-        trajectory_horizon = min(args.max_timesteps, env.spec.max_episode_steps)
-    finally:
-        env.close()
-
-    target_num_trajectories = max(2, math.ceil(num_samples / trajectory_horizon))
-    initial_num_minari = max(1, int(round(target_num_trajectories * minari_fraction)))
-    target_counts = np.asarray(
-        [target_num_trajectories - initial_num_minari, initial_num_minari],
-        dtype=np.int64,
+    # The sweep routes the zero-Minari endpoint through generated clean data.
+    clean_quota, minari_quota = rollout.transition_quotas(
+        num_samples, [1.0 - minari_fraction, minari_fraction]
+    ).tolist()
+    minari_dataset, minari_metadata = load_offline.load_minari_transition_subset(
+        dataset_id=dataset_id,
+        num_transitions=minari_quota,
+        seed=args.seed,
+        episode_id_start=0,
     )
-    proportions = np.asarray([1.0 - minari_fraction, minari_fraction])
-    trajectory_counts = np.zeros(2, dtype=np.int64)
-    transition_counts = np.zeros(2, dtype=np.int64)
-    components = []
-    next_episode_id = 0
-    clean_rng = np.random.default_rng(args.seed)
-    minari_metadata = None
-
-    while transition_counts.sum() < num_samples:
-        additions = target_counts - trajectory_counts
-        num_clean, num_minari = (int(value) for value in additions)
-        if num_clean:
-            if not expert_path.exists():
-                raise FileNotFoundError(f"Expert policy not found: {expert_path}")
-            clean_dataset = rollout.collect_expert(
-                env_name=env_name,
-                policy_path=str(expert_path),
-                num_trajectories=num_clean,
-                max_timesteps=args.max_timesteps,
-                deterministic=True,
-                rng=clean_rng,
-                episode_id_start=next_episode_id,
-            )
-            components.append(clean_dataset)
-            trajectory_counts[0] += num_clean
-            transition_counts[0] += len(clean_dataset["rewards"])
-            next_episode_id += num_clean
-
-        if num_minari:
-            minari_dataset, minari_metadata = load_offline.load_minari_episode_subset(
-                dataset_id=dataset_id,
-                num_episodes=num_minari,
-                seed=args.seed,
-                episode_id_start=next_episode_id,
-                episode_offset=int(trajectory_counts[1]),
-            )
-            components.append(minari_dataset)
-            trajectory_counts[1] += num_minari
-            transition_counts[1] += len(minari_dataset["rewards"])
-            next_episode_id += num_minari
-
-        if transition_counts.sum() < num_samples:
-            mean_length = transition_counts.sum() / trajectory_counts.sum()
-            shortfall = num_samples - transition_counts.sum()
-            target_num_trajectories = int(trajectory_counts.sum()) + max(
-                1, math.ceil(shortfall / mean_length)
-            )
-            target_counts = grow_source_counts(
-                trajectory_counts, target_num_trajectories, proportions
-            )
+    components = [minari_dataset]
+    num_minari = minari_metadata["num_episodes"]
+    num_clean = num_clean_transitions = 0
+    if clean_quota:
+        if not expert_path.exists():
+            raise FileNotFoundError(f"Expert policy not found: {expert_path}")
+        clean_dataset = rollout.collect_expert(
+            env_name=env_name,
+            policy_path=str(expert_path),
+            num_trajectories=None,
+            min_transitions=clean_quota,
+            max_timesteps=args.max_timesteps,
+            deterministic=True,
+            rng=np.random.default_rng(args.seed),
+            episode_id_start=num_minari,
+        )
+        components.append(clean_dataset)
+        num_clean = len(np.unique(clean_dataset["episode_ids"]))
+        num_clean_transitions = len(clean_dataset["rewards"])
 
     dataset = load_offline.concat_datasets(components)
-    num_clean = int(trajectory_counts[0])
-    num_minari = int(trajectory_counts[1])
     num_trajectories = num_clean + num_minari
-    num_clean_transitions = int(transition_counts[0])
-    num_minari_transitions = int(transition_counts[1])
+    num_minari_transitions = len(minari_dataset["rewards"])
     num_transitions = num_clean_transitions + num_minari_transitions
 
     return dataset, {
@@ -644,8 +608,9 @@ def collect_clean_minari_dataset(
         "minari_env_id": minari_metadata["env_id"],
         "max_timesteps": args.max_timesteps,
         "requested_num_samples": num_samples,
-        "requested_minari_trajectory_fraction": minari_fraction,
-        "requested_clean_expert_trajectory_fraction": 1.0 - minari_fraction,
+        "requested_minari_transition_fraction": minari_fraction,
+        "requested_clean_expert_transition_fraction": 1.0 - minari_fraction,
+        "requested_transition_quotas": {"clean_expert": clean_quota, "minari": minari_quota},
         "num_trajectories": num_trajectories,
         "num_clean_expert_trajectories": num_clean,
         "num_minari_trajectories": num_minari,
@@ -659,20 +624,6 @@ def collect_clean_minari_dataset(
         "deterministic": True,
         "seed": args.seed,
     }
-
-
-def grow_source_counts(
-    current_counts: np.ndarray,
-    target_total: int,
-    proportions: np.ndarray,
-) -> np.ndarray:
-    """Grow source counts while staying closest to requested proportions."""
-    counts = np.asarray(current_counts, dtype=np.int64).copy()
-    while counts.sum() < target_total:
-        next_total = int(counts.sum()) + 1
-        deficits = next_total * proportions - counts
-        counts[int(np.argmax(deficits))] += 1
-    return counts
 
 
 def find_generated_clean_dataset(
@@ -708,7 +659,7 @@ def find_generated_clean_dataset(
         if {key: value for key, value in schema.items() if key != "noise_scale"} != expected:
             continue
         dataset_dir = metadata_path.parent
-        if dataset_cache_is_complete(dataset_dir):
+        if dataset_cache_is_complete(dataset_dir) and dataset_meets_transition_quotas(metadata, schema):
             candidates.append((dataset_dir.parent, dataset_dir.parent.name, schema))
     if not candidates or args.algos == ["none"]:
         return None if not candidates else candidates[0]
@@ -757,6 +708,7 @@ def find_cached_dataset(
         if (
             metadata.get("dataset_schema") == dataset_schema
             and dataset_cache_is_complete(dataset_dir)
+            and dataset_meets_transition_quotas(metadata, dataset_schema)
         ):
             try:
                 dataset = rollout.load_dataset(dataset_dir / "train.npz")
@@ -765,6 +717,30 @@ def find_cached_dataset(
                 continue
             return dataset, split_paths(dataset_dir)
     return None
+
+
+def dataset_meets_transition_quotas(metadata: dict, schema: dict) -> bool:
+    """Reuse existing collections only when their actual source counts suffice."""
+    source = schema.get("source")
+    if source not in {"generated", "clean-minari"}:
+        return True
+    try:
+        if source == "generated":
+            clean, noisy = schema["prop_clean_expert"], schema["prop_noisy_expert"]
+            proportions = [clean, noisy, 1.0 - (clean + noisy)]
+            names = ("clean_expert", "noisy_expert", "random")
+        else:
+            fraction = schema["minari_fraction"]
+            proportions = [1.0 - fraction, fraction]
+            names = ("clean_expert", "minari")
+        quotas = rollout.transition_quotas(schema["num_samples"], proportions)
+        return all(
+            metadata.get(f"num_{name}_transitions", 0) >= quota if quota
+            else metadata.get(f"num_{name}_transitions", 0) == 0
+            for name, quota in zip(names, quotas)
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
 
 
 def dataset_cache_is_complete(dataset_dir: Path) -> bool:
@@ -991,6 +967,14 @@ def find_trained_run(run_parent: Path, training_schema: dict) -> Path | None:
         except (OSError, json.JSONDecodeError):
             continue
         if manifest.get("training_schema") == training_schema and run_is_complete(manifest):
+            dataset_schema = training_schema.get("dataset", {})
+            if dataset_schema.get("source") in {"generated", "clean-minari"}:
+                try:
+                    metadata = json.loads(Path(manifest["dataset_metadata_path"]).read_text(encoding="utf-8"))
+                except (KeyError, OSError, ValueError, TypeError):
+                    continue
+                if not dataset_meets_transition_quotas(metadata, dataset_schema):
+                    continue
             return manifest_path.parent
     return None
 
