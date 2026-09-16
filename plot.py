@@ -3,7 +3,7 @@
 # - Average matching results across the random seeds selected by the sweep.
 # - Plot final-policy performance and contraction against action chunk length.
 # - Plot task performance and contraction against generated noisy-trajectory fractions.
-# - Plot final-policy performance against generated expert-action noise scale.
+# - Plot final-policy performance and contraction against expert-action noise scale.
 # - Plot task performance and contraction against clean-expert/Minari fractions.
 # - Plot state and state-action conservativity over policy-training checkpoints.
 # - Plot task performance over policy-training checkpoints.
@@ -19,7 +19,13 @@ import task_support
 
 
 EVALUATION_SCHEMA_VERSION = 2
-PLOT_COHORT_VERSION = 1
+PLOT_COHORT_VERSION = 2
+PLOT_ABLATIONS = {
+    "chunk_length",
+    "noisy_fraction",
+    "noise_scale",
+    "minari_fraction",
+}
 BOOTSTRAP_REPLICATES = 10000
 BOOTSTRAP_PERCENTILES = (10.0, 90.0)
 BOOTSTRAP_SEED = 0
@@ -39,9 +45,8 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "JSON cohort selecting one or more explicitly matched algorithm series; "
-            "required when historical runs contain multiple configurations of the "
-            "same algorithm at one plotted x-value"
+            "JSON cohort declaring the exact seeds, ablation values, run filters, "
+            "and algorithm series to plot"
         ),
     )
     args = parser.parse_args()
@@ -57,23 +62,34 @@ def plot_root(
     cohort: Path | dict | None = None,
 ) -> None:
     out = root / "plots" if out is None else out
-    if eval_dirs is None:
-        eval_dirs = latest_eval_dirs(root)
-    rows = load_rows(eval_dirs)
-    histories = load_histories(eval_dirs, rows)
-    rows = average_seed_rows(rows)
-    histories = average_seed_histories(histories)
+    cohort_config = None
     if cohort is not None:
         cohort_config = (
             load_plot_cohort(cohort) if isinstance(cohort, Path)
             else validate_plot_cohort(cohort)
         )
+    if eval_dirs is None:
+        eval_dirs = latest_eval_dirs(root)
+    rows = load_rows(eval_dirs)
+    histories = load_histories(eval_dirs, rows)
+    if cohort_config is not None:
+        rows, histories = filter_cohort_runs(rows, histories, cohort_config)
+    rows = average_seed_rows(rows)
+    histories = average_seed_histories(histories)
+    if cohort_config is not None:
         rows = select_plot_cohort(rows, cohort_config)
+        validate_cohort_grid(rows, cohort_config)
         histories = select_cohort_histories(histories, rows)
     out.mkdir(parents=True, exist_ok=True)
-    plot_generated_ablation(rows, out)
-    plot_noise_scale_ablation(rows, out)
-    plot_clean_minari_ablation(rows, out)
+    ablation = (
+        cohort_config["ablation"]["name"] if cohort_config is not None else None
+    )
+    if ablation in (None, "noisy_fraction"):
+        plot_generated_ablation(rows, out)
+    if ablation in (None, "noise_scale"):
+        plot_noise_scale_ablation(rows, out)
+    if ablation in (None, "minari_fraction"):
+        plot_clean_minari_ablation(rows, out)
 
     dataset_tags = sorted({row["plot_dataset_tag"] for row in rows} | {history["plot_dataset_tag"] for history in histories})
     for dataset_tag in dataset_tags:
@@ -81,10 +97,11 @@ def plot_root(
         dataset_out.mkdir(exist_ok=True)
         dataset_rows = [row for row in rows if row["plot_dataset_tag"] == dataset_tag]
         dataset_histories = [history for history in histories if history["plot_dataset_tag"] == dataset_tag]
-        selection_out = dataset_out / "final"
-        selection_out.mkdir(exist_ok=True)
-        plot_performance_vs_chunk_length(dataset_rows, selection_out)
-        plot_contraction_vs_chunk_length(dataset_rows, selection_out)
+        if ablation in (None, "chunk_length"):
+            selection_out = dataset_out / "final"
+            selection_out.mkdir(exist_ok=True)
+            plot_performance_vs_chunk_length(dataset_rows, selection_out)
+            plot_contraction_vs_chunk_length(dataset_rows, selection_out)
         plot_training_histories(dataset_histories, dataset_out)
 
 
@@ -279,6 +296,26 @@ def load_plot_cohort(path: Path) -> dict:
     return validate_plot_cohort(load_json(path))
 
 
+def validate_cohort_match(match: dict, location: str) -> dict:
+    if not isinstance(match, dict):
+        raise ValueError(f"Plot cohort {location} must be an object")
+    for path in match:
+        if (
+            not isinstance(path, str)
+            or not path
+            or any(not component for component in path.split("."))
+        ):
+            raise ValueError(
+                f"Plot cohort {location} has an invalid match path"
+            )
+        if "seed" in path.split("."):
+            raise ValueError(
+                "Plot cohorts select seeds with the top-level 'seeds' field; "
+                f"{location} cannot match '{path}'"
+            )
+    return dict(match)
+
+
 def validate_plot_cohort(cohort: dict) -> dict:
     if not isinstance(cohort, dict):
         raise ValueError("Plot cohort must be a JSON object")
@@ -286,8 +323,61 @@ def validate_plot_cohort(cohort: dict) -> dict:
         raise ValueError(
             f"Plot cohort version must be {PLOT_COHORT_VERSION}"
         )
-    if set(cohort) != {"version", "series"}:
-        raise ValueError("Plot cohort supports only 'version' and 'series'")
+    required = {"version", "seeds", "ablation", "match", "series"}
+    optional = {"match_any"}
+    if set(cohort) - required - optional or required - set(cohort):
+        raise ValueError(
+            "Plot cohort requires 'version', 'seeds', 'ablation', 'match', "
+            "and 'series', with optional 'match_any'"
+        )
+
+    seeds = cohort["seeds"]
+    if (
+        not isinstance(seeds, list)
+        or not seeds
+        or any(
+            not isinstance(seed, int) or isinstance(seed, bool)
+            for seed in seeds
+        )
+        or len(set(seeds)) != len(seeds)
+    ):
+        raise ValueError("Plot cohort 'seeds' must contain unique integers")
+
+    ablation = cohort["ablation"]
+    if not isinstance(ablation, dict) or set(ablation) != {"name", "values"}:
+        raise ValueError(
+            "Plot cohort 'ablation' requires exactly 'name' and 'values'"
+        )
+    name = ablation["name"]
+    values = ablation["values"]
+    if name not in PLOT_ABLATIONS:
+        raise ValueError(
+            f"Plot cohort ablation must be one of {sorted(PLOT_ABLATIONS)}"
+        )
+    if (
+        not isinstance(values, list)
+        or not values
+        or any(
+            not isinstance(value, (int, float)) or isinstance(value, bool)
+            for value in values
+        )
+        or len(set(values)) != len(values)
+    ):
+        raise ValueError(
+            "Plot cohort ablation values must be unique numbers"
+        )
+
+    common_match = validate_cohort_match(cohort["match"], "'match'")
+    match_any = cohort.get("match_any")
+    if match_any is not None:
+        if not isinstance(match_any, list) or not match_any:
+            raise ValueError(
+                "Plot cohort 'match_any' must be a non-empty list"
+            )
+        match_any = [
+            validate_cohort_match(match, f"'match_any' entry {index}")
+            for index, match in enumerate(match_any)
+        ]
 
     series = cohort["series"]
     if not isinstance(series, list) or not series:
@@ -307,25 +397,9 @@ def validate_plot_cohort(cohort: dict) -> dict:
             raise ValueError(
                 f"Plot cohort series {index} requires a non-empty 'algo'"
             )
-        match = item.get("match", {})
-        if not isinstance(match, dict):
-            raise ValueError(
-                f"Plot cohort series {index} 'match' must be an object"
-            )
-        for path in match:
-            if (
-                not isinstance(path, str)
-                or not path
-                or any(not component for component in path.split("."))
-            ):
-                raise ValueError(
-                    f"Plot cohort series {index} has an invalid match path"
-                )
-            if "seed" in path.split("."):
-                raise ValueError(
-                    "Plot cohorts select seed-averaged configurations; "
-                    f"series {index} cannot match '{path}'"
-                )
+        match = validate_cohort_match(
+            item.get("match", {}), f"series {index} 'match'"
+        )
         label = item.get("label")
         if label is not None and (not isinstance(label, str) or not label):
             raise ValueError(
@@ -335,7 +409,16 @@ def validate_plot_cohort(cohort: dict) -> dict:
         if label is not None:
             validated["label"] = label
         validated_series.append(validated)
-    return {"version": PLOT_COHORT_VERSION, "series": validated_series}
+    validated = {
+        "version": PLOT_COHORT_VERSION,
+        "seeds": list(seeds),
+        "ablation": {"name": name, "values": list(values)},
+        "match": common_match,
+        "series": validated_series,
+    }
+    if match_any is not None:
+        validated["match_any"] = match_any
+    return validated
 
 
 def training_schema_value(record: dict, path: str):
@@ -347,16 +430,67 @@ def training_schema_value(record: dict, path: str):
     return value, True
 
 
-def cohort_series_matches(record: dict, series: dict) -> bool:
-    if record["algo"] != series["algo"]:
-        return False
-    for path, expected in series["match"].items():
+def training_schema_matches(record: dict, match: dict) -> bool:
+    for path, expected in match.items():
         actual, present = training_schema_value(record, path)
         if not present and expected is None:
             continue
         if not present or actual != expected:
             return False
     return True
+
+
+def cohort_ablation_value(record: dict, cohort: dict):
+    name = cohort["ablation"]["name"]
+    path = {
+        "chunk_length": "chunk_length",
+        "noisy_fraction": "dataset.prop_noisy_expert",
+        "noise_scale": "dataset.noise_scale",
+        "minari_fraction": "dataset.minari_fraction",
+    }[name]
+    value, present = training_schema_value(record, path)
+    if present:
+        return value
+    if name == "minari_fraction":
+        dataset = record["training_schema"]["dataset"]
+        if (
+            dataset.get("source") == "generated"
+            and dataset.get("prop_clean_expert") == 1.0
+            and dataset.get("prop_noisy_expert") == 0.0
+            and dataset.get("prop_random") == 0.0
+        ):
+            return 0.0
+    return None
+
+
+def filter_cohort_runs(
+    rows: list[dict], histories: list[dict], cohort: dict
+) -> tuple[list[dict], list[dict]]:
+    seeds = set(cohort["seeds"])
+    values = set(cohort["ablation"]["values"])
+    alternatives = cohort.get("match_any")
+    selected_rows = [
+        row for row in rows
+        if row["training_schema"]["seed"] in seeds
+        and training_schema_matches(row, cohort["match"])
+        and (
+            alternatives is None
+            or any(training_schema_matches(row, match) for match in alternatives)
+        )
+        and cohort_ablation_value(row, cohort) in values
+    ]
+    eval_dirs = {row["eval_dir"] for row in selected_rows}
+    return (
+        selected_rows,
+        [history for history in histories if history["eval_dir"] in eval_dirs],
+    )
+
+
+def cohort_series_matches(record: dict, series: dict) -> bool:
+    return (
+        record["algo"] == series["algo"]
+        and training_schema_matches(record, series["match"])
+    )
 
 
 def select_plot_cohort(rows: list[dict], cohort: dict) -> list[dict]:
@@ -367,11 +501,6 @@ def select_plot_cohort(rows: list[dict], cohort: dict) -> list[dict]:
             (row_index, row) for row_index, row in enumerate(rows)
             if cohort_series_matches(row, series)
         ]
-        if not matches:
-            raise ValueError(
-                f"Plot cohort series {series_index} ({series['algo']}) "
-                "matched no seed-averaged configurations"
-            )
         for row_index, row in matches:
             if row_index in owners:
                 raise ValueError(
@@ -385,6 +514,46 @@ def select_plot_cohort(rows: list[dict], cohort: dict) -> list[dict]:
                 "_plot_cohort_spec": series,
             })
     return selected
+
+
+def validate_cohort_grid(rows: list[dict], cohort: dict) -> None:
+    expected_seeds = set(cohort["seeds"])
+    name = cohort["ablation"]["name"]
+    grid_problems = []
+    for series_index, series in enumerate(cohort["series"]):
+        problems = []
+        series_rows = [
+            row for row in rows
+            if row["_plot_cohort_series"] == series_index
+        ]
+        for value in cohort["ablation"]["values"]:
+            matching = [
+                row for row in series_rows
+                if cohort_ablation_value(row, cohort) == value
+            ]
+            point = f"{name}={value:g}"
+            if not matching:
+                problems.append(f"{point} is missing")
+                continue
+            if len(matching) > 1:
+                problems.append(f"{point} has multiple configurations")
+                continue
+            seeds = {
+                seed_row["training_schema"]["seed"]
+                for seed_row in matching[0]["seed_rows"]
+            }
+            missing = sorted(expected_seeds - seeds)
+            if missing:
+                problems.append(f"{point} is missing seeds {missing}")
+        if problems:
+            grid_problems.append(
+                f"series {series_index} ({series['algo']}): "
+                f"{'; '.join(problems)}"
+            )
+    if grid_problems:
+        raise ValueError(
+            "Plot cohort grid is incomplete:\n" + "\n".join(grid_problems)
+        )
 
 
 def select_cohort_histories(
@@ -465,6 +634,8 @@ def parameter_value_label(path: str, value) -> str:
 def cohort_parameter_labels(
     series: dict, hidden_parameters: set[str] | None = None
 ) -> list[str]:
+    if "label" in series:
+        return []
     return [
         parameter_value_label(path, value)
         for path, value in sorted(series["match"].items())
@@ -935,6 +1106,13 @@ def plot_noise_scale_ablation(rows: list[dict], out: Path) -> None:
             "noise_scale",
             "Gaussian action-noise scale",
             fraction_axis=False,
+        )
+        contraction_curve_plot(
+            group,
+            "noise_scale",
+            "Gaussian action-noise scale",
+            "Final-policy Gaussian action-noise scale ablation",
+            experiment_out / "contraction_vs_noise_scale.png",
         )
 
 

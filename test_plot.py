@@ -331,11 +331,134 @@ class PlotCohortTests(unittest.TestCase):
         }
 
     @staticmethod
-    def cohort(*series):
-        return plot.validate_plot_cohort({
+    def cohort(*series, seeds=(0,), ablation="chunk_length", values=(4,),
+               match=None, match_any=None):
+        config = {
             "version": plot.PLOT_COHORT_VERSION,
+            "seeds": list(seeds),
+            "ablation": {"name": ablation, "values": list(values)},
+            "match": {} if match is None else match,
             "series": list(series),
+        }
+        if match_any is not None:
+            config["match_any"] = match_any
+        return plot.validate_plot_cohort(config)
+
+    @staticmethod
+    def raw_record(seed, source="generated", fraction=0.0, dataset_id=None):
+        row = PlotCohortTests.record(algo="iql", chunk_length=1)
+        dataset = {
+            "source": source,
+            "seed": seed,
+            "num_samples": 1000,
+        }
+        if source == "generated":
+            dataset.update({
+                "prop_clean_expert": 1.0 - fraction,
+                "prop_noisy_expert": fraction,
+                "prop_random": 0.0,
+            })
+        else:
+            dataset.update({
+                "dataset_id": dataset_id,
+                "minari_fraction": fraction,
+            })
+        row.update({
+            "dataset_source": source,
+            "env_name": "HalfCheetah-v5",
+            "eval_dir": f"eval-{source}-{dataset_id}-{fraction}-{seed}",
         })
+        row["training_schema"].update({
+            "env_name": "HalfCheetah-v5",
+            "seed": seed,
+            "dataset": dataset,
+        })
+        return row
+
+    def test_run_filter_applies_seeds_common_match_alternatives_and_values(self):
+        rows = [
+            self.raw_record(seed, source, fraction, dataset_id)
+            for seed in (0, 1, 2)
+            for source, fraction, dataset_id in (
+                ("generated", 0.0, None),
+                ("generated", 0.5, None),
+                ("clean-minari", 0.5, "mujoco/halfcheetah/medium-v0"),
+                ("clean-minari", 0.5, "mujoco/halfcheetah/expert-v0"),
+            )
+        ]
+        histories = [
+            {"eval_dir": row["eval_dir"], "training_schema": row["training_schema"]}
+            for row in rows
+        ]
+        cohort = self.cohort(
+            {"algo": "iql"},
+            seeds=(0, 1),
+            ablation="minari_fraction",
+            values=(0.0, 0.5),
+            match={"env_name": "HalfCheetah-v5", "dataset.num_samples": 1000},
+            match_any=[
+                {
+                    "dataset.source": "generated",
+                    "dataset.prop_clean_expert": 1.0,
+                    "dataset.prop_noisy_expert": 0.0,
+                },
+                {
+                    "dataset.source": "clean-minari",
+                    "dataset.dataset_id": "mujoco/halfcheetah/medium-v0",
+                },
+            ],
+        )
+
+        selected_rows, selected_histories = plot.filter_cohort_runs(
+            rows, histories, cohort
+        )
+
+        self.assertEqual(len(selected_rows), 4)
+        self.assertEqual(len(selected_histories), 4)
+        self.assertEqual(
+            {row["training_schema"]["seed"] for row in selected_rows}, {0, 1}
+        )
+        self.assertEqual(
+            {plot.cohort_ablation_value(row, cohort) for row in selected_rows},
+            {0.0, 0.5},
+        )
+        self.assertFalse(any(
+            row["training_schema"]["dataset"].get("dataset_id", "").endswith("expert-v0")
+            for row in selected_rows
+        ))
+
+    def test_grid_validation_requires_every_seed_at_every_value(self):
+        cohort = self.cohort(
+            {"algo": "mobile", "match": {"model_based.real_ratio": 0.5}},
+            seeds=(0, 1), values=(2, 4),
+        )
+        rows = []
+        for chunk_length, seeds in ((2, (0, 1)), (4, (0,))):
+            row = self.record(chunk_length=chunk_length)
+            row["seed_rows"] = [
+                {"training_schema": {"seed": seed}} for seed in seeds
+            ]
+            rows.append(row)
+        selected = plot.select_plot_cohort(rows, cohort)
+
+        with self.assertRaisesRegex(
+            ValueError, r"chunk_length=4.*missing seeds \[1\]"
+        ):
+            plot.validate_cohort_grid(selected, cohort)
+
+    def test_grid_validation_rejects_duplicate_configuration_at_one_value(self):
+        cohort = self.cohort(
+            {"algo": "mobile"}, seeds=(0,), values=(4,),
+        )
+        rows = []
+        for epoch in (100, 300):
+            row = self.record(epoch=epoch)
+            row["seed_rows"] = [{"training_schema": {"seed": 0}}]
+            rows.append(row)
+        selected = plot.select_plot_cohort(rows, cohort)
+
+        with self.assertRaisesRegex(ValueError, "multiple configurations"):
+            plot.validate_cohort_grid(selected, cohort)
 
     def test_mobile_real_ratio_variants_are_separate_labeled_series(self):
         rows = [
@@ -459,6 +582,19 @@ class PlotCohortTests(unittest.TestCase):
         self.assertEqual(plot.algorithm_name(row, {"label": "mobile baseline"}), "MOBILE baseline")
         self.assertEqual(plot.algorithm_name(row, {"label": "reference OOD"}), "Reference OOD")
         self.assertEqual(plot.capitalize_label("state-action OOD"), "State-action OOD")
+
+    def test_custom_label_replaces_match_details(self):
+        row = self.record()
+        selected = plot.select_plot_cohort([row], self.cohort({
+            "algo": "mobile",
+            "label": "MOBILE baseline",
+            "match": {"model_based.real_ratio": 0.5},
+        }))
+
+        self.assertEqual(
+            plot.algorithm_groups(selected, "chunk_length")[0][0],
+            "MOBILE baseline",
+        )
 
     def test_noise_scale_legend_hides_all_constant_filters(self):
         rows = []
@@ -743,20 +879,23 @@ class PlotCohortTests(unittest.TestCase):
             plot.select_plot_cohort([row], cohort)
 
     def test_cohort_cannot_select_individual_seeds(self):
-        with self.assertRaisesRegex(ValueError, "seed-averaged"):
+        with self.assertRaisesRegex(ValueError, "top-level 'seeds'"):
             self.cohort({
                 "algo": "mobile",
                 "match": {"dataset.seed": 1},
             })
 
-    def test_cohort_requires_every_declared_series_to_match(self):
+    def test_grid_requires_every_declared_series_to_match(self):
         cohort = self.cohort({
             "algo": "mobile",
             "match": {"model_based.real_ratio": 0.0},
         })
+        selected = plot.select_plot_cohort(
+            [self.record(real_ratio=0.5)], cohort
+        )
 
-        with self.assertRaisesRegex(ValueError, "matched no"):
-            plot.select_plot_cohort([self.record(real_ratio=0.5)], cohort)
+        with self.assertRaisesRegex(ValueError, "chunk_length=4 is missing"):
+            plot.validate_cohort_grid(selected, cohort)
 
     def test_selected_history_label_includes_variant_parameters(self):
         row = {
@@ -820,9 +959,10 @@ class NoiseScalePlotTests(unittest.TestCase):
         ):
             plot.algorithm_groups(rows, "noise_scale")
 
+    @patch("plot.contraction_curve_plot")
     @patch("plot.performance_ablation_plot")
     def test_noise_scale_plot_is_split_by_fixed_dataset_and_chunk(
-        self, performance_plot
+        self, performance_plot, contraction_plot
     ):
         rows = [
             self.row(scale, chunk_length=chunk_length)
@@ -834,6 +974,7 @@ class NoiseScalePlotTests(unittest.TestCase):
             plot.plot_noise_scale_ablation(rows, Path(directory))
 
         self.assertEqual(performance_plot.call_count, 2)
+        self.assertEqual(contraction_plot.call_count, 2)
         paths = {call.args[2] for call in performance_plot.call_args_list}
         self.assertEqual(paths, {
             Path(directory)
@@ -853,10 +994,17 @@ class NoiseScalePlotTests(unittest.TestCase):
                 ("noise_scale", "Gaussian action-noise scale"),
             )
             self.assertFalse(call.kwargs["fraction_axis"])
+        contraction_paths = {
+            call.args[4] for call in contraction_plot.call_args_list
+        }
+        self.assertEqual(contraction_paths, {
+            path.parent / "contraction_vs_noise_scale.png" for path in paths
+        })
 
+    @patch("plot.contraction_curve_plot")
     @patch("plot.performance_ablation_plot")
     def test_noise_scale_title_shows_only_nonzero_mixture_components(
-        self, performance_plot
+        self, performance_plot, _contraction_plot
     ):
         cases = [
             (0.5, 0.5, 0.0, "50% clean expert, 50% noisy expert"),
@@ -887,9 +1035,10 @@ class NoiseScalePlotTests(unittest.TestCase):
                 ))
                 self.assertEqual(json.dumps(rows, sort_keys=True), original)
 
+    @patch("plot.contraction_curve_plot")
     @patch("plot.performance_ablation_plot")
     def test_noise_scale_plot_requires_multiple_scales_and_a_noisy_component(
-        self, performance_plot
+        self, performance_plot, contraction_plot
     ):
         plot.plot_noise_scale_ablation([self.row(0.5)], Path("unused"))
         plot.plot_noise_scale_ablation(
@@ -898,6 +1047,7 @@ class NoiseScalePlotTests(unittest.TestCase):
         )
 
         performance_plot.assert_not_called()
+        contraction_plot.assert_not_called()
 
     @patch("plot.final_performance_samples", return_value=[np.ones(2)])
     def test_noise_scale_plot_does_not_use_fraction_axis_limits(self, _samples):

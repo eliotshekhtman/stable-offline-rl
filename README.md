@@ -123,20 +123,27 @@ State and state-action OOD ratios are evaluated over checkpoints. Each is the me
 
 For Robomimic datasets, final-policy plots compare task performance and contraction curves across action chunk lengths. For generated datasets, they compare those metrics against the realized fraction of complete trajectories collected from the noisy expert. A fixed random fraction gives the clean-expert/noisy-expert ablation; zero clean-expert fraction gives the random/noisy-expert ablation. A generated run with multiple noise scales also plots final-policy performance against requested noise scale, separately for every fixed sample count, requested composition, and chunk length, under `plots/noise_scale/`. Clean-Minari sweeps plot the same metrics against the realized Minari trajectory fraction, separately for each Minari dataset, sample count, and chunk length. Each plotter reads only its own source-specific metadata; generating one family no longer deletes unrelated existing plots. Performance and OOD ratios are also plotted against training percent. Lines are exact means with shaded hierarchical-bootstrap 10th-90th percentile bands: seeds and episodes are resampled for performance, while seeds and trajectory pairs are resampled for contraction. A one-seed run still uses episode or trajectory-pair variability; milestone OOD bands require multiple seeds because only one OOD estimate is saved per seed and checkpoint. Raw arrays are saved under the matching `<storage-root>/evals/<environment>/<run-name>/<training-timestamp>/` directory, and plots are written under `<storage-root>/evals/<environment>/plots/`.
 
-When plotting an environment's full result history, pass `python plot.py --root /data/shekhe/stable-offline-rl/evals/<environment> --cohort <cohort.json>` to select explicit series. Each `match` key is a dotted path within `training_schema`. Comparison and checkpoint legends omit matched parameters that are constant in that plot, and retain parameters whose actual values differ among the plotted runs. A field absent from an unrelated algorithm does not count as a different value; missing fields within an applicable algorithm do. For example, a single TD3BC alpha and a shared dataset composition stay hidden, while multiple alpha values or MOBILE real ratios remain labeled. This presentation rule does not change selectors, seed grouping, saved results, or configuration-consistency checks. The noise-scale plot states its fixed trajectory mixture once in the title; "random policy" denotes trajectories collected using random actions, not the Gaussian noise scale. Algorithm names are uppercase, and labels start with a capital letter. For example, this cohort deliberately plots two MOBILE variants as `MOBILE (real ratio=0.00)` and `MOBILE (real ratio=0.50)`:
+When plotting an environment's full result history, pass `python plot.py --root /data/shekhe/stable-offline-rl/evals/<environment> --cohort <cohort.json>` to select an exact experiment cohort. A version-2 cohort declares the required seeds, one ablation and its complete x-axis values, common `training_schema` matches, and the algorithm series. Each `match` key may be a dotted path within `training_schema`; optional top-level `match_any` entries describe alternative dataset schemas, such as a generated-clean endpoint combined with clean-Minari mixtures. The plotter filters individual runs before seed averaging and fails if any series/value combination is missing a requested seed or resolves to multiple configurations. For example, this cohort compares two MOBILE real ratios across chunk lengths:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
+  "seeds": [10000, 10100, 10200, 10300],
+  "ablation": {"name": "chunk_length", "values": [1, 2, 4, 8, 16]},
+  "match": {
+    "env_name": "Lift",
+    "dataset.source": "robomimic",
+    "dataset.dataset_type": "mg_dense",
+    "epoch": 300
+  },
   "series": [
     {"algo": "mobile", "match": {"model_based.real_ratio": 0.0}},
-    {"algo": "mobile", "match": {"model_based.real_ratio": 0.5}},
-    {"algo": "mopo", "match": {"epoch": 300}}
+    {"algo": "mobile", "match": {"model_based.real_ratio": 0.5}}
   ]
 }
 ```
 
-Algorithms may use different match parameters. Within each series, every plotted x-value must resolve to exactly one seed-averaged training configuration, and every non-axis training parameter must remain constant across x-values. An underspecified selector that mixes configurations therefore fails instead of combining or silently splitting them; select direct and recursive dynamics, different epochs, or other parameter variants as separate series. Automatically generated plots from one coherent sweep need no cohort file and retain their existing labels.
+Algorithms may use different series-specific match parameters. Explicit `label` values replace automatic match-detail labels; without one, differing values such as MOBILE real ratio remain visible. Every non-axis training parameter must remain constant within a line. An underspecified selector therefore fails instead of combining incompatible runs. Automatically generated plots from one coherent sweep need no cohort file and retain their existing behavior.
 
 Pass `--reuse-eval` together with `--eval` to reuse a completed matching evaluation or matching per-checkpoint rollout caches. Without it, the run's evaluation directory is cleared before evaluation. New non-final rollout caches retain only returns, task performance, decision-boundary observations, and action chunks; contraction-only initial simulator states and primitive Cartesian position traces are retained only for the final policy. Existing larger rollout caches remain readable. Gym expert references are shared by task, expert path, episode budget, and rollout seed under `<storage-root>/evals/<environment>/_expert_cache/`; Robomimic references are shared by task and official PH source. Matching legacy per-run `expert.npz` caches are still reused and promoted to the shared cache.
 
