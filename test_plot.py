@@ -244,25 +244,234 @@ class DynamicsChunkModePlotTests(unittest.TestCase):
             "performance_label": "success rate",
         }
         recursive = {**direct, **self.record(mode="recursive")}
-        figure, axis = plot.plt.subplots()
         with tempfile.TemporaryDirectory() as directory, patch(
-            "plot.plt.subplots", return_value=(figure, axis)
-        ), patch("plot.plt.close"):
+            "plot.plt.close"
+        ) as close:
             plot.performance_ablation_plot(
                 [recursive, direct],
-                "mode separation",
                 Path(directory) / "plot.png",
                 "fraction",
                 "fraction",
             )
 
+        figure = close.call_args.args[0]
+        self.addCleanup(plot.plt.close, figure)
+        axis = figure.axes[0]
         self.assertEqual(
             axis.get_legend_handles_labels()[1],
             ["MOPO", "MOPO (recursive dynamics)", "Expert"],
         )
         self.assertEqual(axis.get_xlabel(), "Fraction")
         self.assertEqual(axis.get_ylabel(), "Success rate")
+        self.assertEqual(axis.get_title(), "")
+        self.assertIsNone(figure._suptitle)
         plot.plt.close(figure)
+
+
+class PerformanceLabelTests(unittest.TestCase):
+    def test_performance_axis_label_shortens_only_the_legacy_reacher_label(self):
+        for label, expected in (
+            ("final fingertip-target distance (m)", "Final target distance (m)"),
+            ("Final fingertip-target distance (m)", "Final target distance (m)"),
+            ("Final target distance (m)", "Final target distance (m)"),
+            ("success rate", "Success rate"),
+            ("forward displacement", "Forward displacement"),
+            ("Reward_50%", "Reward_50%"),
+        ):
+            with self.subTest(label=label):
+                self.assertEqual(plot.performance_axis_label(label), expected)
+
+    def test_cached_reacher_labels_change_only_on_the_display_axes(self):
+        for label in (
+            "final fingertip-target distance (m)",
+            "Final fingertip-target distance (m)",
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "rollouts").mkdir()
+                cache = root / "results.json"
+                cache.write_text(json.dumps({"performance_label": label}))
+                cached_bytes = cache.read_bytes()
+                np.savez(root / "returns_last.npz", policy_episode_performance=[0.2, 0.4])
+                np.savez(root / "rollouts/step_1.npz", performance=[0.2, 0.4])
+                rows = [{
+                    **plot.load_json(cache),
+                    "algo": "iql", "chunk_length": chunk_length,
+                    "training_schema": {"algo": "iql", "chunk_length": chunk_length},
+                    "env_name": "Reacher-v5", "expert_performance_mean": 0.1,
+                    "seed_rows": [{"eval_dir": str(root)}],
+                } for chunk_length in (1, 4)]
+                histories = [{
+                    **rows[0], "label": "IQL (l=1)",
+                    "records": [{"step": 1, "actual_percent": 100.0}],
+                    "seed_histories": [{"eval_dir": str(root), "records": [{"step": 1}]}],
+                }]
+                original = json.dumps([rows, histories], sort_keys=True)
+                calls = (
+                    (plot.plot_performance_vs_chunk_length, (rows, root)),
+                    (plot.performance_ablation_plot, (
+                        rows, root / "ablation.png", "chunk_length", "Action chunk length", False,
+                    )),
+                    (plot.performance_history_plot, (histories, root / "history.png")),
+                )
+                for function, args in calls:
+                    with self.subTest(adapter=function.__name__), patch("plot.plt.close") as close:
+                        function(*args)
+                    figure = close.call_args.args[0]
+                    self.addCleanup(plot.plt.close, figure)
+                    self.assertEqual(figure.axes[0].get_ylabel(), "Final target distance (m)")
+                    self.assertEqual(json.dumps([rows, histories], sort_keys=True), original)
+                    self.assertEqual(cache.read_bytes(), cached_bytes)
+
+
+class PlotStyleTests(unittest.TestCase):
+    @staticmethod
+    def row(algo="iql", **values):
+        return {
+            "algo": algo,
+            "chunk_length": 1,
+            "training_schema": {"algo": algo, "chunk_length": 1},
+            "expert_performance_mean": 1.0,
+            "performance_label": "success rate",
+            "label": f"{algo.upper()} (l=1)",
+            **values,
+        }
+
+    def assert_axis_style(self, axis, legend_size=18):
+        self.assertAlmostEqual(axis.xaxis.label.get_fontsize(), 24.3 if axis.get_xlabel() else 18)
+        self.assertEqual(axis.yaxis.label.get_fontsize(), 18)
+        for tick in axis.get_xticklabels() + axis.get_yticklabels():
+            self.assertEqual(tick.get_fontsize(), 18)
+        for axis_dimension in (axis.xaxis, axis.yaxis):
+            self.assertTrue(all(
+                tick.gridline.get_visible()
+                for tick in axis_dimension.get_major_ticks()
+            ))
+            self.assertTrue(all(
+                axis_dimension.get_zorder() < band.get_zorder()
+                for band in axis.collections
+            ))
+        if axis.get_legend() is not None:
+            for text in axis.get_legend().get_texts():
+                self.assertAlmostEqual(text.get_fontsize(), legend_size)
+
+    @patch("plot.contraction_curve_plot")
+    @patch("plot.final_performance_samples", return_value=[np.ones(2)])
+    def test_composition_adapters_use_shorter_source_labels(self, _samples, _contraction):
+        for source, function, expected in (
+            ("generated", plot.plot_generated_ablation,
+             "Fraction of data from the noisy expert"),
+            ("clean-minari", plot.plot_clean_minari_ablation,
+             "Fraction of data from the Minari dataset"),
+        ):
+            rows = [self.row(
+                dataset_source=source, num_samples=1000, noise_scale=0.5,
+                noisy_trajectory_fraction=fraction,
+                requested_prop_clean_expert=1.0 - fraction,
+                requested_prop_random=0.0,
+                minari_trajectory_fraction=fraction,
+                minari_dataset_id="mujoco/reacher/medium-v0",
+            ) for fraction in (0.1, 0.8)]
+            original = json.dumps(rows, sort_keys=True)
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as directory, patch(
+                "plot.plt.close"
+            ) as close:
+                function(rows, Path(directory))
+            figure = close.call_args.args[0]
+            self.addCleanup(plot.plt.close, figure)
+            self.assertEqual(figure.axes[0].get_xlabel(), expected)
+            np.testing.assert_array_equal(figure.axes[0].lines[0].get_xdata(), [0.1, 0.8])
+            self.assertEqual(json.dumps(rows, sort_keys=True), original)
+
+    @patch("plot.final_performance_samples", return_value=[np.ones(2)])
+    def test_fraction_ticks_do_not_change_either_series_coordinates(self, _samples):
+        fractions = {"iql": (0.1, 0.45, 0.9), "mopo": (0.0, 0.3, 0.8)}
+        rows = [
+            self.row(algo, fraction=fraction)
+            for algo, values in fractions.items()
+            for fraction in values
+        ]
+        with tempfile.TemporaryDirectory() as directory, patch("plot.plt.close") as close:
+            plot.performance_ablation_plot(
+                rows, Path(directory) / "fraction.png", "fraction", "fraction",
+                fraction_axis=True,
+            )
+
+        figure = close.call_args.args[0]
+        self.addCleanup(plot.plt.close, figure)
+        axis = figure.axes[0]
+        np.testing.assert_allclose(figure.get_size_inches(), [8, 5])
+        np.testing.assert_array_equal(axis.get_xticks(), [0, 0.25, 0.5, 0.75, 1])
+        self.assertEqual(len(axis.xaxis.get_minorticklocs()), 0)
+        for line in axis.lines[:-1]:
+            np.testing.assert_array_equal(
+                line.get_xdata(), fractions[line.get_label().lower()]
+            )
+        self.assert_axis_style(axis)
+
+    @patch("plot.final_performance_samples", return_value=[np.ones(2)])
+    def test_noise_ticks_use_observed_values_and_exclude_expert_line_endpoints(self, _samples):
+        values = [0.0, 0.3, 0.9]
+        rows = [self.row(noise_scale=value) for value in values]
+        with tempfile.TemporaryDirectory() as directory, patch("plot.plt.close") as close:
+            plot.performance_ablation_plot(
+                rows, Path(directory) / "noise.png", "noise_scale", "noise scale",
+                fraction_axis=False,
+            )
+
+        figure = close.call_args.args[0]
+        self.addCleanup(plot.plt.close, figure)
+        axis = figure.axes[0]
+        np.testing.assert_allclose(figure.get_size_inches(), [8, 5])
+        np.testing.assert_array_equal(axis.get_xticks(), values)
+        np.testing.assert_array_equal(axis.lines[0].get_xdata(), values)
+        self.assertEqual(len(axis.xaxis.get_minorticklocs()), 0)
+        self.assert_axis_style(axis)
+
+    @patch("plot.history_performance_samples", return_value=[np.ones(2)])
+    def test_performance_history_uses_observed_percentages_and_smaller_legend(self, _samples):
+        percentages = [10.0, 35.0, 90.0]
+        history = self.row(records=[
+            {"step": step, "actual_percent": percent}
+            for step, percent in enumerate(percentages)
+        ])
+        with tempfile.TemporaryDirectory() as directory, patch("plot.plt.close") as close:
+            plot.performance_history_plot([history], Path(directory) / "history.png")
+
+        figure = close.call_args.args[0]
+        self.addCleanup(plot.plt.close, figure)
+        axis = figure.axes[0]
+        np.testing.assert_allclose(figure.get_size_inches(), [8, 5])
+        np.testing.assert_array_equal(axis.get_xticks(), percentages)
+        np.testing.assert_array_equal(axis.lines[0].get_xdata(), percentages)
+        self.assert_axis_style(axis, legend_size=14.4)
+
+    @patch("plot.history_scalar_samples", return_value=[np.ones(2)])
+    def test_shared_ood_axes_use_union_of_observed_percentages(self, _samples):
+        keys = ("state_ood_ratio", "state_action_ood_ratio")
+        histories = [
+            self.row(algo, records=[
+                {"step": step, "actual_percent": percent, key: 1.0}
+                for step, percent in enumerate(percentages)
+            ])
+            for algo, key, percentages in (
+                ("iql", keys[0], (10.0, 40.0)),
+                ("mopo", keys[1], (25.0, 90.0)),
+            )
+        ]
+        with tempfile.TemporaryDirectory() as directory, patch("plot.plt.close") as close:
+            plot.history_line_plot(
+                histories, keys, ("state OOD", "state-action OOD"),
+                Path(directory) / "ood.png",
+            )
+
+        figure = close.call_args.args[0]
+        self.addCleanup(plot.plt.close, figure)
+        np.testing.assert_allclose(figure.get_size_inches(), [8, 6])
+        for axis, expected_values in zip(figure.axes, ([10, 40], [25, 90])):
+            np.testing.assert_array_equal(axis.get_xticks(), [10, 25, 40, 90])
+            np.testing.assert_array_equal(axis.lines[0].get_xdata(), expected_values)
+            self.assert_axis_style(axis, legend_size=14.4)
 
 
 class ChunkLengthAxisTests(unittest.TestCase):
@@ -282,12 +491,14 @@ class ChunkLengthAxisTests(unittest.TestCase):
             }
             for chunk_length in chunk_lengths
         ]
-        figure, axis = plot.plt.subplots()
         with tempfile.TemporaryDirectory() as directory, patch(
-            "plot.plt.subplots", return_value=(figure, axis)
-        ), patch("plot.plt.close"):
+            "plot.plt.close"
+        ) as close:
             plot.plot_performance_vs_chunk_length(rows, Path(directory))
 
+        figure = close.call_args.args[0]
+        self.addCleanup(plot.plt.close, figure)
+        axis = figure.axes[0]
         self.assertEqual(axis.get_xscale(), "log")
         np.testing.assert_array_equal(axis.get_xticks(), chunk_lengths)
         self.assertEqual(
@@ -302,6 +513,15 @@ class ChunkLengthAxisTests(unittest.TestCase):
         self.assertEqual(len(axis.xaxis.get_minorticklocs()), 0)
         self.assertEqual(axis.get_xlabel(), "Action chunk length")
         self.assertEqual(axis.get_ylabel(), "Success rate")
+        self.assertEqual(axis.get_title(), "")
+        self.assertIsNone(figure._suptitle)
+        np.testing.assert_allclose(figure.get_size_inches(), [8, 5])
+        self.assertAlmostEqual(axis.xaxis.label.get_fontsize(), 24.3)
+        self.assertEqual(axis.yaxis.label.get_fontsize(), 18)
+        self.assertTrue(all(tick.get_fontsize() == 18 for tick in axis.get_xticklabels()))
+        self.assertTrue(all(text.get_fontsize() == 18 for text in axis.get_legend().get_texts()))
+        self.assertTrue(all(line.get_visible() for line in axis.get_xgridlines()))
+        self.assertTrue(all(line.get_visible() for line in axis.get_ygridlines()))
         plot.plt.close(figure)
 
 
@@ -476,7 +696,7 @@ class PlotCohortTests(unittest.TestCase):
 
         self.assertEqual(
             [label for label, _ in groups],
-            ["MOBILE (real ratio=0.00)", "MOBILE (real ratio=0.50)"],
+            ["real ratio=0.00", "real ratio=0.50"],
         )
         self.assertEqual([len(group) for _, group in groups], [2, 2])
 
@@ -507,6 +727,54 @@ class PlotCohortTests(unittest.TestCase):
         self.assertIn("td3bc.alpha=0.05", plot.cohort_policy_label(
             selected[0], selected[0]["_plot_cohort_spec"]
         ))
+
+    def test_shipped_mixed_cohorts_use_mobile_aliases_with_nested_filters(self):
+        for name in ("lift_chunks", "reacher_noise_scale", "reacher_noisy_fraction",
+                     "halfcheetah_noisy_fraction", "halfcheetah_clean_medium"):
+            with self.subTest(cohort=name):
+                cohort = plot.load_plot_cohort(Path(__file__).parent / "scripts" / f"{name}.json")
+                rows = []
+                for index, series in enumerate(cohort["series"]):
+                    schema = {"algo": series["algo"], "chunk_length": 1}
+                    for filters in (cohort["match"], series["match"]):
+                        for key, value in filters.items():
+                            target = schema
+                            parts = key.split(".")
+                            for part in parts[:-1]:
+                                target = target.setdefault(part, {})
+                            target[parts[-1]] = value
+                    rows.append({"algo": series["algo"], "chunk_length": 1,
+                                 "training_schema": schema, "_plot_cohort_series": index,
+                                 "_plot_cohort_spec": series})
+                original = json.dumps(rows, sort_keys=True)
+                self.assertEqual([label for label, _ in plot.algorithm_groups(rows)],
+                                 ["TD3BC", "IQL", "MOPO", "Hybrid-MOBILE", "MB-MOBILE"])
+                self.assertEqual(json.dumps(rows, sort_keys=True), original)
+
+    def test_mobile_names_preserve_custom_labels_and_other_variant_details(self):
+        rows = [self.record(algo="iql"), self.record(real_ratio=0),
+                self.record(real_ratio=0.25), self.record(real_ratio=0.5, dynamics_mode="recursive")]
+        selected = plot.select_plot_cohort(rows, self.cohort(
+            {"algo": "iql"},
+            {"algo": "mobile", "match": {"model_based.real_ratio": 0}, "label": "Custom baseline"},
+            {"algo": "mobile", "match": {"model_based.real_ratio": 0.25}},
+            {"algo": "mobile", "match": {"model_based.real_ratio": 0.5}},
+        ))
+        self.assertEqual([label for label, _ in plot.algorithm_groups(selected)], [
+            "IQL", "Custom baseline", "Hybrid-MOBILE (real ratio=0.25)",
+            "Hybrid-MOBILE (real ratio=0.50) (recursive dynamics)",
+        ])
+
+    def test_ratio_only_histories_retain_varying_chunks_and_support_no_cohort(self):
+        histories = [self.record(real_ratio=ratio, chunk_length=chunk)
+                     for ratio, chunk in ((0, 2), (0.5, 4))]
+        for history in histories:
+            history["label"] = plot.policy_label(history)
+        self.assertEqual(plot.history_plot_labels(histories),
+                         ["real ratio=0.00 (l=2)", "real ratio=0.50 (l=4)"])
+        histories.append({**self.record(algo="iql"), "label": "IQL (l=4)"})
+        self.assertEqual(plot.history_plot_labels(histories),
+                         ["MB-MOBILE (l=2)", "Hybrid-MOBILE (l=4)", "IQL (l=4)"])
 
     def test_multiple_td3bc_alphas_remain_in_series_labels(self):
         rows = []
@@ -554,7 +822,7 @@ class PlotCohortTests(unittest.TestCase):
 
         self.assertEqual([label for label, _ in groups], [
             "TD3BC", "IQL", "MOPO",
-            "MOBILE (real ratio=0.50)", "MOBILE (real ratio=0.00)",
+            "Hybrid-MOBILE", "MB-MOBILE",
         ])
         self.assertEqual([len(group) for _, group in groups], [2] * 5)
         self.assertEqual(json.dumps({"rows": rows, "cohort": cohort}, sort_keys=True), original)
@@ -713,7 +981,7 @@ class PlotCohortTests(unittest.TestCase):
         )
         self.assertEqual(
             plot.algorithm_groups(selected, "chunk_length")[0][0],
-            "MOBILE (real ratio=0.00)",
+            "real ratio=0.00",
         )
 
     def test_history_legends_use_same_rule_and_preserve_chunk_labels(self):
@@ -729,12 +997,64 @@ class PlotCohortTests(unittest.TestCase):
         histories = plot.select_cohort_histories(rows, selected)
 
         self.assertEqual(plot.history_plot_labels(histories), [
-            "MOBILE (l=4, real ratio=0.00)", "MOBILE (l=4, real ratio=0.50)",
+            "real ratio=0.00", "real ratio=0.50",
         ])
         self.assertEqual(plot.history_plot_labels(histories[:1]), ["MOBILE (l=4)"])
         self.assertEqual(plot.history_plot_labels([
             {**rows[0], "label": "Existing custom label"},
         ]), ["Existing custom label"])
+
+    def test_contraction_keeps_variant_panel_titles_without_overall_title(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            curves = np.asarray([[1.0, 2.0, 3.0], [3.0, 4.0, 5.0]])
+            np.savez(root / "contraction_last.npz", distance_curves=curves)
+            rows = [
+                {
+                    **self.record(real_ratio=ratio, chunk_length=chunk_length),
+                    "seed_rows": [{"eval_dir": str(root)}],
+                }
+                for ratio in (0.0, 0.5)
+                for chunk_length in (1, 4)
+            ]
+            selected = plot.select_plot_cohort(rows, self.cohort(
+                {"algo": "mobile", "match": {"model_based.real_ratio": 0.0}},
+                {"algo": "mobile", "match": {"model_based.real_ratio": 0.5}},
+                values=(1, 4),
+            ))
+            with patch("plot.plt.close") as close:
+                plot.plot_contraction_vs_chunk_length(selected, root)
+
+            figure = close.call_args.args[0]
+            self.addCleanup(plot.plt.close, figure)
+            axes = figure.axes
+            self.assertTrue((root / "contraction_vs_chunk_length.png").is_file())
+            self.assertTrue((root / "contraction_vs_chunk_length.pdf").is_file())
+            np.testing.assert_allclose(figure.get_size_inches(), [10, 4])
+            self.assertIsNone(figure._suptitle)
+            self.assertEqual([axis.get_title() for axis in axes], [
+                "real ratio=0.00", "real ratio=0.50",
+            ])
+            for axis in axes:
+                self.assertEqual(axis.get_xlabel(), "Primitive timestep")
+                self.assertAlmostEqual(axis.title.get_fontsize(), 21.6)
+                self.assertAlmostEqual(axis.xaxis.label.get_fontsize(), 24.3)
+                self.assertTrue(all(tick.get_fontsize() == 18 for tick in axis.get_xticklabels()))
+                for text in axis.get_legend().get_texts():
+                    self.assertAlmostEqual(text.get_fontsize(), 14.4)
+                self.assertTrue(all(line.get_visible() for line in axis.get_xgridlines()))
+                self.assertTrue(all(line.get_visible() for line in axis.get_ygridlines()))
+                np.testing.assert_array_equal(axis.get_xticks(), [0, 1, 2])
+                self.assertEqual(axis.get_legend_handles_labels()[1], [
+                    "Chunk length=1", "Chunk length=4",
+                ])
+                self.assertEqual(len(axis.collections), 2)
+                for line in axis.lines:
+                    np.testing.assert_array_equal(line.get_xdata(), [0, 1, 2])
+                    np.testing.assert_array_equal(line.get_ydata(), [2, 3, 4])
+            self.assertEqual(
+                axes[0].get_ylabel(), "Distance (m)"
+            )
 
     def test_automatic_grouping_rejects_two_configs_at_one_x_value(self):
         rows = [
@@ -975,7 +1295,7 @@ class NoiseScalePlotTests(unittest.TestCase):
 
         self.assertEqual(performance_plot.call_count, 2)
         self.assertEqual(contraction_plot.call_count, 2)
-        paths = {call.args[2] for call in performance_plot.call_args_list}
+        paths = {call.args[1] for call in performance_plot.call_args_list}
         self.assertEqual(paths, {
             Path(directory)
             / "noise_scale/samples1000_clean0_noisy1_random0_chunk1/final"
@@ -985,39 +1305,36 @@ class NoiseScalePlotTests(unittest.TestCase):
             / "performance_vs_noise_scale.png",
         })
         for call in performance_plot.call_args_list:
-            self.assertEqual(call.args[1], (
-                "Gaussian action-noise scale ablation\n"
-                "Trajectories: 100% noisy expert"
-            ))
             self.assertEqual(
-                call.args[3:5],
+                call.args[2:4],
                 ("noise_scale", "Gaussian action-noise scale"),
             )
             self.assertFalse(call.kwargs["fraction_axis"])
         contraction_paths = {
-            call.args[4] for call in contraction_plot.call_args_list
+            call.args[3] for call in contraction_plot.call_args_list
         }
         self.assertEqual(contraction_paths, {
             path.parent / "contraction_vs_noise_scale.png" for path in paths
         })
 
     @patch("plot.contraction_curve_plot")
-    @patch("plot.performance_ablation_plot")
-    def test_noise_scale_title_shows_only_nonzero_mixture_components(
-        self, performance_plot, _contraction_plot
+    @patch("plot.final_performance_samples", return_value=[np.ones(2)])
+    def test_noise_scale_plot_has_no_title_for_any_mixture(
+        self, _samples, _contraction_plot
     ):
         cases = [
-            (0.5, 0.5, 0.0, "50% clean expert, 50% noisy expert"),
-            (0.0, 0.5, 0.5, "50% noisy expert, 50% random policy"),
-            (0.25, 0.5, 0.25, "25% clean expert, 50% noisy expert, 25% random policy"),
+            (0.5, 0.5, 0.0),
+            (0.0, 0.5, 0.5),
+            (0.25, 0.5, 0.25),
         ]
-        for clean, noisy, random, expected in cases:
+        for clean, noisy, random in cases:
             with self.subTest(composition=(clean, noisy, random)):
-                performance_plot.reset_mock()
                 rows = [self.row(scale, noisy=noisy) for scale in (0.0, 0.5)]
                 for row in rows:
                     row["requested_prop_clean_expert"] = clean
                     row["requested_prop_random"] = random
+                    row["expert_performance_mean"] = 1.0
+                    row["performance_label"] = "forward displacement"
                     row["training_schema"]["dataset"].update({
                         "prop_clean_expert": clean,
                         "prop_random": random,
@@ -1025,14 +1342,21 @@ class NoiseScalePlotTests(unittest.TestCase):
                     })
                 original = json.dumps(rows, sort_keys=True)
 
-                with tempfile.TemporaryDirectory() as directory:
+                with tempfile.TemporaryDirectory() as directory, patch(
+                    "plot.plt.close"
+                ) as close:
                     plot.plot_noise_scale_ablation(rows, Path(directory))
 
-                performance_plot.assert_called_once()
-                self.assertEqual(performance_plot.call_args.args[1], (
-                    "Gaussian action-noise scale ablation\n"
-                    f"Trajectories: {expected}"
-                ))
+                figure = close.call_args.args[0]
+                self.addCleanup(plot.plt.close, figure)
+                axis = figure.axes[0]
+                self.assertEqual(axis.get_title(), "")
+                self.assertIsNone(figure._suptitle)
+                self.assertEqual(axis.get_xlabel(), "Gaussian action-noise scale")
+                self.assertEqual(axis.get_ylabel(), "Forward displacement")
+                np.testing.assert_array_equal(axis.lines[0].get_xdata(), [0, 0.5])
+                np.testing.assert_array_equal(axis.lines[0].get_ydata(), [1, 1])
+                self.assertEqual(axis.get_legend_handles_labels()[1], ["IQL", "Expert"])
                 self.assertEqual(json.dumps(rows, sort_keys=True), original)
 
     @patch("plot.contraction_curve_plot")
@@ -1060,19 +1384,20 @@ class NoiseScalePlotTests(unittest.TestCase):
                 "performance_label": "forward displacement",
             })
             rows.append(row)
-        figure, axis = plot.plt.subplots()
         with tempfile.TemporaryDirectory() as directory, patch(
-            "plot.plt.subplots", return_value=(figure, axis)
-        ), patch("plot.plt.close"):
+            "plot.plt.close"
+        ) as close:
             plot.performance_ablation_plot(
                 rows,
-                "noise scale",
                 Path(directory) / "plot.png",
                 "noise_scale",
                 "Gaussian action-noise scale",
                 fraction_axis=False,
             )
 
+        figure = close.call_args.args[0]
+        self.addCleanup(plot.plt.close, figure)
+        axis = figure.axes[0]
         self.assertGreater(axis.get_xlim()[1], 2.0)
         plot.plt.close(figure)
 

@@ -1,0 +1,72 @@
+{
+  "version": 2,
+  "setting": "clean-medium-v2",
+  "seeds": [10000, 10100, 10200, 10300],
+  "ablation": {"name": "other_fraction", "values": [0, 0.25, 0.5, 0.75, 1]},
+  "match": {
+    "dataset_spec.num_samples": 999995,
+    "dataset_spec.test_fraction": 0.2,
+    "training_config.epoch": 3000,
+    "training_config.step_per_epoch": 1000,
+    "training_config.batch_size": 256
+  },
+  "eval_match": {"checkpoint_eval_episodes": 10, "final_eval_episodes": 20},
+  "series": [
+    {
+      "algo": "td3bc",
+      "match": {
+        "training_config.implementation": "walker-composition-mf-v1",
+        "training_config.td3bc_learning_rate": 0.0003,
+        "training_config.td3bc_alpha": 2.5,
+        "training_config.td3bc_hidden_dims": [256, 256]
+      }
+    },
+    {
+      "algo": "iql",
+      "match": {
+        "training_config.implementation": "walker-composition-mf-v1",
+        "training_config.iql_temperature": 3.0,
+        "training_config.iql_expectile": 0.7,
+        "training_config.iql_learning_rate": 0.0003,
+        "training_config.iql_lr_schedule": "cosine",
+        "training_config.iql_hidden_dims": [256, 256]
+      }
+    },
+    {
+      "algo": "mopo",
+      "match": {
+        "training_config.real_ratio": 0.0,
+        "training_config.rollout_length": 1,
+        "training_config.rollout_batch_size": 250000,
+        "training_config.penalty_coef": 2.5,
+        "training_config.actor_lr": 0.0001,
+        "training_config.critic_lr": 0.0003,
+        "training_config.dynamics_max_epochs": null
+      }
+    },
+    {
+      "algo": "mobile",
+      "match": {
+        "training_config.real_ratio": 0.05,
+        "training_config.rollout_length": 5,
+        "training_config.rollout_batch_size": 50000,
+        "training_config.penalty_coef": 0.5,
+        "training_config.actor_lr": 0.0001,
+        "training_config.critic_lr": 0.0003,
+        "training_config.dynamics_max_epochs": 30
+      }
+    },
+    {
+      "algo": "mobile",
+      "match": {
+        "training_config.real_ratio": 0.0,
+        "training_config.rollout_length": 5,
+        "training_config.rollout_batch_size": 50000,
+        "training_config.penalty_coef": 0.5,
+        "training_config.actor_lr": 0.0001,
+        "training_config.critic_lr": 0.0003,
+        "training_config.dynamics_max_epochs": 30
+      }
+    }
+  ]
+}
