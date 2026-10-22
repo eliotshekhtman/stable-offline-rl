@@ -27,6 +27,7 @@ import load_offline
 import rollout
 import task_support
 from chunked_dynamics import DIRECT_DYNAMICS_MODE, resolve_dynamics_chunk_mode
+from chunk_policy import validate_chunk_policy_config
 from policies import (
     CQL_DEFAULT_ENTROPY_ALPHA_MAX,
     CQL_DEFAULT_ENTROPY_LEARNING_RATE,
@@ -306,6 +307,21 @@ def load_policy_and_dynamics(
         epoch=manifest["epoch"],
         step_per_epoch=manifest["step_per_epoch"],
     )
+    chunk_policy_config = None
+    normalization_kwargs = {}
+    if "policy_architecture" in manifest["training_schema"]:
+        chunk_policy_config = validate_chunk_policy_config(
+            manifest["training_schema"]["policy_architecture"], manifest["algo"]
+        )
+        build_args.chunk_policy = chunk_policy_config["type"]
+        build_args.chunk_policy_rho = chunk_policy_config["rho"]
+        build_args.chunk_policy_config = chunk_policy_config
+        if chunk_policy_config["version"] == 2:
+            obs_dim = int(np.prod(env.observation_space.shape))
+            # Allocate buffers only; strict checkpoint loading restores the fitted values.
+            normalization_kwargs["observation_stats"] = (
+                np.zeros(obs_dim, dtype=np.float32), np.ones(obs_dim, dtype=np.float32)
+            )
     if manifest["algo"] in MODEL_BASED_ALGOS:
         model_based = manifest["training_schema"]["model_based"]
         build_args.model_manipulation_settings = "manipulation_settings" in model_based
@@ -354,6 +370,7 @@ def load_policy_and_dynamics(
             base_discount=manifest["base_discount"],
             dynamics_chunk_mode=manifest_dynamics_chunk_mode(manifest),
             primitive_action_dim=action_dim // chunk_length,
+            **normalization_kwargs,
         )
         builder_parameters = inspect.signature(
             build_model_based_policy
@@ -380,8 +397,8 @@ def load_policy_and_dynamics(
             buffer = argparse.Namespace(
                 normalize_obs=lambda: (obs_mean, obs_std)
             )
-        builder_kwargs = {"discount": manifest["macro_discount"]}
-        if manifest["algo"] == "cql":
+        builder_kwargs = {"discount": manifest["macro_discount"], **normalization_kwargs}
+        if manifest["algo"] == "cql" or chunk_policy_config is not None:
             builder_kwargs["chunk_length"] = manifest["chunk_length"]
         policy, _ = build_model_free_policy(
             manifest["algo"], env, buffer, build_args, **builder_kwargs

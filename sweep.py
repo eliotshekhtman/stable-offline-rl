@@ -27,6 +27,7 @@ import load_offline
 import rollout
 import task_support
 from chunked_dynamics import DYNAMICS_CHUNK_MODES, resolve_dynamics_chunk_mode
+from chunk_policy import CHUNK_POLICY_MODES, fit_observation_stats, get_chunk_policy_config
 from offlinerlkit.buffer import ReplayBuffer
 from offlinerlkit.policy_trainer import MBPolicyTrainer, MFPolicyTrainer
 from offlinerlkit.utils.logger import Logger
@@ -152,6 +153,20 @@ def parse_args() -> argparse.Namespace:
         "--chunk-lengths", type=int, nargs="+", default=[1],
         help="Action chunk lengths to sweep over; each policy emits this many primitive actions",
     )
+    training.add_argument(
+        "--chunk-policy", choices=CHUNK_POLICY_MODES, default="standard",
+        help="Actor architecture: standard, or a spectrally normalized chunk actor with geometric decay for TD3+BC, IQL, MOPO, and MOBILE",
+    )
+    training.add_argument(
+        "--chunk-policy-rho", type=float, default=None,
+        help="Geometric decay factor for --chunk-policy decay-sn; must be finite and in (0, 1]",
+    )
+    training.add_argument(
+        "--chunk-policy-c", type=float, default=None,
+        help="Approximate per-primitive-action L2 sensitivity bound C in normalized observation "
+             "coordinates for --chunk-policy decay-sn (default: 1); position k has bound C*rho**k "
+             "for unit-range actions. One gain before tanh, not a per-layer multiplier; must be finite and positive",
+    )
     training.add_argument("--epoch", type=int, default=1000, help="Number of policy-training epochs")
     training.add_argument("--step-per-epoch", type=int, default=1000, help="Gradient-update steps per policy-training epoch")
     training.add_argument("--batch-size", type=int, default=512, help="Policy-training batch size")
@@ -232,6 +247,11 @@ def parse_args() -> argparse.Namespace:
         parser.error(str(error))
     if any(chunk_length <= 0 for chunk_length in args.chunk_lengths):
         parser.error("--chunk-lengths values must be positive")
+    try:
+        for algo in args.algos:
+            get_chunk_policy_config(args, algo)
+    except ValueError as error:
+        parser.error(str(error))
     if (
         not math.isfinite(args.cql_entropy_learning_rate)
         or args.cql_entropy_learning_rate <= 0.0
@@ -850,6 +870,7 @@ def make_training_schema(
     args: argparse.Namespace,
 ) -> dict:
     macro_discount = BASE_DISCOUNT**chunk_length
+    chunk_policy_config = get_chunk_policy_config(args, algo)
     schema = {
         "version": TRAINING_SCHEMA_VERSION,
         "env_name": env_name,
@@ -864,6 +885,8 @@ def make_training_schema(
         "step_per_epoch": args.step_per_epoch,
         "batch_size": args.batch_size,
     }
+    if chunk_policy_config is not None:
+        schema["policy_architecture"] = chunk_policy_config
     if algo == "iql":
         schema["iql"] = {
             "temperature": args.iql_temperature,
@@ -1096,12 +1119,20 @@ def train_algo(
             run_dir, args, algo, env_name, chunk_length, macro_discount
         )
 
+        normalization_kwargs = {}
+        chunk_policy_config = get_chunk_policy_config(args, algo)
+        if chunk_policy_config is not None and chunk_policy_config["version"] == 2:
+            normalization_kwargs["observation_stats"] = fit_observation_stats(
+                chunk_dataset["observations"]
+            )
+
         if algo in MODEL_FREE_ALGOS:
             buffer = build_buffer(chunk_dataset, eval_env, args.device)
+            builder_kwargs = {"discount": macro_discount, **normalization_kwargs}
+            if algo == "cql" or get_chunk_policy_config(args, algo) is not None:
+                builder_kwargs["chunk_length"] = chunk_length
             policy, lr_scheduler = build_model_free_policy(
-                algo, eval_env, buffer, args,
-                discount=macro_discount,
-                **({"chunk_length": chunk_length} if algo == "cql" else {}),
+                algo, eval_env, buffer, args, **builder_kwargs,
             )
             trainer = MFPolicyTrainer(
                 policy=policy,
@@ -1143,6 +1174,7 @@ def train_algo(
                 base_discount=BASE_DISCOUNT,
                 dynamics_chunk_mode=dynamics_chunk_mode,
                 primitive_action_dim=int(np.prod(eval_env.env.action_space.shape)),
+                **normalization_kwargs,
             )
 
             if dynamics_dataset is None:

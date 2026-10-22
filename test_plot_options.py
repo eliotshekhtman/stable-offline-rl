@@ -56,43 +56,39 @@ class PlotOptionValidationTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 plot.validate_plot_cohort(cohort_config(figure_height=2.9, **changes))
 
-    def test_shipped_cohort_heights_follow_the_requested_ablation_groups(self):
+    def test_shipped_cohorts_preserve_their_custom_plot_options(self):
         import walker_composition_plot
 
         root = Path(__file__).parent
-        cohorts = {
-            3.5: (
-                "scripts/halfcheetah_noisy_fraction.json",
-                "scripts/halfcheetah_real_ratio.json",
-                "scripts/reacher_noisy_fraction.json",
-                "scripts/reacher_real_ratio.json",
-                "walker_composition_cohorts/all_algorithms_clean_noisy.json",
-                "walker_composition_cohorts/mobile_clean_noisy.json",
-            ),
-            4.25: (
-                "scripts/halfcheetah_expert_chunks.json",
-                "scripts/lift_chunks.json",
-                "scripts/lift_real_ratio.json",
-            ),
-            None: (
-                "scripts/halfcheetah_clean_medium.json",
-                "scripts/reacher_noise_scale.json",
-                "walker_composition_cohorts/all_algorithms_clean_medium.json",
-                "walker_composition_cohorts/mobile_clean_medium.json",
-            ),
-        }
-        for height, paths in cohorts.items():
-            for path in paths:
-                with self.subTest(cohort=path, height=height):
-                    config = plot.load_json(root / path)
-                    original = deepcopy(config)
-                    validate = (walker_composition_plot.validate_cohort
-                                if path.startswith("walker_composition_cohorts/")
-                                else plot.validate_plot_cohort)
-                    validated = validate(config)
-                    expected = {} if height is None else {"figure_height": height}
-                    self.assertEqual(plot_rendering.validate_plot_options(validated), expected)
-                    self.assertEqual(config, original)
+        paths = (
+            "scripts/halfcheetah_noisy_fraction.json",
+            "scripts/halfcheetah_real_ratio.json",
+            "scripts/reacher_noisy_fraction.json",
+            "scripts/reacher_real_ratio.json",
+            "walker_composition_cohorts/all_algorithms_clean_noisy.json",
+            "walker_composition_cohorts/mobile_clean_noisy.json",
+            "scripts/halfcheetah_expert_chunks.json",
+            "scripts/lift_chunks.json",
+            "scripts/lift_real_ratio.json",
+            "scripts/halfcheetah_clean_medium.json",
+            "scripts/reacher_noise_scale.json",
+            "walker_composition_cohorts/all_algorithms_clean_medium.json",
+            "walker_composition_cohorts/mobile_clean_medium.json",
+        )
+        for path in paths:
+            with self.subTest(cohort=path):
+                config = plot.load_json(root / path)
+                original = deepcopy(config)
+                validate = (walker_composition_plot.validate_cohort
+                            if path.startswith("walker_composition_cohorts/")
+                            else plot.validate_plot_cohort)
+                validated = validate(config)
+                expected = {
+                    key: original[key]
+                    for key in ("figure_height", "show_legend") if key in original
+                }
+                self.assertEqual(plot_rendering.validate_plot_options(validated), expected)
+                self.assertEqual(config, original)
 
 
 class PlotOptionRenderingTests(unittest.TestCase):

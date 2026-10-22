@@ -271,9 +271,10 @@ class DynamicsChunkModePlotTests(unittest.TestCase):
 class PerformanceLabelTests(unittest.TestCase):
     def test_performance_axis_label_shortens_only_the_legacy_reacher_label(self):
         for label, expected in (
-            ("final fingertip-target distance (m)", "Final target distance (m)"),
-            ("Final fingertip-target distance (m)", "Final target distance (m)"),
+            ("final fingertip-target distance (m)", "Final target dist. (m)"),
+            ("Final fingertip-target distance (m)", "Final target dist. (m)"),
             ("Final target distance (m)", "Final target distance (m)"),
+            ("Final target dist. (m)", "Final target dist. (m)"),
             ("success rate", "Success rate"),
             ("forward displacement", "Forward displacement"),
             ("Reward_50%", "Reward_50%"),
@@ -319,7 +320,7 @@ class PerformanceLabelTests(unittest.TestCase):
                         function(*args)
                     figure = close.call_args.args[0]
                     self.addCleanup(plot.plt.close, figure)
-                    self.assertEqual(figure.axes[0].get_ylabel(), "Final target distance (m)")
+                    self.assertEqual(figure.axes[0].get_ylabel(), "Final target dist. (m)")
                     self.assertEqual(json.dumps([rows, histories], sort_keys=True), original)
                     self.assertEqual(cache.read_bytes(), cached_bytes)
 

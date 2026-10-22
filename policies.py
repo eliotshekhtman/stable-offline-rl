@@ -10,6 +10,14 @@ import gymnasium as gym
 import numpy as np
 import torch
 
+from chunk_policy import (
+    ChunkTD3BCPolicy,
+    DecayingActor,
+    DecayingChunkMean,
+    NormalizedObservationBackbone,
+    apply_chunk_spectral_norm,
+    get_chunk_policy_config,
+)
 from chunked_dynamics import (
     DIRECT_DYNAMICS_MODE,
     RecursiveChunkDynamics,
@@ -46,6 +54,20 @@ MODEL_BASED_DEFAULTS = {
 }
 
 
+def _normalize_chunk_policy_inputs(config, observation_stats, obs_dim, *networks):
+    if config is None or config["version"] != 2:
+        return
+    if observation_stats is None:
+        raise ValueError("Version 2 chunk policies require observation_stats from real training data.")
+    mean, std = observation_stats
+    if np.shape(mean) != (obs_dim,) or np.shape(std) != (obs_dim,):
+        raise ValueError("Observation statistics must match the environment observation dimension.")
+    for network in networks:
+        network.backbone = NormalizedObservationBackbone(
+            network.backbone, mean, std
+        ).to(network.device)
+
+
 def build_model_free_policy(
     algo: str,
     env: gym.Env,
@@ -53,7 +75,10 @@ def build_model_free_policy(
     args: argparse.Namespace,
     discount: float,
     chunk_length: int = 1,
+    *,
+    observation_stats=None,
 ):
+    chunk_policy = get_chunk_policy_config(args, algo)
     obs_dim = int(np.prod(env.observation_space.shape))
     action_dim = int(np.prod(env.action_space.shape))
     max_action = float(env.action_space.high[0])
@@ -134,12 +159,22 @@ def build_model_free_policy(
             conditioned_sigma=False,
             max_mu=max_action,
         )
+        if chunk_policy is not None:
+            dist.mu = DecayingChunkMean(
+                actor_backbone.output_dim, action_dim, chunk_length, chunk_policy["rho"],
+                c=chunk_policy.get("c", 1.0),
+            )
         actor = ActorProb(actor_backbone, dist, args.device)
         critic_q1, critic_q1_optim = build_critic(obs_dim, action_dim, hidden_dims, args.device, args.iql_learning_rate)
         critic_q2, critic_q2_optim = build_critic(obs_dim, action_dim, hidden_dims, args.device, args.iql_learning_rate)
         critic_v_backbone = MLP(input_dim=obs_dim, hidden_dims=hidden_dims)
         critic_v = Critic(critic_v_backbone, args.device)
         orthogonal_init(actor, critic_q1, critic_q2, critic_v)
+        if chunk_policy is not None:
+            apply_chunk_spectral_norm(actor)
+        _normalize_chunk_policy_inputs(
+            chunk_policy, observation_stats, obs_dim, actor, critic_q1, critic_q2, critic_v
+        )
         actor_optim = torch.optim.Adam(actor.parameters(), lr=args.iql_learning_rate)
         critic_v_optim = torch.optim.Adam(critic_v.parameters(), lr=args.iql_learning_rate)
         policy = IQLPolicy(
@@ -172,11 +207,20 @@ def build_model_free_policy(
         obs_mean, obs_std = buffer.normalize_obs()
         hidden_dims = args.td3bc_hidden_dims
         actor_backbone = MLP(input_dim=obs_dim, hidden_dims=hidden_dims)
-        actor = Actor(actor_backbone, action_dim, max_action=max_action, device=args.device)
+        if chunk_policy is None:
+            actor = Actor(actor_backbone, action_dim, max_action=max_action, device=args.device)
+        else:
+            actor = DecayingActor(
+                actor_backbone, action_dim, max_action=max_action, device=args.device,
+                chunk_length=chunk_length, rho=chunk_policy["rho"],
+                c=chunk_policy.get("c", 1.0),
+            )
+            apply_chunk_spectral_norm(actor)
         critic1, critic1_optim = build_critic(obs_dim, action_dim, hidden_dims, args.device, args.td3bc_learning_rate)
         critic2, critic2_optim = build_critic(obs_dim, action_dim, hidden_dims, args.device, args.td3bc_learning_rate)
         actor_optim = torch.optim.Adam(actor.parameters(), lr=args.td3bc_learning_rate)
-        return TD3BCPolicy(
+        policy_type = TD3BCPolicy if chunk_policy is None else ChunkTD3BCPolicy
+        return policy_type(
             actor,
             critic1,
             critic2,
@@ -283,10 +327,18 @@ def build_model_based_policy(
     dynamics_chunk_mode: str = DIRECT_DYNAMICS_MODE,
     primitive_action_dim: int | None = None,
     build_dynamics_model: bool = True,
+    *,
+    observation_stats=None,
 ):
     if algo not in MODEL_BASED_ALGOS:
         raise ValueError(f"Unsupported algorithm: {algo}")
 
+    chunk_policy = get_chunk_policy_config(args, algo)
+    actor_kwargs = (
+        {"chunk_length": chunk_length, "chunk_policy_rho": chunk_policy["rho"],
+         "chunk_policy_c": chunk_policy.get("c", 1.0)}
+        if chunk_policy is not None else {}
+    )
     obs_dim = int(np.prod(env.observation_space.shape))
     action_dim = int(np.prod(env.action_space.shape))
     effective_dynamics_mode = resolve_dynamics_chunk_mode(
@@ -349,7 +401,10 @@ def build_model_based_policy(
         )
 
     if algo == "mobile":
-        actor, actor_optim = build_prob_actor(obs_dim, action_dim, max_action, hidden_dims, args.device, actor_lr)
+        actor, actor_optim = build_prob_actor(
+            obs_dim, action_dim, max_action, hidden_dims, args.device, actor_lr,
+            **actor_kwargs,
+        )
         critics = torch.nn.ModuleList(
             [
                 Critic(MLP(input_dim=obs_dim + action_dim, hidden_dims=hidden_dims), args.device)
@@ -361,6 +416,9 @@ def build_model_based_policy(
             with torch.no_grad():
                 for critic in critics:
                     critic.last.bias.add_(return_shift)
+        _normalize_chunk_policy_inputs(
+            chunk_policy, observation_stats, obs_dim, actor, *critics
+        )
         critics_optim = torch.optim.Adam(critics.parameters(), lr=critic_lr)
         alpha = build_auto_alpha(action_dim, args.device, 1e-4)
         policy = MOBILEPolicy(
@@ -381,9 +439,15 @@ def build_model_based_policy(
         )
         return policy, dynamics, torch.optim.lr_scheduler.CosineAnnealingLR(actor_optim, args.epoch)
 
-    actor, actor_optim = build_prob_actor(obs_dim, action_dim, max_action, hidden_dims, args.device, actor_lr)
+    actor, actor_optim = build_prob_actor(
+        obs_dim, action_dim, max_action, hidden_dims, args.device, actor_lr,
+        **actor_kwargs,
+    )
     critic1, critic1_optim = build_critic(obs_dim, action_dim, hidden_dims, args.device, critic_lr)
     critic2, critic2_optim = build_critic(obs_dim, action_dim, hidden_dims, args.device, critic_lr)
+    _normalize_chunk_policy_inputs(
+        chunk_policy, observation_stats, obs_dim, actor, critic1, critic2
+    )
     alpha = build_auto_alpha(action_dim, args.device, 1e-4)
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(actor_optim, args.epoch)
 
@@ -507,7 +571,12 @@ def termination_fn_inverted_double_pendulum(obs, act, next_obs):
     return (tip_height <= 1.0)[:, None]
 
 
-def build_prob_actor(obs_dim: int, action_dim: int, max_action: float, hidden_dims: list[int], device: str, lr: float):
+def build_prob_actor(
+    obs_dim: int, action_dim: int, max_action: float, hidden_dims: list[int],
+    device: str, lr: float, *, chunk_length: int = 1,
+    chunk_policy_rho: float | None = None,
+    chunk_policy_c: float = 1.0,
+):
     actor_backbone = MLP(input_dim=obs_dim, hidden_dims=hidden_dims)
     dist = TanhDiagGaussian(
         latent_dim=getattr(actor_backbone, "output_dim"),
@@ -516,7 +585,14 @@ def build_prob_actor(obs_dim: int, action_dim: int, max_action: float, hidden_di
         conditioned_sigma=True,
         max_mu=max_action,
     )
+    if chunk_policy_rho is not None:
+        dist.mu = DecayingChunkMean(
+            actor_backbone.output_dim, action_dim, chunk_length, chunk_policy_rho,
+            c=chunk_policy_c,
+        )
     actor = ActorProb(actor_backbone, dist, device)
+    if chunk_policy_rho is not None:
+        apply_chunk_spectral_norm(actor)
     return actor, torch.optim.Adam(actor.parameters(), lr=lr)
 
 
